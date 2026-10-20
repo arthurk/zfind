@@ -1,0 +1,5 @@
+zfind
+*.o
+.envrc
+core
+core.*
