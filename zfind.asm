@@ -56,8 +56,11 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define DIRENT_MAX  4128             ; room a getdents64 batch must have left to
                                      ;   prove it was the last: any d_name up
                                      ;   to 4096 bytes fits
-%define IGBUF_SZ    16384            ; .gitignore bytes read per directory
-%define IG_DEPTH    32               ; deepest directory whose .gitignore is read
+%define IGBUF_SZ    65536            ; .gitignore bytes read per directory
+                                      ; shortcut: only IGBUF_SZ - 1 bytes of a
+                                      ;   .gitignore are read, the rest is
+                                      ;   dropped; raise this if a real file
+                                      ;   ever exceeds that
 %define IG_MAX      1024             ; rules kept at once (per thread)
 %define ARENA_SZ    (1 << 30)        ; records, tokens, output blocks: one mmap
                                       ;   (chunks are handed out on demand,
@@ -99,7 +102,8 @@ struc TSTATE
   .path_buf:  resb PATH_MAX         ; current directory path relative to cwd
   .statbuf:   resb 144
   .ent_buf:   resb ENT_BUF          ; one getdents64 batch
-  .igbuf:     resb IGBUF_SZ * IG_DEPTH
+  .igbuf:     resb IGBUF_SZ         ; one buffer per thread: load_ignore never
+                                    ;   re-enters, it reads and parses one file
   .ig_rules:  resb 32 * IG_MAX      ; this level's rules (parsing scratch)
   alignb 64
   .id:        resq 1                ; thread number: owner of the blocks it makes
@@ -1625,8 +1629,8 @@ ig_add_line:
     cmp rax, IG_MAX
     jae .ret                         ; rule table full: drop the rest
     ; copy the pattern out of igbuf, which this thread reuses for the next
-    ; directory at this depth; rules handed to another thread (as a chain
-    ; node) outlive it, hence ig_alloc
+    ; directory; rules handed to another thread (as a chain node) outlive it,
+    ; hence ig_alloc
     push r12
     mov r12, rdi                     ; pattern start
     mov rcx, rsi
@@ -1660,7 +1664,7 @@ ig_add_line:
     ret
 
 ; load_ignore: read this directory's .gitignore (if this is a repo) into
-; igbuf[depth] and append its rules; rbx = directory path length, r12 = depth.
+; igbuf and append its rules; rbx = directory path length.
 ; If it added any, publish a chain node holding a copy of the whole active
 ; rule stack, so tasks dispatched below it keep their ancestors' rules.
 load_ignore:
@@ -1670,10 +1674,7 @@ load_ignore:
     sub rsp, 32
     cmp qword [git_repo], 0
     je .ret
-    cmp r12, IG_DEPTH
-    jae .ret                         ; deeper than the slot table
     mov [rsp], rbx                   ; ig_add_line wants the prefix length
-    mov [rsp+8], r12
     mov rbx, [r14+ig_nrules]
     mov [rsp+16], rbx                ; rules before this file
     mov rbx, [rsp]                   ; the directory's path length
@@ -1701,10 +1702,7 @@ load_ignore:
     test rax, rax
     js .ret
     mov r8, rax                      ; fd
-    mov r9, [rsp+8]
-    shl r9, 14                       ; 16384 = 1 << 14
     lea rsi, [r14+igbuf]
-    add rsi, r9                      ; this depth's slot
     xor r10d, r10d                   ; bytes read
 .read:
     mov rax, 0                       ; sys_read
@@ -1725,7 +1723,6 @@ load_ignore:
     test r10, r10
     jz .ret
     lea r8, [r14+igbuf]
-    add r8, r9                       ; slot base
     lea r9, [r8+r10]                 ; end of content
 .line:
     cmp r8, r9
