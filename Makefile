@@ -1,16 +1,49 @@
-zfind: zfind.asm
-	nasm -f elf64 -g $< -o zfind.o
-	ld -o $@ zfind.o
+ARCH ?= x86_64
 
-run: zfind
-	./zfind
+BUILD_DIR := build/$(ARCH)
+BIN       := $(BUILD_DIR)/zfind
+OBJ       := $(BUILD_DIR)/zfind.o
+SRC       := src/$(ARCH)/zfind.asm
+
+# ---------- architecture-specific settings ----------
+ifeq ($(ARCH),x86_64)
+  AS      := nasm
+  ASFLAGS := -f elf64 -g
+  LDFLAGS :=
+else ifeq ($(ARCH),aarch64)
+  # Placeholder for later
+  AS      := as
+  ASFLAGS := -g
+  LDFLAGS :=
+  $(error aarch64 support not implemented yet)
+else
+  $(error Unsupported ARCH=$(ARCH). Supported: x86_64)
+endif
+
+# ---------- targets ----------
+.PHONY: all run clean install testdata
+
+all: $(BIN)
+
+$(BUILD_DIR):
+	mkdir -p $@
+
+$(OBJ): $(SRC) | $(BUILD_DIR)
+	$(AS) $(ASFLAGS) $< -o $@
+
+$(BIN): $(OBJ)
+	ld $(LDFLAGS) -o $@ $<
+
+run: $(BIN)
+	./$(BIN)
+
+PREFIX ?= $(HOME)/.local
+install: $(BIN)
+	install -D $(BIN) $(DESTDIR)$(PREFIX)/bin/zfind
 
 clean:
-	rm -f zfind zfind.o
+	rm -rf build
 
 PRESET ?= default
-
 testdata:
 	python3 tools/mktrees.py --preset $(PRESET)
-
-.PHONY: run clean testdata
