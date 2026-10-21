@@ -3,3 +3,4 @@ zfind
 .envrc
 core
 core.*
+testdata/

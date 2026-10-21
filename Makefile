@@ -8,4 +8,9 @@ run: zfind
 clean:
 	rm -f zfind zfind.o
 
-.PHONY: run clean
+PRESET ?= default
+
+testdata:
+	python3 tools/mktrees.py --preset $(PRESET)
+
+.PHONY: run clean testdata
