@@ -14,6 +14,18 @@ zfind PATTERN                       # smart-case search
 zfind -0 PATTERN | xargs -0 ...     # NUL-separated output
 ```
 
+## Building
+
+```sh
+make            # build into build/x86_64/
+make run        # build, then run
+make install    # install to ~/.local/bin (PREFIX=, DESTDIR= overridable)
+```
+
+Sources live per architecture under `src/x86_64/`; the build is driven by a
+single `ARCH` variable, so `make ARCH=...` selects another port once one
+exists. For the toolchain use `nix develop`.
+
 ## Development
 
 Generate test and benchmark trees:
