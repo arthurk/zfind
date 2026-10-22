@@ -21,7 +21,7 @@ else
 endif
 
 # ---------- targets ----------
-.PHONY: all run clean install testdata
+.PHONY: all run clean testdata
 
 all: $(BIN)
 
@@ -36,10 +36,6 @@ $(BIN): $(OBJ)
 
 run: $(BIN)
 	./$(BIN)
-
-PREFIX ?= $(HOME)/.local
-install: $(BIN)
-	install -D $(BIN) $(DESTDIR)$(PREFIX)/bin/zfind
 
 clean:
 	rm -rf build

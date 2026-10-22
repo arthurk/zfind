@@ -15,7 +15,6 @@ Assembly filesystem searcher.
 make           # assemble + link
 make run       # build, then run
 make clean
-make install   # PREFIX ?= ~/.local, DESTDIR-aware
 make testdata  # PRESET ?= default; see tools/mktrees.py
 ```
 
