@@ -1,12 +1,12 @@
 default rel                     ; x86-64: address labels RIP-relative, not via implicit ABS
 
 ; zfind, "simple search" use case only:
-;   zfind [PATTERN]     search cwd for entries whose name matches PATTERN
+;   zfind [-h] [-0] [--limit N] [PATTERN]   search cwd for entries whose name matches PATTERN
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
 ; Hidden entries are skipped and .gitignore rules are applied when cwd is a
 ; git repository, but the pattern is matched against the name only.
-; shortcut: no options or path arguments, no regex/glob, and none of the
+; shortcut: no path arguments, no regex/glob, and none of the
 ;   ignore sources beyond .gitignore in the walked tree itself (no parent
 ;   dirs, no global gitignore, no .ignore, no [] or \ in patterns);
 ;   add use-case by use-case.
@@ -36,6 +36,16 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; shortcut: the writer streams the record it is on as it grows (polling every
 ;   5 ms for new lines) but an unfinished record further ahead is not written
 ;   until it is the current one, which is what keeps the order exact.
+;
+; --limit N is enforced by the writer alone: out_put counts the separators in the
+; bytes it is handed and, in the call that reaches the Nth, keeps the bytes
+; through it, flushes and exit_groups. No stop flag is needed and the prefix is
+; the DFS order above, so it is deterministic. Workers that ran ahead of the
+; writer die with the process.
+; shortcut: an error raised by a worker that ran ahead of the writer (tree or
+;   directory too large) still exits 1, so a capped run on a tree that triggers
+;   one may exit 0 or 1 depending on timing.
+; Requires an x86-64-v3 CPU (AVX2, POPCNT): out_put's separator count uses them.
 
 %define AT_FDCWD    -100
 %define PATH_MAX    4096
@@ -162,6 +172,8 @@ section .rodata
     igname      db '.gitignore', 0
     e_arg       db "zfind: unexpected argument", 10
     e_arg_e:
+    e_limit     db "zfind: invalid limit", 10
+    e_limit_e:
     e_write     db "zfind: write error", 10
     e_write_e:
     e_big       db "zfind: tree too large", 10
@@ -172,15 +184,19 @@ section .rodata
     h_long      db "--help", 0
     z_short     db "-0", 0
     z_long      db "--null", 0
-    help_msg    db "usage: zfind [-h] [-0] [PATTERN]", 10, 10
+    l_long      db "--limit", 0
+    l_eq        db "--limit=", 0     ; 8 bytes of prefix
+    help_msg    db "usage: zfind [-h] [-0] [--limit N] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). Case-insensitive", 10
                db "unless PATTERN contains an A-Z. Without a pattern every entry is", 10
                db "listed.", 10, 10
                db "Hidden entries are skipped and .gitignore is applied when the", 10
-               db "current directory is a git repository. Output is sorted by name.", 10, 10
+               db "current directory is a git repository. Entries are sorted by name", 10
+               db "within each directory; output follows depth-first order.", 10, 10
                db "  -h, --help  show this help and exit", 10
                db "  -0, --null  separate entries with NUL, not newline", 10
+               db "  --limit N   print at most N results, then stop (0 = none)", 10
     help_msg_e:
     align 8
     poll_ts     dq 0, 5000000         ; 5 ms: how stale streamed output can get
@@ -192,6 +208,7 @@ section .bss
     pat_len:    resq 1
     pat_ci:     resq 1                ; 1 = fold case (pattern has no A-Z)
     nul_sep:    resq 1                ; 1 = separate entries with NUL, not newline
+    lim_left:   resq 1                ; results left before the writer stops; -1 = no limit
     git_repo:   resq 1
     tstate_map: resq 1
     stacks:     resq 1
@@ -225,51 +242,95 @@ section .text
 _start:
     mov rbx, [rsp]                   ; argc
     lea rbp, [rsp+8]                 ; argv
-    cmp rbx, 1
-    je .no_pat
-    mov r13, [rbp+8]                 ; argv[1]
-    cmp byte [r13], '-'
-    jne .plain
-    mov rdi, r13
-    lea rsi, [z_short]                ; "-0"
-    call streq
-    je .null
-    mov rdi, r13
-    lea rsi, [z_long]                 ; "--null"
-    call streq
-    je .null
-    mov rdi, r13
-    lea rsi, [h_short]                ; "-h": help, before the '--' checks below
-    call streq
-    je .help
-    cmp byte [r13+1], '-'
-    jne .plain
-    mov rdi, r13
-    lea rsi, [h_long]                 ; "--help"
+    mov qword [lim_left], -1
+    xor r13d, r13d
+    mov r12, 1
+.args_loop:
+    cmp r12, rbx
+    jae .args_done
+    mov rdi, [rbp+r12*8]
+    cmp byte [rdi], '-'
+    jne .arg_pattern
+    cmp byte [rdi+1], 0
+    je .arg_pattern                    ; "-" alone
+
+    mov rdi, [rbp+r12*8]
+    lea rsi, [h_short]
     call streq
     je .help
-    cmp byte [r13+2], 0
-    jne .plain
-    cmp rbx, 2                       ; "--" alone: no pattern
-    je .no_pat
-    cmp rbx, 3                       ; "-- PATTERN"
+    mov rdi, [rbp+r12*8]
+    lea rsi, [h_long]
+    call streq
+    je .help
+    mov rdi, [rbp+r12*8]
+    lea rsi, [z_short]
+    call streq
+    je .opt_null
+    mov rdi, [rbp+r12*8]
+    lea rsi, [z_long]
+    call streq
+    je .opt_null
+    mov rdi, [rbp+r12*8]
+    lea rsi, [l_long]
+    call streq
+    je .opt_limit_next
+    mov rdi, [rbp+r12*8]
+    lea rsi, [l_eq]
+    call startswith
+    je .opt_limit_eq
+
+    mov rdi, [rbp+r12*8]
+    cmp byte [rdi+1], '-'
+    jne .arg_pattern                   ; unknown short: pattern, as before
+    cmp byte [rdi+2], 0
+    je .arg_end_opts                   ; "--"
+    jmp .arg_pattern                   ; unknown long: pattern, as before
+
+.opt_null:
+    mov qword [nul_sep], 1
+    inc r12
+    jmp .args_loop
+
+.opt_limit_next:
+    inc r12
+    cmp r12, rbx
+    jae bad_limit
+    mov rdi, [rbp+r12*8]
+    call parse_u64
+    jc bad_limit
+    mov [lim_left], rax
+    inc r12
+    jmp .args_loop
+
+.opt_limit_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 8                         ; len("--limit=")
+    call parse_u64
+    jc bad_limit
+    mov [lim_left], rax
+    inc r12
+    jmp .args_loop
+
+.arg_end_opts:
+    inc r12
+    cmp r12, rbx
+    jae .args_done
+    mov r13, [rbp+r12*8]
+    inc r12
+    cmp r12, rbx
     jne bad_args
-    mov r13, [rbp+16]
-    jmp .pat
-.plain:
-    cmp rbx, 2                       ; anything else would be a search path
+    jmp .args_done
+
+.arg_pattern:
+    mov r13, [rbp+r12*8]
+    inc r12
+    cmp r12, rbx
     jne bad_args
-    jmp .pat                         ; the pattern, not a flag: no -0 here
-.null:                                ; -0/--null: NUL-separated output. Like
-    mov qword [nul_sep], 1            ; "--", it takes an optional pattern and
-    cmp rbx, 3                       ; nothing else
-    je .pat2
-    cmp rbx, 2
-    jne bad_args
-    jmp .no_pat
-.pat2:
-    mov r13, [rbp+16]
-.pat:
+    jmp .args_done
+
+.args_done:
+    test r13, r13
+    jz .no_pat
     mov [pat_ptr], r13
     mov rdi, r13
     call strlen
@@ -278,6 +339,7 @@ _start:
 .no_pat:
     mov qword [pat_len], 0
     jmp .pat_ready
+
 .help:                                 ; write the usage, then leave: no walk
     mov edi, 1
     lea rsi, [help_msg]
@@ -286,6 +348,10 @@ _start:
     syscall
     xor edi, edi
     mov rax, 231                     ; exit_group
+    syscall
+.exit_zero:                            ; --limit 0: nothing to print, nothing to walk
+    xor edi, edi
+    mov eax, 231                     ; exit_group
     syscall
 .pat_ready:
     ; smart case: one A-Z anywhere in the pattern makes it case-sensitive
@@ -309,6 +375,8 @@ _start:
 .sc_done:
     xor edx, 1
     mov [pat_ci], rdx
+    cmp qword [lim_left], 0          ; --limit 0 exits before fstat, mmap and threads, so
+    je .exit_zero                    ;   from here on lim_left is -1 or positive
 
     ; .gitignore applies only inside a git repository; .git in cwd is
     ; the shortcut here (no ancestor walk, see the header)
@@ -473,6 +541,54 @@ streq:
     inc ecx
     jmp .loop
 .ret:
+    ret
+
+; parse_u64: rdi = NUL-terminated decimal -> rax = value, CF=1 on error
+parse_u64:
+    xor eax, eax
+    xor ecx, ecx                       ; digits seen
+.loop:
+    movzx edx, byte [rdi]
+    test dl, dl
+    jz .done
+    sub edx, '0'
+    cmp edx, 9
+    ja .bad
+    mov r8, rdx                        ; digit
+    mov rsi, 10
+    mul rsi                            ; rdx:rax = rax * 10
+    test rdx, rdx
+    jnz .bad                           ; overflow
+    add rax, r8
+    jc .bad
+    inc ecx
+    inc rdi
+    jmp .loop
+.done:
+    test ecx, ecx
+    jz .bad                            ; empty value
+    clc
+    ret
+.bad:
+    stc
+    ret
+
+; startswith: rdi = string, rsi = prefix -> ZF=1 if string begins with prefix
+startswith:
+    xor ecx, ecx
+.loop:
+    mov al, [rsi+rcx]
+    test al, al
+    jz .yes
+    cmp al, [rdi+rcx]
+    jne .no
+    inc ecx
+    jmp .loop
+.yes:
+    xor eax, eax                       ; ZF=1
+    ret
+.no:
+    or eax, 1                          ; ZF=0
     ret
 
 ; cpu_count -> rax = walking thread count, 2..MAX_THREADS (the main thread
@@ -780,17 +896,26 @@ recycle:
 
 ; out_put: rdi = bytes, rsi = length. One buffered write() per OUT_SZ, so a
 ; 1.5M-line search is a few hundred syscalls instead of one per line.
-out_put:
+; With --limit it also enforces the cap: count the separators first, and in the
+; call that reaches the Nth keep the bytes through it, flush and exit_group.
+; shortcut: with newline output N counts output lines, so a newline inside a
+;   name counts as a boundary; -0 counts entries exactly.
+out_put:                                ; rdi = bytes, rsi = length
+    ; lim_left is -1 (no cap) or > 0 on entry (--limit 0 exited at startup). It
+    ; is 0 only after this call has found the Nth separator.
     push rbx
     push r12
     mov rbx, rdi
     mov r12, rsi
-.loop:
+    mov rax, [lim_left]
+    cmp rax, -1
+    jne .count                          ; a cap is set: look at the separators
+.loop:                                  ; the copy loop, unchanged
     test r12, r12
     jz .done
     mov rcx, [out_len]
     mov rax, OUT_SZ
-    sub rax, rcx                     ; room left
+    sub rax, rcx                        ; room left
     cmp r12, rax
     jbe .fits
     mov rdx, rax
@@ -801,7 +926,7 @@ out_put:
     lea rdi, [out_buf]
     add rdi, rcx
     mov rsi, rbx
-    mov rcx, rdx                     ; bytes for this run
+    mov rcx, rdx                        ; bytes for this run
     rep movsb
     add [out_len], rdx
     sub r12, rdx
@@ -811,9 +936,70 @@ out_put:
     call out_flush
     jmp .loop
 .done:
+    cmp qword [lim_left], 0
+    je .stop                            ; the cap was reached in this call
     pop r12
     pop rbx
     ret
+.stop:
+    call out_flush
+    xor edi, edi
+    mov eax, 231                        ; exit_group: workers die with us
+    syscall
+
+.count:                                 ; rax = lim_left, > 0
+    mov r10d, 10
+    cmp qword [nul_sep], 0
+    je .have_sep
+    xor r10d, r10d
+.have_sep:
+    vmovd xmm1, r10d
+    vpbroadcastb ymm1, xmm1             ; the separator in every byte lane
+    mov rsi, rbx                        ; cursor
+    xor r8d, r8d                        ; separators seen
+    mov rcx, r12
+    shr rcx, 5                          ; whole 32-byte steps
+    jz .vec_done
+.vec:
+    vpcmpeqb ymm0, ymm1, [rsi]          ; unaligned load, inside [rbx, rbx+r12)
+    vpmovmskb edx, ymm0
+    popcnt edx, edx
+    add r8, rdx
+    add rsi, 32
+    dec rcx
+    jnz .vec
+.vec_done:
+    vzeroupper
+    lea rdi, [rbx+r12]                  ; end
+.tail:                                  ; fewer than 32 bytes left, branch-free
+    cmp rsi, rdi
+    jae .counted
+    xor edx, edx
+    cmp byte [rsi], r10b
+    sete dl
+    add r8, rdx
+    inc rsi
+    jmp .tail
+.counted:
+    cmp r8, rax
+    jae .cap
+    sub rax, r8                         ; the cap is not reached in this call
+    mov [lim_left], rax
+    jmp .loop
+.cap:                                   ; the rax-th separator ends the output
+    xor ecx, ecx                        ; cold: runs once, then the process exits
+.find:
+    cmp byte [rbx+rcx], r10b
+    jne .next_byte
+    dec rax
+    jz .found
+.next_byte:
+    inc rcx
+    jmp .find
+.found:
+    lea r12, [rcx+1]                    ; keep the bytes through that separator
+    mov qword [lim_left], 0             ; 0 = capped: .done flushes and exits
+    jmp .loop
 
 out_flush:
     xor ecx, ecx
@@ -1371,6 +1557,11 @@ wfail:
 bad_args:
     lea rsi, [e_arg]
     mov rdx, e_arg_e - e_arg
+    jmp die
+
+bad_limit:
+    lea rsi, [e_limit]
+    mov rdx, e_limit_e - e_limit
     jmp die
 
 big:
