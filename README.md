@@ -5,7 +5,8 @@ Finds files and directories.
 ## Features
 
 - Multi-threaded
-- Respects `.gitignore`, skips hidden files and VCS dirs unless asked
+- Skips hidden files; honors `.gitignore` only with `--gitignore`
+  (the default searches everything else)
 
 ## Usage
 
@@ -13,6 +14,8 @@ Finds files and directories.
 zfind PATTERN                       # smart-case search
 zfind -0 PATTERN | xargs -0 ...     # NUL-separated output
 zfind --limit 100 PATTERN           # first 100 results, then stop
+zfind --gitignore PATTERN           # apply .gitignore when cwd contains .git
+zfind -- -abc                       # search for a name starting with '-'
 ```
 
 ## Building

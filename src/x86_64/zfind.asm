@@ -1,11 +1,13 @@
 default rel                     ; x86-64: address labels RIP-relative, not via implicit ABS
 
 ; zfind, "simple search" use case only:
-;   zfind [-h] [-0] [--limit N] [PATTERN]   search cwd for entries whose name matches PATTERN
+;   zfind [-h] [-0] [--gitignore] [--limit N] [--] [PATTERN]   search cwd for entries whose name matches PATTERN
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
-; Hidden entries are skipped and .gitignore rules are applied when cwd is a
-; git repository, but the pattern is matched against the name only.
+; Hidden entries are skipped. .gitignore rules apply only when --gitignore
+; is given and cwd contains .git (the existing shortcut; no ancestor walk).
+; The pattern is matched against the name only. Use -- before a PATTERN that
+; starts with -.
 ; shortcut: no path arguments, no regex/glob, and none of the
 ;   ignore sources beyond .gitignore in the walked tree itself (no parent
 ;   dirs, no global gitignore, no .ignore, no [] or \ in patterns);
@@ -174,6 +176,8 @@ section .rodata
     e_arg_e:
     e_limit     db "zfind: invalid limit", 10
     e_limit_e:
+    e_flag      db "zfind: unknown option", 10
+    e_flag_e:
     e_write     db "zfind: write error", 10
     e_write_e:
     e_big       db "zfind: tree too large", 10
@@ -186,17 +190,21 @@ section .rodata
     z_long      db "--null", 0
     l_long      db "--limit", 0
     l_eq        db "--limit=", 0     ; 8 bytes of prefix
-    help_msg    db "usage: zfind [-h] [-0] [--limit N] [PATTERN]", 10, 10
+    g_long      db "--gitignore", 0
+    help_msg    db "usage: zfind [-h] [-0] [--gitignore] [--limit N] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). Case-insensitive", 10
                db "unless PATTERN contains an A-Z. Without a pattern every entry is", 10
                db "listed.", 10, 10
-               db "Hidden entries are skipped and .gitignore is applied when the", 10
-               db "current directory is a git repository. Entries are sorted by name", 10
-               db "within each directory; output follows depth-first order.", 10, 10
+               db "Hidden entries are skipped. With --gitignore, .gitignore rules are", 10
+               db "applied when the current directory contains .git. Use -- before a", 10
+               db "PATTERN that starts with -. Entries are sorted by name within each", 10
+               db "directory; output follows depth-first order.", 10, 10
                db "  -h, --help  show this help and exit", 10
                db "  -0, --null  separate entries with NUL, not newline", 10
+               db "  --gitignore respect .gitignore rules when cwd contains .git", 10
                db "  --limit N   print at most N results, then stop (0 = none)", 10
+               db "  --          end options; a following argument is the PATTERN", 10
     help_msg_e:
     align 8
     poll_ts     dq 0, 5000000         ; 5 ms: how stale streamed output can get
@@ -209,6 +217,7 @@ section .bss
     pat_ci:     resq 1                ; 1 = fold case (pattern has no A-Z)
     nul_sep:    resq 1                ; 1 = separate entries with NUL, not newline
     lim_left:   resq 1                ; results left before the writer stops; -1 = no limit
+    res_ig:     resq 1                ; 1 = --gitignore: apply .gitignore rules in a repo cwd
     git_repo:   resq 1
     tstate_map: resq 1
     stacks:     resq 1
@@ -278,16 +287,25 @@ _start:
     lea rsi, [l_eq]
     call startswith
     je .opt_limit_eq
+    mov rdi, [rbp+r12*8]
+    lea rsi, [g_long]
+    call streq
+    je .opt_git
 
     mov rdi, [rbp+r12*8]
     cmp byte [rdi+1], '-'
-    jne .arg_pattern                   ; unknown short: pattern, as before
+    jne bad_flag                       ; unknown short flag
     cmp byte [rdi+2], 0
     je .arg_end_opts                   ; "--"
-    jmp .arg_pattern                   ; unknown long: pattern, as before
+    jmp bad_flag                       ; unknown long flag
 
 .opt_null:
     mov qword [nul_sep], 1
+    inc r12
+    jmp .args_loop
+
+.opt_git:
+    mov qword [res_ig], 1
     inc r12
     jmp .args_loop
 
@@ -378,8 +396,12 @@ _start:
     cmp qword [lim_left], 0          ; --limit 0 exits before fstat, mmap and threads, so
     je .exit_zero                    ;   from here on lim_left is -1 or positive
 
-    ; .gitignore applies only inside a git repository; .git in cwd is
-    ; the shortcut here (no ancestor walk, see the header)
+    ; .gitignore applies only inside a repository, and only when
+    ; --gitignore was given; a .git entry in cwd is the shortcut here (no
+    ; ancestor walk, see the header). Without the flag this whole block is
+    ; skipped: git_repo stays 0 and every gate downstream reads 0.
+    cmp qword [res_ig], 0
+    je .norepo
     mov rax, 262                     ; newfstatat
     mov rdi, AT_FDCWD
     lea rsi, [gitname]
@@ -1564,6 +1586,11 @@ bad_limit:
     mov rdx, e_limit_e - e_limit
     jmp die
 
+bad_flag:
+    lea rsi, [e_flag]
+    mov rdx, e_flag_e - e_flag
+    jmp die
+
 big:
     lea rsi, [e_big]
     mov rdx, e_big_e - e_big
@@ -2066,7 +2093,8 @@ walk_dir:
     ; [rsp]=saved ig_nrules [rsp+8]=saved chain [rsp+16]=count
     ; [rsp+24]=sort table [rsp+32]=split [rsp+40]=dir fd (-1: none/closed)
     ; [rsp+48]=scratch mark
-    ; [rsp+56]=while parsing: this directory lists a .gitignore; while iterating:
+    ; [rsp+56]=while parsing: this directory lists a .gitignore (as git_repo:
+    ;          so 0 unless --gitignore was given and cwd contains .git); while iterating:
     ;          the current entry was matched during parsing
     mov rax, [r14+ig_nrules]
     mov [rsp], rax
@@ -2138,6 +2166,8 @@ walk_dir:
     ; regard to case (OR 0x20 folds letters; the '.' and the NUL are checked
     ; exactly), because open() on a case-folding filesystem would have found
     ; it under any spelling. The 8-byte load stays inside the getdents buffer.
+    ; The slot is set to git_repo, so unless ignore rules are active the
+    ; recorded slot stays 0 and load_ignore is never called — no branch, no code.
     mov rax, [r15]
     mov rdx, 0x2020202020202020
     or rax, rdx
@@ -2150,7 +2180,8 @@ walk_dir:
     jne .pskip
     cmp byte [r15+10], 0
     jne .pskip
-    mov qword [rsp+56], 1
+    mov rax, [git_repo]              ; record git_repo (1 only if --gitignore AND repo):
+    mov [rsp+56], rax                ;   0 suppresses load_ignore with no branch added
     jmp .pskip                       ; ".", "..", and every hidden entry
 .visible:
     ; Filter before collecting. A name that does not match the pattern only
