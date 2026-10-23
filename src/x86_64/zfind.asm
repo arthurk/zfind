@@ -250,6 +250,7 @@ section .bss
     tok_cap:    resq 1
     tok_claim:  resq 1                ; next token a worker may claim
     walk_done:  resq 1                ; dword: the token stream is complete
+    alignb 8                          ; futex words must be naturally aligned
     ev_seq:     resq 1                ; dword futex word: tokens / done / walk_done
     ev_waiters: resq 1
     bp_seq:     resq 1                ; dword futex word: the writer made progress
