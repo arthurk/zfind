@@ -675,8 +675,8 @@ cpu_count:
 %endif
     mov eax, 204                     ; sched_getaffinity
     xor edi, edi                     ; pid 0 = this thread
-    lea rsi, [cpuset]
-    mov edx, 128
+    mov esi, 128                     ; cpusetsize
+    lea rdx, [cpuset]                ; mask
     syscall
     test rax, rax
     js .fallback
