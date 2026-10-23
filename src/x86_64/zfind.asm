@@ -7,8 +7,10 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; Every entry is searched, including hidden names and dot-directories like
 ; .git. With --no-hidden, entries whose name starts with . are skipped.
 ; .gitignore rules apply only when --gitignore is given and cwd contains
-; .git (the existing shortcut; no ancestor walk). The pattern is matched
-; against the name only. Use -- before a PATTERN that starts with -.
+; .git (the existing shortcut; no ancestor walk); with the flag, the .git
+; entry itself is pruned - never printed, never walked - because git never
+; tracks anything under it. The pattern is matched against the name only.
+; Use -- before a PATTERN that starts with -.
 ; shortcut: no path arguments, no regex/glob, and none of the
 ;   ignore sources beyond .gitignore in the walked tree itself (no parent
 ;   dirs, no global gitignore, no .ignore, no [] or \ in patterns);
@@ -201,12 +203,13 @@ section .rodata
                db "Hidden entries are searched like any other, .git included; with", 10
                db "--no-hidden, entries whose name starts with . are skipped. With", 10
                db "--gitignore, .gitignore rules are applied when the current", 10
-               db "directory contains .git. Use -- before a PATTERN that starts", 10
-               db "with -. Entries are sorted by name within each directory;", 10
-               db "output follows depth-first order.", 10, 10
+               db "directory contains .git, and the .git entry itself is skipped:", 10
+               db "git never tracks anything under it. Use -- before a PATTERN", 10
+               db "that starts with -. Entries are sorted by name within each", 10
+               db "directory; output follows depth-first order.", 10, 10
                db "  -h, --help  show this help and exit", 10
                db "  -0, --null  separate entries with NUL, not newline", 10
-               db "  --gitignore respect .gitignore rules when cwd contains .git", 10
+               db "  --gitignore respect .gitignore rules when cwd contains .git; skip .git", 10
                db "  --no-hidden skip entries whose name starts with .", 10
                db "  --limit N   print at most N results, then stop (0 = none)", 10
                db "  --          end options; a following argument is the PATTERN", 10
@@ -2195,6 +2198,8 @@ walk_dir:
     ; slot is set to git_repo, so unless ignore rules are active the
     ; recorded slot stays 0 and load_ignore is never called — no branch, no
     ; code.
+    ; .git itself is pruned at the gate below, name-based and gated on
+    ; git_repo; the slot logic above is untouched by it.
     mov rax, [r15]
     mov rdx, 0x2020202020202020
     or rax, rdx
@@ -2210,6 +2215,33 @@ walk_dir:
     mov rax, [git_repo]              ; record git_repo (1 only if --gitignore AND repo):
     mov [rsp+56], rax                ;   0 suppresses load_ignore with no branch added
 .gate:
+    ; .git itself, in a repo cwd under --gitignore: pruned by name. Git
+    ; never tracks anything under it: its walk drops the exact .git name
+    ; silently, its path checks reject the lookalike spellings outright
+    ; (git add .Git -> "error: invalid path"), no ignore rule reaches it
+    ; and no ! rule brings it back, so the prune behaves like a rule that
+    ; always matches, applied before the rules are even loaded. Any
+    ; d_type: directories, submodule marker files, dot-symlinks. Exact
+    ; ".git" only — no fold, unlike the .gitignore probe above: nothing
+    ; is being opened here, and a case-spelling is distinct filesystem
+    ; content that must stay searched (git's own path checks reject those
+    ; spellings too — recorded narrowness: the prune models only the
+    ; exact name git itself writes). The loads stay
+    ; inside the dirent record for every name: a reclen is a multiple of 8
+    ; and always carries room for a 4-character name plus its terminator
+    ; past the 19-byte fixed prefix (24 minimum), so the 4-byte compare and
+    ; the NUL probe — 5 bytes, not 8 — never leave the record, let alone
+    ; the buffer; no guarded read is needed and no sibling storage can be
+    ; read, unlike the unguarded 8-byte probe above.
+    cmp qword [git_repo], 0
+    je .gate_hid
+    cmp dword [r15], '.git'          ; 4 chars, packed little-endian
+    jne .gate_hid
+    cmp byte [r15+4], 0
+    jne .gate_hid
+    jmp .pskip                       ; untracked by construction: never
+                                     ;   collected, never descended into
+.gate_hid:
     cmp qword [res_hid], 0
     jne .pskip                       ; --no-hidden: hidden entries stay hidden
 .visible:                            ; default falls through: the dot-entry
