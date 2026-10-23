@@ -16,28 +16,32 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ;   dirs, no global gitignore, no .ignore, no [] or \ in patterns);
 ;   add use-case by use-case.
 ;
-; The walk is parallel. Thread 0 walks down until a directory holds
-; at least 2*threads subdirectories, then hands each of those subtrees to the
-; other threads as a task and keeps walking. The main thread does no walking:
-; it only writes. Every unit of output - a task's subtree, or a run of lines the
-; dispatching walk printed itself - is a "record": a chain of 16 KiB blocks that
-; its producer appends lines to while the writer is already reading them. The
-; dispatching walk publishes one token (a record pointer) per record, in DFS
-; order; workers claim the tokens in that order and the writer replays them in
-; that order, so the single-threaded byte order is reproduced exactly, and the
-; first lines reach stdout while the walk is still running.
+; The walk is parallel.  Output is an explicit tree of groups.  A group's
+; items are ordered text records and child groups; the writer walks that tree
+; depth-first, left-to-right, so the single-threaded byte order is reproduced
+; exactly while producers run ahead.  A global LIFO stack holds groups that are
+; ready to run; any worker may claim one.  The root group is the dispatcher: it
+; pre-scans a wide level, creates and pushes every child group, then links them
+; in sorted order.  A group whose root was narrow enough may split again; for a
+; very wide root, child groups walk their subtrees inline so the parent-fd
+; relative-open optimisation is not lost to thousands of short groups.
+; Directories with at least RANGE_MIN entries are copied into contiguous sort
+; slices, one group per slice, which also covers huge all-files directories
+; such as /nix/store/.links.
 ;
-; Memory is bounded two ways. Names, sort tables and ignore rules live in a
+; Memory is bounded two ways.  Names, sort tables and ignore rules live in a
 ; per-thread scratch region with stack discipline: walk_dir puts the scratch top
-; back when it returns, so a directory's entries die with its frame. Output
+; back when it returns, so a directory's entries die with its frame.  Output
 ; blocks go back to the thread that made them as soon as the writer has written
-; them, and a producer more than BLK_LIMIT blocks ahead of the writer waits -
-; except the one the writer is waiting on, so the wait cannot deadlock. Only
-; records, tokens, rule chain nodes of the dispatching walk and the blocks
-; themselves come from the shared arena.
-; shortcut: subtrees are split at the first level with >= 2*threads
-;   subdirectories, so a tree whose every level fans out less than that is
-;   still walked single-threaded; descend deeper when that shows up in a bench.
+; them; a producer more than BLK_LIMIT blocks ahead waits, except the record the
+; writer is on, so backpressure cannot deadlock.  Records, groups, paths,
+; ignore-chain nodes and range copies are arena-backed and never freed; the
+; block limit and SPLIT_CAP are the bounded-memory knobs.
+; shortcut: wide splitting starts at the root; if that first level has more
+;   than NESTED_WIDTH_MAX children, child groups do not split again.  This
+;   keeps /nix/store at one group per package while a small repo can still
+;   split deeper.  A directory with an enormous number of entries uses range
+;   slices instead of one group per child.
 ; shortcut: the writer streams the record it is on as it grows (polling every
 ;   5 ms for new lines) but an unfinished record further ahead is not written
 ;   until it is the current one, which is what keeps the order exact.
@@ -77,7 +81,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
                                       ;   dropped; raise this if a real file
                                       ;   ever exceeds that
 %define IG_MAX      1024             ; rules kept at once (per thread)
-%define ARENA_SZ    (1 << 30)        ; records, tokens, output blocks: one mmap
+%define ARENA_SZ    (1 << 30)        ; records, groups, output blocks: one mmap
                                       ;   (chunks are handed out on demand,
                                       ;    pages fault in on use)
 %ifndef SCRATCH_SZ
@@ -92,7 +96,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define BLK_SZ      16384            ; one output block, header included
 %endif
 %ifndef BLK_LIMIT
-%define BLK_LIMIT   1024             ; blocks in flight before producers wait
+%define BLK_LIMIT   14336            ; blocks in flight before producers wait
 %endif
 %define BLK_HDR     32
 %define FD_KEEP_MAX  64               ; directories one thread keeps open while recursing
@@ -133,11 +137,12 @@ struc TSTATE
   .ig_chain:  resq 1                ; ancestor rules, innermost node first
   .cur_task:  resq 1                ; record we append lines to
   .cur_blk:   resq 1                ; its last block
+  .cur_grp:   resq 1                ; group whose item list we append to
+  .no_split:  resq 1                ; 1 = this walk must not wide-split
   .tab_ptr:   resq 1                ; {key, name} table (16 bytes each) of the current dir
   .tab_n:     resq 1
   .tab_cap:   resq 1
   .blk_free:  resq 1                ; blocks the writer gave back to us
-  .mode:      resq 1                ; 1 = dispatching walk (main thread only)
   .parent_fd: resq 1                ; handed to the next walk_dir: open relative to it (-1: by path)
   .child_name: resq 1               ; ... the entry name to open there
 endstruc
@@ -152,19 +157,44 @@ endstruc
 %define ig_chain   TSTATE.ig_chain
 %define cur_task   TSTATE.cur_task
 %define cur_blk    TSTATE.cur_blk
-%define mode       TSTATE.mode
+%define cur_grp    TSTATE.cur_grp
 
 %define TSTATE_STRIDE ((TSTATE_size + 63) & ~63)
 
-; record (arena): one unit of output. A task has a path and rule chain to walk;
-; a text record holds lines the dispatching walk printed itself.
-%define REC_PATH    0
-%define REC_PATHLEN 8
-%define REC_CHAIN   16
-%define REC_HEAD    24               ; first output block (0 until there is output)
-%define REC_KIND    32               ; 0 = task, 1 = text
-%define REC_DONE    40               ; dword, set after the last block is final
-%define REC_SZ      64
+; record (arena): one unit of output.  It holds a chain of output blocks and
+; is linked into its owning group before the first block is requested.
+%define REC_HEAD     0               ; first output block (0 until there is output)
+%define REC_DONE     8               ; dword, set after the last block is final
+%define REC_NEXT    16               ; tagged next item in the owning group
+%define REC_SZ      32
+; group (arena): one node of the output tree and one unit of work
+%define GRP_WORK_NEXT  0             ; LIFO work-stack link
+%define GRP_ITEM_NEXT  8             ; tagged next item in the parent's list
+%define GRP_STATE     16              ; dword: 0 NEW, 1 RUNNING, 2 DONE
+%define GRP_KIND      20              ; dword: 0 directory, 1 range
+%define GRP_FIRST     24              ; tagged first item (0 = none)
+%define GRP_LAST      32              ; tagged last item (producer-private)
+%define GRP_PATH      40              ; arena path; empty root uses 0
+%define GRP_PATHLEN   48
+%define GRP_CHAIN     56              ; arena ignore chain
+%define GRP_TAB       64              ; range: copied {key,name} table
+%define GRP_NAMES     72              ; range: copied name records
+%define GRP_N         80              ; range: table entries
+%define GRP_SZ        96
+%define GRP_NEW       0
+%define GRP_RUNNING   1
+%define GRP_DONE      2
+%define GRP_DIR       0
+%define GRP_RANGE     1
+%define GRP_TAG       1
+%define EMIT_STACK_MAX 8192
+%define RANGE_MIN     (1 << 17)
+%ifndef SPLIT_CAP
+%define SPLIT_CAP     8192             ; upper bound on wide-split groups
+%endif
+%define NESTED_WIDTH_MAX 20           ; wider root: child groups do not split again
+%define CHUNK_MIN     (1 << 11)
+%define MAX_RANGE_CHUNKS 128
 ; ignore-rule chain node (arena)
 %define NODE_RULES  0
 %define NODE_PARENT 8
@@ -245,13 +275,15 @@ section .bss
     split_min:  resq 1                ; dispatch a level with this many subdirs
     fd_keep:    resq 1                ; per-thread budget of directories kept open
     rl_buf:     resq 2
-    tok_ptr:    resq 1                ; token stream: one record pointer each
-    tok_n:      resq 1                ; published count (dword); thread 0 writes
-    tok_cap:    resq 1
-    tok_claim:  resq 1                ; next token a worker may claim
-    walk_done:  resq 1                ; dword: the token stream is complete
+    work_head:  resq 1                ; LIFO of NEW groups
+    pending:    resq 1                ; groups not yet DONE
+    group_count: resq 1               ; wide-split groups created
+    root_width: resq 1                ; dirs at the first split level
+    alignb 64
+    root_grp:   resb GRP_SZ           ; static root group
+    emit_stack: resb EMIT_STACK_MAX * 24
     alignb 8                          ; futex words must be naturally aligned
-    ev_seq:     resq 1                ; dword futex word: tokens / done / walk_done
+    ev_seq:     resq 1                ; dword futex word: work / group state changes
     ev_waiters: resq 1
     bp_seq:     resq 1                ; dword futex word: the writer made progress
     bp_waiters: resq 1
@@ -506,9 +538,22 @@ _start:
     xor ecx, ecx
 %endif
     mov [fd_keep], rcx
-    mov rax, [nthreads]
-    shl rax, 1                       ; dispatch a level with 2*threads subdirs
+    mov eax, 2                       ; dispatch any level with 2+ subdirs
     mov [split_min], rax
+
+    ; static root group: the whole output tree and the first work item
+    lea rax, [root_grp]
+    mov qword [rax+GRP_WORK_NEXT], 0
+    mov qword [rax+GRP_ITEM_NEXT], 0
+    mov dword [rax+GRP_STATE], GRP_NEW
+    mov dword [rax+GRP_KIND], GRP_DIR
+    mov qword [rax+GRP_FIRST], 0
+    mov qword [rax+GRP_LAST], 0
+    mov qword [rax+GRP_PATH], 0
+    mov qword [rax+GRP_PATHLEN], 0
+    mov qword [rax+GRP_CHAIN], 0
+    mov qword [work_head], rax
+    mov qword [pending], 1
 
     ; one state block per thread, zeroed by the kernel
     xor edi, edi
@@ -589,7 +634,6 @@ _start:
     jmp .spawn_loop
 .spawned:
     call emit_main                   ; the main thread only writes
-
     xor edi, edi                     ; every normal path exits 0, even no match
     mov rax, 231                     ; exit_group
     syscall
@@ -708,35 +752,62 @@ cpu_count:
     ret
 
 ; thread_main: entered by a fresh clone with r12 = its id, r13 = its state block
-; and its own stack. Thread 0 first runs the dispatching walk, which publishes
-; tokens as it goes so the other threads start on subtrees at once; then it
-; joins them.
+; and its own stack.  Every thread claims groups from the shared work stack
+; until pending is zero; whoever claims the root group performs its prepass and
+; publishes the first level for the others.
 thread_main:
     mov r14, r13
     mov [r14+TSTATE.id], r12
     mov qword [r14+TSTATE.parent_fd], -1
-    test r12, r12
-    jnz .work
-    mov qword [r14+TSTATE.mode], 1
-    call walk_dir                    ; depth 0 .. the first wide level
-    call finish_dispatch
-.work:
-    call run_tasks
+    call run_workers
     mov eax, 60                      ; SYS_exit: leave the other threads alone
     xor edi, edi
     syscall
 
-; finish_dispatch: close the open text record and publish "no more tokens"
-finish_dispatch:
-    mov rdi, [r14+cur_task]
-    test rdi, rdi
-    jz .end
-    mov qword [r14+cur_task], 0
-    mov qword [r14+cur_blk], 0
-    call mark_done
-.end:
-    mov dword [walk_done], 1
-    jmp notify_ev
+; run_workers: claim NEW groups from the LIFO until pending is zero and none
+; are left.  The snapshot-before-check protocol prevents lost wake-ups.
+run_workers:
+.loop:
+    mov edx, [ev_seq]
+    cmp qword [pending], 0
+    jne .try
+    cmp qword [work_head], 0
+    je .done
+.try:
+    call pop_group
+    test rax, rax
+    jz .sleep
+    mov rdi, rax
+    xor esi, esi                     ; path_ready = 0
+    call walk_group
+    jmp .loop
+.sleep:
+    xor r10d, r10d
+    call ev_sleep
+    jmp .loop
+.done:
+    ret
+
+; pop_group -> rax = a NEW group, now RUNNING, or 0.  Stale stack entries for
+; groups that another worker already claimed, or that finished, are skipped.
+pop_group:
+.retry:
+    mov rax, [work_head]
+    test rax, rax
+    jz .none
+    mov rcx, [rax+GRP_WORK_NEXT]
+    lock cmpxchg [work_head], rcx
+    jne .retry
+    mov rdx, rax
+    xor eax, eax                     ; expected state NEW
+    mov ecx, GRP_RUNNING
+    lock cmpxchg dword [rdx+GRP_STATE], ecx
+    jne .retry
+    mov rax, rdx
+    ret
+.none:
+    xor eax, eax
+    ret
 
 ; notify_ev: something the writer or an idle worker may be waiting for changed.
 ; The increment is the full barrier that orders the caller's stores before the
@@ -765,70 +836,231 @@ ev_sleep:
     lock dec dword [ev_waiters]
     ret
 
-; run_tasks: claim tokens in order and walk the tasks among them, until the
-; stream is complete and every token is claimed
-run_tasks:
-    push rbx
-    push r12
-    push r13
-.claim:
-    mov r12d, [ev_seq]               ; before the checks, see ev_sleep
-    mov r13d, [walk_done]            ; before tok_n: a 1 means tok_n is final
-    mov rax, [tok_claim]
-    mov ecx, [tok_n]
-    cmp rax, rcx
-    jae .none
-    lea rdx, [rax+1]
-    lock cmpxchg [tok_claim], rdx    ; rax is the implicit expected value
-    jne .claim
-    mov rcx, [tok_ptr]               ; after tok_n: the array has that many entries
-    mov rbx, [rcx+rax*8]
-    cmp qword [rbx+REC_KIND], 0
-    jne .claim                       ; text record: thread 0 fills and closes it
-    mov rdi, rbx
-    call run_task
-    mov rdi, rbx
-    call mark_done
-    jmp .claim
-.none:
-    test r13d, r13d
-    jnz .exit
-    mov edx, r12d
-    xor r10d, r10d                   ; no timeout: a token or walk_done will come
-    call ev_sleep
-    jmp .claim
-.exit:
-    pop r13
-    pop r12
-    pop rbx
-    ret
-
-; run_task: rdi = task record. Walk its subtree exactly as the dispatching walk
-; would have, appending every printed line to the task's block chain.
-run_task:
+; walk_group: rdi = GRP.  Saves the caller's walk context, executes the group's
+; directory or range body, marks it DONE, then helps any child groups that are
+; still NEW.  f_deep is deliberately preserved: an inline child runs while the
+; caller's directory descriptors are still open.
+walk_group:
     push rbx
     push rbp
     push r12
     push r13
-    push r15
+    sub rsp, 96
+    mov rax, [r14+TSTATE.no_split]
+    mov [rsp+0], rax
+    mov rax, [r14+path_len]
+    mov [rsp+8], rax
+    mov rax, [r14+f_deep]
+    mov [rsp+16], rax
+    mov rax, [r14+ig_nrules]
+    mov [rsp+24], rax
+    mov rax, [r14+ig_chain]
+    mov [rsp+32], rax
+    mov rax, [r14+cur_task]
+    mov [rsp+40], rax
+    mov rax, [r14+cur_blk]
+    mov [rsp+48], rax
+    mov rax, [r14+cur_grp]
+    mov [rsp+56], rax
+    mov rax, [r14+TSTATE.parent_fd]
+    mov [rsp+64], rax
+    mov rax, [r14+TSTATE.child_name]
+    mov [rsp+72], rax
+    mov rax, [r14+TSTATE.tab_ptr]
+    mov [rsp+80], rax
+    mov rax, [r14+TSTATE.tab_n]
+    mov [rsp+88], rax
     mov rbx, rdi
-    mov rbp, [rdi+REC_PATH]
-    mov rcx, [rdi+REC_PATHLEN]
+    mov [r14+cur_grp], rbx
+    mov qword [r14+cur_task], 0
+    mov qword [r14+cur_blk], 0
+    mov rdx, [rbx+GRP_PATHLEN]
+    mov rsi, [rbx+GRP_PATH]
     lea rdi, [r14+path_buf]
-    mov [r14+path_len], rcx
-    inc rcx                          ; path + NUL
-    mov rsi, rbp
+    test rdx, rdx
+    jz .term
+    mov rcx, rdx
     rep movsb
-    mov rax, [rbx+REC_CHAIN]
+.term:
+    mov byte [rdi], 0
+    mov [r14+path_len], rdx
+    mov rax, [rbx+GRP_CHAIN]
     mov [r14+ig_chain], rax
     mov qword [r14+ig_nrules], 0
-    mov qword [r14+f_deep], 0
-    mov qword [r14+TSTATE.mode], 0   ; lines go to the task, not to the token stream
-    mov [r14+cur_task], rbx
-    mov qword [r14+cur_blk], 0
+    mov qword [r14+TSTATE.parent_fd], -1
+    lea rax, [root_grp]
+    cmp rbx, rax
+    je .root_group
+    cmp qword [root_width], NESTED_WIDTH_MAX
+    jbe .root_group
+    mov qword [r14+TSTATE.no_split], 1
+.root_group:
+    cmp dword [rbx+GRP_KIND], GRP_RANGE
+    je .range
     call walk_dir
+    jmp .body_done
+.range:
+    call walk_range
+.body_done:
+    mov rdi, [r14+cur_task]
+    test rdi, rdi
+    jz .no_record
     mov qword [r14+cur_task], 0
+    mov qword [r14+cur_blk], 0
+    call mark_done
+.no_record:
+    mov dword [rbx+GRP_STATE], GRP_DONE
+    lock dec qword [pending]
+    call notify_ev
+    mov rdi, rbx
+    call help_group
+    mov rax, [rsp+0]
+    mov [r14+TSTATE.no_split], rax
+    mov rax, [rsp+8]
+    mov [r14+path_len], rax
+    mov rax, [rsp+16]
+    mov [r14+f_deep], rax
+    mov rax, [rsp+24]
+    mov [r14+ig_nrules], rax
+    mov rax, [rsp+32]
+    mov [r14+ig_chain], rax
+    mov rax, [rsp+40]
+    mov [r14+cur_task], rax
+    mov rax, [rsp+48]
+    mov [r14+cur_blk], rax
+    mov rax, [rsp+56]
+    mov [r14+cur_grp], rax
+    mov rax, [rsp+64]
+    mov [r14+TSTATE.parent_fd], rax
+    mov rax, [rsp+72]
+    mov [r14+TSTATE.child_name], rax
+    mov rax, [rsp+80]
+    mov [r14+TSTATE.tab_ptr], rax
+    mov rax, [rsp+88]
+    mov [r14+TSTATE.tab_n], rax
+    add rsp, 96
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; push_group: rdi = a fully initialised NEW group.  Publish it on the global
+; LIFO and account for it before the notify.
+push_group:
+    lock inc qword [pending]
+.retry:
+    mov rax, [work_head]
+    mov [rdi+GRP_WORK_NEXT], rax
+    lock cmpxchg [work_head], rdi
+    jne .retry
+    jmp notify_ev
+
+; make_group: rdi = path length.  Copies path_buf[0..len) and the current ignore
+; chain into a fully initialised NEW directory group and pushes it.  The group
+; is not linked yet; the wide prepass builds all siblings before publishing.
+make_group:
+    lock inc qword [group_count]
+    push rbx
+    push rbp
+    push r12
+    push r13
+    mov r12, rdi
+    mov rdi, GRP_SZ
+    call alloc
+    mov rbx, rax
+    lea rdi, [r12+1]
+    call alloc
+    mov r13, rax
+    lea rsi, [r14+path_buf]
+    mov rdi, r13
+    mov rcx, r12
+    rep movsb
+    mov byte [rdi], 0
+    mov qword [rbx+GRP_WORK_NEXT], 0
+    mov qword [rbx+GRP_ITEM_NEXT], 0
+    mov dword [rbx+GRP_STATE], GRP_NEW
+    mov dword [rbx+GRP_KIND], GRP_DIR
+    mov qword [rbx+GRP_FIRST], 0
+    mov qword [rbx+GRP_LAST], 0
+    mov [rbx+GRP_PATH], r13
+    mov [rbx+GRP_PATHLEN], r12
+    mov rax, [r14+ig_chain]
+    mov [rbx+GRP_CHAIN], rax
+    mov qword [rbx+GRP_TAB], 0
+    mov qword [rbx+GRP_NAMES], 0
+    mov qword [rbx+GRP_N], 0
+    mov rdi, rbx
+    call push_group
+    mov rax, rbx
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; link_group: rdi = a NEW (or already claimed/done) child group.  Close the
+; current text record so the group lands at this exact output position, link
+; it, then claim it if it is still NEW.  Claiming means executing it inline;
+; the wide prepass has already pushed every sibling, so this cannot serialise
+; the level.  If another worker claimed it, that worker owns it.
+link_group:
+    push rbx
+    push r15
+    mov r15, rdi
+    mov rdi, [r14+cur_task]
+    test rdi, rdi
+    jz .no_record
+    mov qword [r14+cur_task], 0
+    mov qword [r14+cur_blk], 0
+    call mark_done
+.no_record:
+    mov rdi, [r14+cur_grp]
+    mov rsi, r15
+    mov edx, GRP_TAG
+    call append_item
+    xor eax, eax
+    mov ecx, GRP_RUNNING
+    lock cmpxchg dword [r15+GRP_STATE], ecx
+    jne .done
+    mov rdi, r15
+    call walk_group
+.done:
     pop r15
+    pop rbx
+    ret
+
+; help_group: rdi = a completed group.  Make one pass over its immutable item
+; list and execute any child group still NEW.  Children claimed by another
+; worker are simply skipped; text records are not work.
+help_group:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13, [r12+GRP_FIRST]
+.loop:
+    test r13, r13
+    jz .done
+    mov rax, r13
+    test al, 1
+    jz .record
+    and rax, -2
+    mov rbx, rax
+    mov r13, [rbx+GRP_ITEM_NEXT]     ; immutable: advance before executing
+    xor eax, eax                     ; expected NEW
+    mov ecx, GRP_RUNNING
+    lock cmpxchg dword [rbx+GRP_STATE], ecx
+    jne .loop
+    mov rdi, rbx
+    call walk_group
+    jmp .loop
+.record:
+    and rax, -2
+    mov r13, [rax+REC_NEXT]
+    jmp .loop
+.done:
     pop r13
     pop r12
     pop rbp
@@ -840,46 +1072,136 @@ mark_done:
     mov dword [rdi+REC_DONE], 1
     jmp notify_ev
 
-; emit_main: the main thread. Replays the token stream in order, writing each
-; record as its producer fills it, and flushes whenever it has to wait, so
-; output is as fresh as the walk can make it.
+; emit_main: the main thread.  It walks the output tree in order, writing each
+; record as its producer fills it, and flushes whenever it has to wait.
 emit_main:
+    lea rdi, [root_grp]
+    jmp emit_group
+
+; emit_group: rdi = root group.  One explicit stack frame per open group:
+;   +0 group, +8 current tagged item, +16 ready byte (24-byte stride).
+; The current item is kept until its NEXT is known to be zero and the group is
+; observed DONE; STATE is always read before FIRST/NEXT.  See
+; IMPL_TASK_SPLIT.md section 7.
+emit_group:
     push rbx
     push rbp
     push r12
     push r13
     push r14
     push r15
-    xor r12d, r12d                   ; next token to write
-.tok:
-    mov r15d, [ev_seq]               ; before the checks, see ev_sleep
-    mov r13d, [walk_done]            ; before tok_n: a 1 means tok_n is final
-    mov eax, [tok_n]
-    cmp r12d, eax
-    jb .have
-    test r13d, r13d
-    jnz .finish
-    call out_flush                   ; about to wait: do not sit on output
-    mov edx, r15d
+    mov rbx, rdi
+    mov qword [emit_stack+0], rbx
+    mov rax, [rbx+GRP_FIRST]
+    mov qword [emit_stack+8], rax
+    mov byte [emit_stack+16], 0
+    xor r12d, r12d                   ; top frame index
+.loop:
+    lea rbx, [emit_stack]
+    mov rax, r12
+    imul rax, 24
+    add rbx, rax                     ; rbx = frame
+    mov rax, [rbx+8]
+    test rax, rax
+    jz .wait_first
+    cmp byte [rbx+16], 0
+    jne .advance
+    jmp .dispatch
+.wait_first:
+    mov r13d, [ev_seq]               ; before the checks, see ev_sleep
+    mov rcx, [rbx]
+    mov edx, [rcx+GRP_STATE]         ; STATE before FIRST
+    mov rax, [rcx+GRP_FIRST]
+    test rax, rax
+    jnz .set_item
+    cmp edx, GRP_DONE
+    je .pop
+    call out_flush
+    mov edx, r13d
     xor r10d, r10d
     call ev_sleep
-    jmp .tok
-.have:
-    mov rax, [tok_ptr]
-    mov rbx, [rax+r12*8]
-    mov [emit_cur], rbx              ; this record's producer is never throttled
+    jmp .loop
+.set_item:
+    mov [rbx+8], rax
+    mov byte [rbx+16], 0
+    jmp .dispatch
+.advance:
+    mov r13d, [ev_seq]
+    mov rcx, [rbx]
+    mov edx, [rcx+GRP_STATE]         ; STATE before NEXT
+    mov rax, [rbx+8]
+    test al, 1
+    jz .rec_next
+    and rax, -2
+    mov rax, [rax+GRP_ITEM_NEXT]
+    jmp .next_ready
+.rec_next:
+    and rax, -2
+    mov rax, [rax+REC_NEXT]
+.next_ready:
+    test rax, rax
+    jnz .set_next
+    cmp edx, GRP_DONE
+    je .pop
+    call out_flush
+    mov edx, r13d
+    xor r10d, r10d
+    call ev_sleep
+    jmp .loop
+.set_next:
+    mov [rbx+8], rax
+    mov byte [rbx+16], 0
+    jmp .dispatch
+.dispatch:
+    mov rax, [rbx+8]
+    test al, 1
+    jnz .push_child
+    mov rbx, rax
+    mov [emit_cur], rbx              ; this record's producer is not throttled
     lock inc dword [bp_seq]
     cmp dword [bp_waiters], 0
-    je .go
+    je .emit
     lea rdi, [bp_seq]
     mov esi, FUTEX_WAKE_PRIV
     mov edx, WAKE_ALL
     mov eax, 202
     syscall
-.go:
+.emit:
     call emit_record
+    lea rcx, [emit_stack]
+    mov rax, r12
+    imul rax, 24
+    add rcx, rax
+    mov byte [rcx+16], 1             ; record finished
+    jmp .loop
+.push_child:
+    and rax, -2
+    lea rcx, [r12+1]
+    cmp rcx, EMIT_STACK_MAX
+    jae .overflow
+    mov rdi, rax                     ; child group
+    lea rax, [r12+1]
+    imul rax, 24
+    lea rdx, [emit_stack]
+    add rdx, rax                     ; child frame
+    mov [rdx+0], rdi
+    mov rax, [rdi+GRP_FIRST]
+    mov [rdx+8], rax
+    mov byte [rdx+16], 0
     inc r12
-    jmp .tok
+    jmp .loop
+.pop:
+    test r12, r12
+    jz .finish
+    dec r12
+    lea rcx, [emit_stack]
+    mov rax, r12
+    imul rax, 24
+    add rcx, rax
+    mov byte [rcx+16], 1             ; parent's child item finished
+    jmp .loop
+.overflow:
+    jmp big
 .finish:
     call out_flush
     pop r15
@@ -1103,7 +1425,7 @@ out_flush:
 ; (load_ignore's buffer cursor and walk_dir's name pointer both did, and a
 ; chunk reservation that clobbered r8 corrupted them).
 alloc:
-    ; round the request up: tokens tag a pointer with bit 0, so every block has
+    ; round the request up: tagged item pointers use bit 0, so every block has
     ; to start 8-aligned (the arena base and every chunk are, being page sizes)
     add rdi, 7
     and rdi, -8
@@ -1151,13 +1473,10 @@ salloc:
     mov [r14+TSTATE.sc_top], rcx
     ret
 
-; ig_alloc: rdi = size. Rules and chain nodes of the dispatching walk are
-; referenced by tasks that outlive its frames: arena. A worker's die with the
-; directory that loaded them: scratch.
+; ig_alloc: rdi = size.  Groups can outlive the frame that loaded their rules,
+; so every ignore node/rule array is arena-backed now.
 ig_alloc:
-    cmp qword [r14+TSTATE.mode], 0
-    jne alloc
-    jmp salloc
+    jmp alloc
 
 ; get_block -> rax = an empty block owned by this thread. Waits while
 ; BLK_LIMIT blocks are in flight, unless the writer is waiting on our record.
@@ -1515,8 +1834,9 @@ sort_table:
 ; print_entry: rdi = path length, rsi = is dir. Appends "path[/]\n" straight into
 ; the current record's last block (a new block when the line does not fit) and
 ; publishes it by bumping BLK_USED; the writer may be reading that block now.
-; The dispatching walk opens a text record - and a token for it - on its first
-; line after a task. With -0 the separator is a NUL instead of the newline.
+; A group's walk opens a text record on its first line; the record is linked
+; into the group before its first block is requested.  With -0 the separator is
+; a NUL instead of the newline.
 print_entry:
     push rbx
     push r12
@@ -1571,52 +1891,54 @@ print_entry:
     pop rbx
     ret
 
-; new_text_record: the dispatching walk starts a record for its own lines
+; append_item: rdi = owning group, rsi = item, edx = 1 for a GRP, 0 for a REC.
+; Publishes one link at the end of the group's item list.  The item's NEXT is
+; cleared before the link becomes visible.
+append_item:
+    mov r8, rsi
+    or r8, rdx                       ; tagged item
+    test edx, edx
+    jz .rec_item
+    mov qword [rsi+GRP_ITEM_NEXT], 0
+    jmp .next_ready
+.rec_item:
+    mov qword [rsi+REC_NEXT], 0
+.next_ready:
+    mov rax, [rdi+GRP_LAST]
+    test rax, rax
+    jz .first
+    mov rcx, rax
+    and rcx, -2
+    test al, 1
+    jz .old_rec
+    mov [rcx+GRP_ITEM_NEXT], r8
+    jmp .last
+.old_rec:
+    mov [rcx+REC_NEXT], r8
+    jmp .last
+.first:
+    mov [rdi+GRP_FIRST], r8
+.last:
+    mov [rdi+GRP_LAST], r8
+    jmp notify_ev
+
+; new_text_record: the walking thread starts a record for its own lines
 new_text_record:
+    push rbx
     mov rdi, REC_SZ
     call alloc
-    mov qword [rax+REC_HEAD], 0
-    mov qword [rax+REC_KIND], 1
-    mov dword [rax+REC_DONE], 0
-    mov [r14+cur_task], rax
+    mov rbx, rax
+    mov qword [rbx+REC_HEAD], 0
+    mov dword [rbx+REC_DONE], 0
+    mov rdi, [r14+cur_grp]
+    mov rsi, rbx
+    xor edx, edx
+    call append_item
+    mov [r14+cur_task], rbx
     mov qword [r14+cur_blk], 0
-    mov rdi, rax
-    jmp push_token
-
-; push_token: rdi = record. Appends it to the stream, then publishes: the array
-; is complete up to tok_n for any reader that loads tok_n first and tok_ptr after.
-push_token:
-    push rbx
-    mov rbx, rdi
-    mov eax, [tok_n]
-    cmp rax, [tok_cap]
-    jb .have
-    mov rcx, [tok_cap]               ; grow: double into fresh arena bytes
-    test rcx, rcx
-    jz .first
-    shl rcx, 1
-    jmp .store
-.first:
-    mov rcx, 256                     ; first token: no array yet
-.store:
-    mov [tok_cap], rcx
-    mov rdi, rcx
-    shl rdi, 3
-    call alloc
-    mov ecx, [tok_n]
-    shl rcx, 3
-    mov rdi, rax
-    mov rsi, [tok_ptr]
-    rep movsb
-    mov [tok_ptr], rax               ; readers of the old array stay valid: never freed
-    mov eax, [tok_n]
-.have:
-    mov rsi, [tok_ptr]
-    mov [rsi+rax*8], rbx
-    inc dword [tok_n]                ; the store that publishes
-    call notify_ev
     pop rbx
     ret
+
 
 die:                                 ; rsi, rdx = message; exits 1
     mov rdi, 2
@@ -1944,7 +2266,7 @@ ig_add_line:
 ; load_ignore: read this directory's .gitignore (if this is a repo) into
 ; igbuf and append its rules; rbx = directory path length.
 ; If it added any, publish a chain node holding a copy of the whole active
-; rule stack, so tasks dispatched below it keep their ancestors' rules.
+; rule stack, so child groups created below it keep their ancestors' rules.
 load_ignore:
     push rbx
     push r12
@@ -2132,6 +2454,332 @@ grow_table:
     pop rbx
     ret
 
+; try_range_split: rdi = sorted {key,name} table, rsi = N.  If the directory is
+; large enough, copy contiguous slices of the table and its name records into
+; arena-backed range groups.  Each range owns its slice, so there is no shared
+; slab and no refcount.  All ranges are pushed first, then linked in order, so
+; the first range can be claimed by the owner while workers take the rest.
+; Returns eax=1 after publishing the groups.
+try_range_split:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r15
+    sub rsp, 128
+    mov [rsp+0], rdi                 ; source table
+    mov [rsp+8], rsi                 ; N
+    mov rax, rsi
+    add rax, CHUNK_MIN - 1
+    xor edx, edx
+    mov rcx, CHUNK_MIN
+    div rcx
+    cmp rax, MAX_RANGE_CHUNKS
+    jbe .k_ok
+    mov eax, MAX_RANGE_CHUNKS
+.k_ok:
+    cmp rax, 2
+    jb .no
+    mov [rsp+16], rax                ; K
+    mov rdi, rax
+    shl rdi, 3
+    call salloc
+    mov [rsp+96], rax                ; group pointer array
+    xor r12d, r12d                   ; range index
+.range_loop:
+    cmp r12, [rsp+16]
+    jae .yes
+    mov rax, r12
+    imul rax, [rsp+8]
+    xor edx, edx
+    div qword [rsp+16]
+    mov [rsp+24], rax                ; lo
+    lea rax, [r12+1]
+    imul rax, [rsp+8]
+    xor edx, edx
+    div qword [rsp+16]
+    mov [rsp+32], rax                ; hi
+    sub rax, [rsp+24]
+    mov [rsp+40], rax                ; count
+
+    ; measure and copy this slice's names (metadata + NUL included)
+    xor r13d, r13d
+    mov rbx, [rsp+24]
+.name_scan:
+    cmp rbx, [rsp+32]
+    jae .name_scanned
+    mov rax, rbx
+    shl rax, 4
+    add rax, [rsp+0]
+    mov rdi, [rax+8]
+    call strlen
+    add rax, 3
+    add r13, rax
+    inc rbx
+    jmp .name_scan
+.name_scanned:
+    mov [rsp+48], r13                ; name bytes
+    mov rdi, GRP_SZ
+    call alloc
+    mov [rsp+56], rax                ; group
+    mov rdi, [rsp+40]
+    shl rdi, 4
+    call alloc
+    mov [rsp+64], rax                ; table copy
+    mov rdi, [rsp+48]
+    call alloc
+    mov [rsp+72], rax                ; names copy
+    mov rax, [r14+path_len]
+    mov [rsp+80], rax
+    lea rdi, [rax+1]
+    call alloc
+    mov [rsp+88], rax                ; path copy
+    mov rcx, [rsp+80]
+    lea rsi, [r14+path_buf]
+    mov rdi, rax
+    rep movsb
+    mov byte [rdi], 0
+
+    mov rbx, [rsp+24]                ; source index
+    mov r13, [rsp+72]                ; names cursor
+    mov rbp, [rsp+64]                ; table cursor
+.copy_loop:
+    cmp rbx, [rsp+32]
+    jae .copy_done
+    mov rax, rbx
+    shl rax, 4
+    add rax, [rsp+0]
+    mov rdi, [rax+8]                 ; source name
+    call strlen
+    mov r15, rax
+    add r15, 3                       ; metadata + name + NUL
+    mov rax, rbx
+    shl rax, 4
+    add rax, [rsp+0]
+    mov rsi, [rax+8]
+    sub rsi, 2
+    mov rdi, r13
+    mov rcx, r15
+    rep movsb
+    lea rax, [r13+2]                 ; new name record
+    mov [rbp+0], rax
+    mov [rbp+8], rax
+    add r13, r15
+    add rbp, 16
+    inc rbx
+    jmp .copy_loop
+.copy_done:
+    mov rbx, [rsp+56]
+    mov qword [rbx+GRP_WORK_NEXT], 0
+    mov qword [rbx+GRP_ITEM_NEXT], 0
+    mov dword [rbx+GRP_STATE], GRP_NEW
+    mov dword [rbx+GRP_KIND], GRP_RANGE
+    mov qword [rbx+GRP_FIRST], 0
+    mov qword [rbx+GRP_LAST], 0
+    mov rax, [rsp+88]
+    mov [rbx+GRP_PATH], rax
+    mov rax, [rsp+80]
+    mov [rbx+GRP_PATHLEN], rax
+    mov rax, [r14+ig_chain]
+    mov [rbx+GRP_CHAIN], rax
+    mov rax, [rsp+64]
+    mov [rbx+GRP_TAB], rax
+    mov rax, [rsp+72]
+    mov [rbx+GRP_NAMES], rax
+    mov rax, [rsp+40]
+    mov [rbx+GRP_N], rax
+    mov rdi, rbx
+    call push_group
+    mov rcx, [rsp+96]
+    mov [rcx+r12*8], rbx
+    inc r12
+    jmp .range_loop
+.yes:
+    ; Every range is already on the work stack.  Publish them in output order;
+    ; link_group claims the first one itself if no worker beat it.
+    xor r12d, r12d
+.publish:
+    cmp r12, [rsp+16]
+    jae .published
+    mov rcx, [rsp+96]
+    mov rdi, [rcx+r12*8]
+    call link_group
+    inc r12
+    jmp .publish
+.published:
+    mov eax, 1
+    jmp .ret
+.no:
+    xor eax, eax
+.ret:
+    add rsp, 128
+    pop r15
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; walk_wide: rdi = sorted table, rsi = N.  Prepass resolves types and filters,
+; creating and pushing a group for every non-ignored directory before any of
+; them is linked.  Publish then walks the table in order, prints the matching
+; lines and links each child; a child still NEW is claimed and executed inline.
+; Because every sibling is already on the work stack, that inline execution
+; cannot serialise the level and cannot deadlock the writer.
+walk_wide:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r15
+    sub rsp, 96
+    mov [rsp+0], rdi                 ; table
+    mov [rsp+8], rsi                 ; N
+    mov rax, [r14+TSTATE.sc_top]
+    mov [rsp+16], rax                ; scratch mark
+    mov rdi, rsi
+    call salloc
+    mov [rsp+24], rax                ; flags
+    mov rdi, rax
+    xor eax, eax
+    mov rcx, [rsp+8]
+    rep stosb
+    mov rdi, [rsp+8]
+    shl rdi, 3
+    call salloc
+    mov [rsp+32], rax                ; child groups
+    mov rdi, rax
+    xor eax, eax
+    mov rcx, [rsp+8]
+    shl rcx, 3
+    rep stosb
+    mov rbx, [r14+path_len]
+    xor r15d, r15d
+.prepass:
+    cmp r15, [rsp+8]
+    jae .publish
+    mov rax, r15
+    shl rax, 4
+    add rax, [rsp+0]
+    mov r12, [rax+8]
+    call walk_dir.mkpath
+    movzx r13d, byte [r12-2]
+    mov [rsp+40], r13
+    test r13b, r13b
+    jnz .have_type
+    mov rax, 262                     ; DT_UNKNOWN: lstat without following
+    mov rdi, AT_FDCWD
+    lea rsi, [r14+path_buf]
+    lea rdx, [r14+statbuf]
+    mov r10, 0x100
+    syscall
+    test rax, rax
+    js .type_unknown
+    mov eax, [r14+statbuf+24]
+    and eax, 0xF000
+    cmp eax, 0x4000
+    je .type_dir
+    cmp eax, 0x8000
+    je .type_file
+.type_unknown:
+    mov byte [r12-2], 0
+    jmp .have_type
+.type_dir:
+    mov byte [r12-2], 4
+    jmp .have_type
+.type_file:
+    mov byte [r12-2], 8
+.have_type:
+    movzx r13d, byte [r12-2]
+    mov [rsp+40], r13
+    mov rax, [r14+ig_chain]
+    test rax, rax
+    jz .no_ignore
+    mov rdi, r12
+    lea rsi, [r14+path_buf]
+    xor edx, edx
+    cmp r13b, 4
+    sete dl
+    call ig_ignored
+    test al, al
+    jnz .ignored
+.no_ignore:
+    xor r13d, r13d                   ; match flag
+    test byte [r12-1], 1
+    jnz .matched
+    mov rdx, [pat_len]
+    test rdx, rdx
+    jz .type_gate
+    mov rdi, r12
+    mov rsi, [pat_ptr]
+    call name_match
+    test al, al
+    jz .match_done
+.type_gate:
+    cmp byte [type_seen], 0
+    je .matched
+    movzx ecx, byte [rsp+40]
+    bt qword [res_type], rcx
+    jnc .match_done
+.matched:
+    mov r13d, 2
+.match_done:
+    mov rax, [rsp+24]
+    mov [rax+r15], r13b
+    cmp byte [rsp+40], 4
+    jne .prep_next
+    mov rdi, rbp
+    call make_group
+    mov rcx, [rsp+32]
+    mov [rcx+r15*8], rax
+    jmp .prep_next
+.ignored:
+    mov rax, [rsp+24]
+    mov byte [rax+r15], 1
+.prep_next:
+    inc r15
+    jmp .prepass
+.publish:
+    xor r15d, r15d
+.pub_loop:
+    cmp r15, [rsp+8]
+    jae .wide_done
+    mov rax, [rsp+24]
+    movzx ecx, byte [rax+r15]
+    test cl, 1
+    jnz .pub_next
+    test cl, 2
+    jz .pub_link
+    mov rax, r15
+    shl rax, 4
+    add rax, [rsp+0]
+    mov r12, [rax+8]
+    call walk_dir.mkpath
+    mov rdi, rbp
+    xor esi, esi
+    cmp byte [r12-2], 4
+    sete sil
+    call print_entry
+.pub_link:
+    mov rax, [rsp+32]
+    mov rdi, [rax+r15*8]
+    test rdi, rdi
+    jz .pub_next
+    call link_group
+.pub_next:
+    inc r15
+    jmp .pub_loop
+.wide_done:
+    mov rax, [rsp+16]
+    mov [r14+TSTATE.sc_top], rax
+    add rsp, 96
+    pop r15
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
 ; walk_dir: search the directory at path_buf[0..path_len) (empty = cwd).
 ; Entries are collected first, sorted by name, then printed and recursed in
 ; that order. Collecting applies pattern and type prefilters: directories and
@@ -2139,11 +2787,8 @@ grow_table:
 ; print are dropped, so with a selective pattern the
 ; sort and the scratch hold a handful of entries instead of the whole
 ; directory. Sorting is never skipped, whatever the directory size.
-; In mode=1 (thread 0's dispatching walk) a directory with enough
-; subdirectories hands each of them to a worker instead of descending, and the
-; lines printed here go to text records that the token stream interleaves with
-; the tasks. Everything the frame allocates in scratch (names, table, and in a
-; worker its rules) is released when it returns: [rsp+48] holds the mark.
+; Everything the frame allocates in scratch (names, table, and rules) is
+; released when it returns: [rsp+48] holds the mark.
 walk_dir:
     push rbx
     push rbp
@@ -2364,10 +3009,15 @@ walk_dir:
     call load_ignore                 ; only path_buf[path_len..) is touched
 .no_ignore:
 
-    ; split decision: a level wide enough to keep every worker busy is worth
-    ; handing out, whatever its depth
-    cmp qword [r14+TSTATE.mode], 0
-    je .sorted
+    ; split decision: a narrow first level may split recursively; when the
+    ; first level is very wide, child groups are tasks and walking inline keeps
+    ; the parent-fd relative opens instead of creating one group per directory.
+    cmp qword [nthreads], 1
+    jbe .sorted
+    cmp qword [r14+TSTATE.no_split], 0
+    jne .sorted
+    cmp qword [group_count], SPLIT_CAP
+    jae .sorted
     mov rdx, [rsp+16]
     test rdx, rdx
     jz .sorted
@@ -2384,6 +3034,11 @@ walk_dir:
     jnz .cnt
     cmp r9, [split_min]
     jb .sorted
+    mov rax, [group_count]
+    add rax, r9
+    cmp rax, SPLIT_CAP
+    ja .sorted                       ; too wide: walk it inline instead
+    mov [root_width], r9
     mov qword [rsp+32], 1
 .sorted:
     mov rax, [rsp+24]
@@ -2391,6 +3046,25 @@ walk_dir:
     mov r15, rax
     call sort_table
     xor r15d, r15d
+    cmp qword [nthreads], 1
+    jbe .no_range
+    mov rax, [rsp+16]
+    cmp rax, RANGE_MIN
+    jb .no_range
+    mov rdi, [rsp+24]
+    mov rsi, rax
+    call try_range_split
+    test eax, eax
+    jnz .fin
+.no_range:
+    cmp qword [rsp+32], 0
+    je .iter_check
+    cmp qword [nthreads], 1
+    jbe .iter_check
+    mov rdi, [rsp+24]
+    mov rsi, [rsp+16]
+    call walk_wide
+    jmp .fin
 .iter_check:
     cmp r15, [rsp+16]
     jae .fin
@@ -2469,19 +3143,12 @@ walk_dir:
 .descend:
     test r13, r13
     jz .next
-    cmp qword [rsp+32], 0
-    jne .dispatch
     mov [r14+path_len], rbp
     mov rax, [rsp+40]
     mov [r14+TSTATE.parent_fd], rax  ; -1 if this directory is closed already
     mov [r14+TSTATE.child_name], r12
     call walk_dir
     mov [r14+path_len], rbx
-    jmp .next
-.dispatch:
-    call .mkpath
-    mov rdi, rbp
-    call dispatch_task
 .next:
     inc r15
     jmp .iter_check
@@ -2533,43 +3200,115 @@ walk_dir:
     pop rbx
     ret
 
-; dispatch_task: rdi = path length of a subtree root. Closes the text record the
-; walk was filling, then makes a task record plus a copy of its path in the
-; arena and publishes its token; the walk continues with the next entry, so the
-; token order is the DFS order.
-dispatch_task:
+; walk_range: execute a range group.  The group owns a sorted copy of its
+; slice's table and names.  Directories are walked inline, in range order, so
+; the range output stays contiguous and cannot depend on another worker.
+walk_range:
     push rbx
+    push rbp
     push r12
     push r13
-    mov rbx, rdi
-    mov rdi, [r14+cur_task]
-    test rdi, rdi
-    jz .fresh
-    mov qword [r14+cur_task], 0
-    mov qword [r14+cur_blk], 0
-    call mark_done
-.fresh:
-    mov rdi, REC_SZ
-    call alloc
-    mov r12, rax
-    mov rax, [r14+ig_chain]
-    mov [r12+REC_CHAIN], rax
-    mov qword [r12+REC_HEAD], 0
-    mov qword [r12+REC_KIND], 0
-    mov dword [r12+REC_DONE], 0
-    mov [r12+REC_PATHLEN], rbx
-    lea rdi, [rbx+1]                 ; path + NUL
-    call alloc
-    mov r13, rax
-    mov [r12+REC_PATH], rax
-    mov rdi, rax
+    push r15
+    sub rsp, 32
+    mov rbx, [r14+path_len]          ; base path length
+    xor r15d, r15d
+.loop:
+    mov rax, [r14+cur_grp]
+    mov rcx, [rax+GRP_N]
+    cmp r15, rcx
+    jae .done
+    mov rdx, [rax+GRP_TAB]
+    mov rax, r15
+    shl rax, 4
+    add rax, rdx
+    mov r12, [rax+8]                 ; name record
+    movzx r13d, byte [r12-2]         ; raw d_type
+    mov [rsp+0], r13                 ; resolved type
+    cmp r13b, 4
+    je .isdir
+    test r13b, r13b
+    jnz .notdir
+    call walk_dir.mkpath
+    mov rax, 262
+    mov rdi, AT_FDCWD
     lea rsi, [r14+path_buf]
-    mov rcx, rbx
-    inc rcx
-    rep movsb
+    lea rdx, [r14+statbuf]
+    mov r10, 0x100
+    syscall
+    test rax, rax
+    js .unknown_other
+    mov eax, [r14+statbuf+24]
+    and eax, 0xF000
+    cmp eax, 0x4000
+    je .unknown_dir
+    cmp eax, 0x8000
+    je .unknown_file
+.unknown_other:
+    xor r13d, r13d
+    jmp .resolved
+.unknown_dir:
+    mov byte [rsp+0], 4
+    mov r13d, 1
+    jmp .resolved
+.unknown_file:
+    mov byte [rsp+0], 8
+    xor r13d, r13d
+    jmp .resolved
+.isdir:
+    call walk_dir.mkpath
+    mov r13d, 1
+    mov byte [rsp+0], 4
+    jmp .resolved
+.notdir:
+    call walk_dir.mkpath
+    xor r13d, r13d
+.resolved:
+    mov rax, [r14+ig_chain]
+    test rax, rax
+    jz .check_match
     mov rdi, r12
-    call push_token
+    lea rsi, [r14+path_buf]
+    mov rdx, r13
+    call ig_ignored
+    test al, al
+    jnz .next
+.check_match:
+    test byte [r12-1], 1
+    jnz .name_ok
+    mov rdx, [pat_len]
+    test rdx, rdx
+    jz .name_ok
+    mov rdi, r12
+    mov rsi, [pat_ptr]
+    call name_match
+    test al, al
+    jz .descend
+.name_ok:
+    cmp byte [type_seen], 0
+    je .matched
+    movzx ecx, byte [rsp+0]
+    bt qword [res_type], rcx
+    jnc .descend
+.matched:
+    mov rdi, rbp
+    mov rsi, r13
+    call print_entry
+.descend:
+    test r13, r13
+    jz .next
+    mov [r14+path_len], rbp
+    mov qword [r14+TSTATE.parent_fd], -1
+    mov [r14+TSTATE.child_name], r12
+    call walk_dir
+    mov [r14+path_len], rbx
+.next:
+    inc r15
+    jmp .loop
+.done:
+    add rsp, 32
+    pop r15
     pop r13
     pop r12
+    pop rbp
     pop rbx
     ret
