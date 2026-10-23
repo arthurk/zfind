@@ -8,13 +8,15 @@
 zfind [OPTIONS] [--] [PATTERN]
 ```
 
-`PATTERN` is optional. When provided, zfind finds entries whose names contain that literal text. Regex and glob patterns are not supported. Without a pattern, it lists every entry.
+`PATTERN` is optional. When provided, zfind finds entries whose names contain that literal text. Regex and glob patterns are not supported. Without a pattern, it lists every entry unless `--type` restricts the result types.
 
 ```sh
 zfind config                # Find names containing "config"
 zfind --no-hidden TODO      # Find names containing "TODO" and skip hidden entries
 zfind --gitignore Cargo     # Find names containing "Cargo" and apply supported .gitignore rules
 zfind -0 --limit 100 .conf  # Print up to 100 matches, separated by NUL bytes
+zfind --type f              # List regular files, traversing directories as usual
+zfind --type f --type d     # List regular files and directories
 ```
 
 ## Matching and output
@@ -25,7 +27,8 @@ zfind -0 --limit 100 .conf  # Print up to 100 matches, separated by NUL bytes
   itself is skipped: git never tracks anything under it.
 - Results are sorted by name within each directory. Output follows depth-first order.
 - Paths are relative to the current directory. Directory results end with `/`.
-- zfind does not follow symlinked directories.
+- zfind does not follow symlinked directories. Explicit `--type f` and
+  `--type d` filters exclude symlinks, including symlinks to files and directories.
 
 ## Options
 
@@ -35,6 +38,10 @@ zfind -0 --limit 100 .conf  # Print up to 100 matches, separated by NUL bytes
   entry itself. See [Gitignore support](#gitignore-support).
 - `--no-hidden` Skip names that begin with `.`, including hidden directories and everything inside them.
 - `--limit N`, `--limit=N` Print at most `N` results. `0` prints nothing. Use `-0` to count entries correctly when filenames may contain newlines.
+- `--type f|d` Print regular files (`f`) and/or directories (`d`). Repeat the
+  option to select both types; repeated values have no extra effect. Explicit
+  type filters exclude symlinks and special entries. `--type f` still traverses
+  directories so matching files below them can be found.
 - `--` End option parsing. Put it before a pattern that starts with `-`, as in `zfind -- -draft` to search for the name substring `-draft`.
 
 ## Gitignore support

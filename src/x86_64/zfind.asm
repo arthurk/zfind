@@ -1,7 +1,7 @@
 default rel                     ; x86-64: address labels RIP-relative, not via implicit ABS
 
 ; zfind, "simple search" use case only:
-;   zfind [-h] [-0] [--gitignore] [--no-hidden] [--limit N] [--] [PATTERN]   search cwd for entries whose name matches PATTERN
+;   zfind [-h] [-0] [--gitignore] [--no-hidden] [--limit N] [--type f|d] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
 ; Every entry is searched, including hidden names and dot-directories like
@@ -179,6 +179,8 @@ section .rodata
     e_arg_e:
     e_limit     db "zfind: invalid limit", 10
     e_limit_e:
+    e_type      db "zfind: expected f or d after --type", 10
+    e_type_e:
     e_flag      db "zfind: unknown option", 10
     e_flag_e:
     e_write     db "zfind: write error", 10
@@ -193,13 +195,17 @@ section .rodata
     z_long      db "--null", 0
     l_long      db "--limit", 0
     l_eq        db "--limit=", 0     ; 8 bytes of prefix
+    t_long      db "--type", 0
+    t_file      db "f", 0
+    t_dir       db "d", 0
     g_long      db "--gitignore", 0
     no_long     db "--no-hidden", 0
-    help_msg    db "usage: zfind [-h] [-0] [--gitignore] [--no-hidden] [--limit N] [--] [PATTERN]", 10, 10
+    help_msg    db "usage: zfind [-h] [-0] [--gitignore] [--no-hidden] [--limit N]", 10
+               db "              [--type f|d] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). Case-insensitive", 10
                db "unless PATTERN contains an A-Z. Without a pattern every entry is", 10
-               db "listed.", 10, 10
+               db "listed unless --type restricts the result types.", 10, 10
                db "Hidden entries are searched like any other, .git included; with", 10
                db "--no-hidden, entries whose name starts with . are skipped. With", 10
                db "--gitignore, .gitignore rules are applied when the current", 10
@@ -212,6 +218,7 @@ section .rodata
                db "  --gitignore respect .gitignore rules when cwd contains .git; skip .git", 10
                db "  --no-hidden skip entries whose name starts with .", 10
                db "  --limit N   print at most N results, then stop (0 = none)", 10
+               db "  --type f|d  repeatable; print regular files and/or directories", 10
                db "  --          end options; a following argument is the PATTERN", 10
     help_msg_e:
     align 8
@@ -227,6 +234,8 @@ section .bss
     lim_left:   resq 1                ; results left before the writer stops; -1 = no limit
     res_ig:     resq 1                ; 1 = --gitignore: apply .gitignore rules in a repo cwd
     res_hid:    resq 1                ; 1 = --no-hidden: skip hidden (dot-)entries, the old default
+    res_type:   resb 32                ; d_type bitset: DT_DIR=4, DT_REG=8
+    type_seen:  resb 1
     git_repo:   resq 1
     tstate_map: resq 1
     stacks:     resq 1
@@ -293,6 +302,10 @@ _start:
     call streq
     je .opt_limit_next
     mov rdi, [rbp+r12*8]
+    lea rsi, [t_long]
+    call streq
+    je .opt_type
+    mov rdi, [rbp+r12*8]
     lea rsi, [l_eq]
     call startswith
     je .opt_limit_eq
@@ -311,6 +324,28 @@ _start:
     cmp byte [rdi+2], 0
     je .arg_end_opts                   ; "--"
     jmp bad_flag                       ; unknown long flag
+
+.opt_type:
+    inc r12
+    cmp r12, rbx
+    jae bad_type
+    mov rdi, [rbp+r12*8]
+    lea rsi, [t_file]
+    call streq
+    je .type_file
+    mov rdi, [rbp+r12*8]
+    lea rsi, [t_dir]
+    call streq
+    jne bad_type
+    mov byte [type_seen], 1
+    bts qword [res_type], 4
+    jmp .type_next
+.type_file:
+    mov byte [type_seen], 1
+    bts qword [res_type], 8
+.type_next:
+    inc r12
+    jmp .args_loop
 
 .opt_null:
     mov qword [nul_sep], 1
@@ -1239,7 +1274,8 @@ name_match:
     pop rbx
     ret
 
-; The table of a directory holds 16-byte entries {key, name pointer}. The key is
+; The table of a directory holds 16-byte entries {key, name pointer}; two
+; metadata bytes precede each pointed-to name. The key is
 ; the first 8 bytes of the name, byte-swapped into a big-endian integer and
 ; zero-padded after the NUL, so comparing keys as unsigned integers orders names
 ; bytewise without touching memory; only names that share their first 8 bytes
@@ -1602,6 +1638,11 @@ bad_args:
 bad_limit:
     lea rsi, [e_limit]
     mov rdx, e_limit_e - e_limit
+    jmp die
+
+bad_type:
+    lea rsi, [e_type]
+    mov rdx, e_type_e - e_type
     jmp die
 
 bad_flag:
@@ -2021,8 +2062,9 @@ load_ignore:
     pop rbx
     ret
 
-; arena_put: append one record [d_type][name,0] to the thread's scratch.
-; rdi = d_type, r15 = the dirent's d_name -> rax = the record, rdx = the sort key
+; arena_put: append [d_type][matched][name,0] with a three-byte header, using
+; packed metadata in rdi.
+; rdi = d_type | (matched << 8), r15 = d_name -> rax = record, rdx = sort key
 ; (first 8 name bytes, big-endian, zero after the NUL). The length pass could be
 ; avoided by allocating d_reclen, but that wastes ~27 bytes per entry (~80 MB on
 ; /nix/store). Clobbers rax, rcx, rdx, rsi, rdi - not r8-r11/r14/r15, which the
@@ -2032,7 +2074,7 @@ arena_put:
     push r12
     push r13
     mov rbx, r15
-    mov r12, rdi                    ; d_type
+    mov r12, rdi                    ; packed metadata
     xor r13d, r13d
 .len:
     cmp byte [rbx+r13], 0
@@ -2040,14 +2082,14 @@ arena_put:
     inc r13
     jmp .len
 .lend:
-    lea rdi, [r13+2]
+    lea rdi, [r13+3]
     call salloc
-    mov [rax], r12b
-    lea rdi, [rax+1]
+    mov [rax], r12w
+    lea rdi, [rax+2]
     mov rsi, rbx
     lea rcx, [r13+1]
     rep movsb
-    mov rdx, [rax+1]                ; the key, from the copy (a guard follows it)
+    mov rdx, [rax+2]                ; the key, from the copy (a guard follows it)
     cmp r13, 8
     jae .whole
     mov ecx, r13d
@@ -2091,8 +2133,9 @@ grow_table:
 
 ; walk_dir: search the directory at path_buf[0..path_len) (empty = cwd).
 ; Entries are collected first, sorted by name, then printed and recursed in
-; that order. Collecting already applies the pattern: only directories, entries
-; of unknown type and names that match are kept, so with a selective pattern the
+; that order. Collecting applies pattern and type prefilters: directories and
+; unknown entries stay for traversal/fallback; known non-directories that cannot
+; print are dropped, so with a selective pattern the
 ; sort and the scratch hold a handful of entries instead of the whole
 ; directory. Sorting is never skipped, whatever the directory size.
 ; In mode=1 (thread 0's dispatching walk) a directory with enough
@@ -2113,7 +2156,7 @@ walk_dir:
     ; [rsp+48]=scratch mark
     ; [rsp+56]=while parsing: this directory lists a .gitignore (as git_repo:
     ;          so 0 unless --gitignore was given and cwd contains .git); while iterating:
-    ;          the current entry was matched during parsing
+    ;          the current entry's resolved type
     mov rax, [r14+ig_nrules]
     mov [rsp], rax
     mov rax, [r14+ig_chain]
@@ -2246,23 +2289,30 @@ walk_dir:
     jne .pskip                       ; --no-hidden: hidden entries stay hidden
 .visible:                            ; default falls through: the dot-entry
                                      ; joins the visible path like any other
-    ; Filter before collecting. A name that does not match the pattern only
-    ; matters if the entry is a directory (walked whatever its name) or of
-    ; unknown type (it might be one). Anything else would be neither printed
-    ; nor descended into, so it gets no scratch, no table slot, no sort time.
-    mov rdx, [pat_len]
-    test rdx, rdx
-    jz .keep                         ; no pattern: everything matches
+    ; Keep directories and unknown types for traversal/fallback. With a filter,
+    ; discard known non-directory entries whose type bit is not selected.
+    ; shortcut: known d_type may misclassify bind mounts; exact classification
+    ; would require statting all entries.
     cmp r8b, 4                       ; DT_DIR
     je .keep
     test r8b, r8b                    ; DT_UNKNOWN
     jz .keep
+    cmp byte [type_seen], 0
+    je .type_visible
+    bt qword [res_type], r8
+    jnc .pskip
+.type_visible:
+    ; Directories and unknown types were kept above; only known non-directories
+    ; reach this pattern prefilter.
+    mov rdx, [pat_len]
+    test rdx, rdx
+    jz .keep                         ; no pattern: everything matches
     mov rdi, r15
     mov rsi, [pat_ptr]
     call name_match                  ; keeps r8-r11, r15; rsi is reloaded below
     test al, al
     jz .pskip
-    or r8d, 0x80                     ; bit 7 of the stored type: matched already
+    or r8d, 0x100                    ; separate cached-match metadata byte
 .keep:
     mov rdi, [r14+TSTATE.tab_n]      ; room first: grow_table keeps r8-r11, r15
     cmp rdi, [r14+TSTATE.tab_cap]
@@ -2275,7 +2325,7 @@ walk_dir:
     shl rdi, 4
     add rdi, [r14+TSTATE.tab_ptr]
     mov [rdi], rdx                   ; the entry: key, then the name pointer;
-    lea rax, [rax+1]                 ; the d_type byte sits right before it
+    lea rax, [rax+2]                 ; two metadata bytes precede the name
     mov [rdi+8], rax
     inc qword [r14+TSTATE.tab_n]
 .pskip:
@@ -2324,7 +2374,7 @@ walk_dir:
     xor r9d, r9d
 .cnt:
     mov rax, [rsi+8]
-    cmp byte [rax-1], 4
+    cmp byte [rax-2], 4
     jne .cnt_next
     inc r9
 .cnt_next:
@@ -2347,11 +2397,8 @@ walk_dir:
     shl rdx, 4
     add rdx, [rsp+24]
     mov r12, [rdx+8]                 ; name
-    movzx r13d, byte [r12-1]         ; d_type, with bit 7 set if the parse matched it
-    mov eax, r13d
-    and eax, 0x80
-    mov [rsp+56], rax                ; in the frame: the calls below eat registers
-    and r13d, 0x7f
+    movzx r13d, byte [r12-2]         ; raw d_type
+    mov [rsp+56], r13                ; resolved type; calls below eat registers
     cmp r13b, 4                      ; DT_DIR
     je .isdir
     test r13b, r13b
@@ -2368,7 +2415,16 @@ walk_dir:
     mov eax, [r14+statbuf+24]        ; st_mode
     and eax, 0xF000
     cmp eax, 0x4000                  ; S_IFDIR
-    jne .notdir
+    je .unknown_dir
+    cmp eax, 0x8000                  ; S_IFREG
+    je .unknown_file
+    jmp .notdir                      ; symlinks and special entries remain type 0
+.unknown_dir:
+    mov byte [rsp+56], 4             ; DT_DIR
+    jmp .isdir
+.unknown_file:
+    mov byte [rsp+56], 8             ; DT_REG
+    jmp .notdir
 .isdir:
     mov r13d, 1
     call .mkpath
@@ -2388,16 +2444,22 @@ walk_dir:
     test al, al
     jnz .next
 .check_match:
-    cmp qword [rsp+56], 0
-    jne .matched                     ; the parse already matched this name
+    test byte [r12-1], 1             ; parse-time cached name match
+    jnz .name_ok
     mov rdx, [pat_len]
     test rdx, rdx
-    jz .matched                      ; no pattern
+    jz .name_ok                      ; no pattern still needs the type gate
     mov rdi, r12
     mov rsi, [pat_ptr]
     call name_match                  ; directories and unknown types only
     test al, al
     jz .descend
+.name_ok:
+    cmp byte [type_seen], 0
+    je .matched
+    movzx ecx, byte [rsp+56]
+    bt qword [res_type], rcx
+    jnc .descend
 .matched:
     call .mkpath                     ; print_entry() wants the path
     mov rdi, rbp
