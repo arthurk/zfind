@@ -10,8 +10,12 @@ zfind [OPTIONS] [--] [PATTERN]
 
 `PATTERN` is optional. When provided, zfind finds entries whose names contain that literal text. Regex and glob patterns are not supported. Without a pattern, it lists every entry unless `--type` restricts the result types.
 
+Options must appear before `PATTERN`. `--` ends option parsing; any argument following `--` is treated as `PATTERN`.
+
 ```sh
 zfind config                # Find names containing "config"
+zfind --case-sensitive foo  # Case-sensitive search for "foo"
+zfind --ignore-case FOO     # Case-insensitive search for "FOO"
 zfind --no-hidden TODO      # Find names containing "TODO" and skip hidden entries
 zfind --gitignore Cargo     # Find names containing "Cargo" and apply supported .gitignore rules
 zfind -0 --limit 100 .conf  # Print up to 100 matches, separated by NUL bytes
@@ -21,7 +25,12 @@ zfind --type f --type d     # List regular files and directories
 
 ## Matching and output
 
-- Matching ignores case unless the pattern contains an uppercase ASCII letter.
+- By default, matching ignores case unless the pattern contains an uppercase ASCII letter (`A`–`Z`, smart case).
+- `--case-sensitive` forces case-sensitive byte comparison.
+- `--ignore-case` forces ASCII case-insensitive comparison, regardless of whether the pattern contains uppercase letters.
+- Combining `--case-sensitive` and `--ignore-case` is a usage error.
+- Case folding is ASCII-only (`A`–`Z`). Non-ASCII bytes are compared unchanged in all modes.
+- Case flags affect only `PATTERN` matching; `.gitignore` matching is unaffected.
 - Hidden entries, including `.git/`, are searched by default. `--no-hidden`
   skips them and their contents. Under `--gitignore`, the `.git` entry
   itself is skipped: git never tracks anything under it.
@@ -32,17 +41,19 @@ zfind --type f --type d     # List regular files and directories
 
 ## Options
 
-- `-h, --help` Show help and exit.
+- `-h, --help` Show help and exit. A pre-scan recognizes `-h` and `--help` anywhere before `--`, including after the pattern or where an option value would normally go.
 - `-0, --null` Separate results with NUL instead of newline. Use this when filenames may contain newlines.
+- `--case-sensitive` Match pattern case-sensitively. Must appear before `PATTERN`.
+- `--ignore-case` Match pattern case-insensitively (ASCII `A`–`Z`). Must appear before `PATTERN`.
 - `--gitignore` Apply supported `.gitignore` rules and skip the `.git`
   entry itself. See [Gitignore support](#gitignore-support).
 - `--no-hidden` Skip names that begin with `.`, including hidden directories and everything inside them.
-- `--limit N`, `--limit=N` Print at most `N` results. `0` prints nothing. Use `-0` to count entries correctly when filenames may contain newlines.
+- `--limit N`, `--limit=N` Print at most `N` results. `0` prints nothing. Use `-0` to count entries correctly when filenames may contain newlines. `--limit` consumes the next token greedily as its value.
 - `--type f|d` Print regular files (`f`) and/or directories (`d`). Repeat the
   option to select both types; repeated values have no extra effect. Explicit
   type filters exclude symlinks and special entries. `--type f` still traverses
-  directories so matching files below them can be found.
-- `--` End option parsing. Put it before a pattern that starts with `-`, as in `zfind -- -draft` to search for the name substring `-draft`.
+  directories so matching files below them can be found. `--type` consumes the next token greedily as its value.
+- `--` End option parsing. Put it before a pattern that starts with `-`, as in `zfind -- -draft` to search for the name substring `-draft`. Any following argument is treated as positional (the pattern).
 
 ## Gitignore support
 

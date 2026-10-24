@@ -219,10 +219,14 @@ section .rodata
     e_big_e:
     e_scratch   db "zfind: directory too large", 10
     e_scratch_e:
+    e_case      db "zfind: cannot combine --case-sensitive and --ignore-case", 10
+    e_case_e:
     h_short     db "-h", 0
     h_long      db "--help", 0
     z_short     db "-0", 0
     z_long      db "--null", 0
+    cs_long     db "--case-sensitive", 0
+    ic_long     db "--ignore-case", 0
     l_long      db "--limit", 0
     l_eq        db "--limit=", 0     ; 8 bytes of prefix
     t_long      db "--type", 0
@@ -230,26 +234,34 @@ section .rodata
     t_dir       db "d", 0
     g_long      db "--gitignore", 0
     no_long     db "--no-hidden", 0
-    help_msg    db "usage: zfind [-h] [-0] [--gitignore] [--no-hidden] [--limit N]", 10
-               db "              [--type f|d] [--] [PATTERN]", 10, 10
+    help_msg    db "usage: zfind [-h] [-0] [--case-sensitive | --ignore-case] [--gitignore]", 10
+               db "              [--no-hidden] [--limit N] [--type f|d] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
-               db "PATTERN, a literal substring (no regex or glob). Case-insensitive", 10
-               db "unless PATTERN contains an A-Z. Without a pattern every entry is", 10
-               db "listed unless --type restricts the result types.", 10, 10
+               db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
+               db "is case-insensitive unless PATTERN contains an uppercase ASCII letter", 10
+               db "(smart case). Use --case-sensitive or --ignore-case to override this;", 10
+               db "combining both is an error. Case folding affects only PATTERN (ASCII", 10
+               db "only) and does not apply to .gitignore rules. Without a pattern every", 10
+               db "entry is listed unless --type restricts the result types.", 10, 10
+               db "Options must appear before PATTERN. --limit and --type consume the next", 10
+               db "token greedily as their value. -- ends options; any following argument", 10
+               db "is treated as PATTERN. -h and --help print this help and exit 0 anywhere", 10
+               db "before --, including after PATTERN or where an option value is expected.", 10, 10
                db "Hidden entries are searched like any other, .git included; with", 10
                db "--no-hidden, entries whose name starts with . are skipped. With", 10
                db "--gitignore, .gitignore rules are applied when the current", 10
                db "directory contains .git, and the .git entry itself is skipped:", 10
-               db "git never tracks anything under it. Use -- before a PATTERN", 10
-               db "that starts with -. Entries are sorted by name within each", 10
+               db "git never tracks anything under it. Entries are sorted by name within each", 10
                db "directory; output follows depth-first order.", 10, 10
-               db "  -h, --help  show this help and exit", 10
-               db "  -0, --null  separate entries with NUL, not newline", 10
-               db "  --gitignore respect .gitignore rules when cwd contains .git; skip .git", 10
-               db "  --no-hidden skip entries whose name starts with .", 10
-               db "  --limit N   print at most N results, then stop (0 = none)", 10
-               db "  --type f|d  repeatable; print regular files and/or directories", 10
-               db "  --          end options; a following argument is the PATTERN", 10
+               db "  -h, --help          show this help and exit", 10
+               db "  -0, --null          separate entries with NUL, not newline", 10
+               db "  --case-sensitive    match pattern case-sensitively", 10
+               db "  --ignore-case       match pattern case-insensitively (ASCII A-Z)", 10
+               db "  --gitignore         respect .gitignore rules when cwd contains .git; skip .git", 10
+               db "  --no-hidden         skip entries whose name starts with .", 10
+               db "  --limit N           print at most N results, then stop (0 = none)", 10
+               db "  --type f|d          repeatable; print regular files and/or directories", 10
+               db "  --                  end options; a following argument is the PATTERN", 10
     help_msg_e:
     align 8
     poll_ts     dq 0, 5000000         ; 5 ms: how stale streamed output can get
@@ -259,11 +271,12 @@ section .bss
     g_resv:     resq 1                ; next free arena byte (xadd'd)
     pat_ptr:    resq 1
     pat_len:    resq 1
-    pat_ci:     resq 1                ; 1 = fold case (pattern has no A-Z)
+    pat_ci:     resq 1                ; 1 = fold case (both filename and pattern bytes)
     nul_sep:    resq 1                ; 1 = separate entries with NUL, not newline
     lim_left:   resq 1                ; results left before the writer stops; -1 = no limit
     res_ig:     resq 1                ; 1 = --gitignore: apply .gitignore rules in a repo cwd
     res_hid:    resq 1                ; 1 = --no-hidden: skip hidden (dot-)entries, the old default
+    case_mode:  resb 1                ; 0 = smart (default), 1 = forced sensitive, 2 = forced insensitive
     res_type:   resb 32                ; d_type bitset: DT_DIR=4, DT_REG=8
     type_seen:  resb 1
     git_repo:   resq 1
@@ -302,6 +315,32 @@ section .text
 _start:
     mov rbx, [rsp]                   ; argc
     lea rbp, [rsp+8]                 ; argv
+
+    ; Pre-scan argv[1..argc) for -h or --help before the first "--"
+    mov r12, 1
+.prescan_loop:
+    cmp r12, rbx
+    jae .prescan_done
+    mov rdi, [rbp+r12*8]
+    cmp byte [rdi], '-'
+    jne .prescan_next
+    cmp byte [rdi+1], '-'
+    jne .prescan_short
+    cmp byte [rdi+2], 0
+    je .prescan_done                 ; stop scanning at the first "--"
+    lea rsi, [h_long]
+    call streq
+    je .help
+    jmp .prescan_next
+.prescan_short:
+    lea rsi, [h_short]
+    call streq
+    je .help
+.prescan_next:
+    inc r12
+    jmp .prescan_loop
+
+.prescan_done:
     mov qword [lim_left], -1
     xor r13d, r13d
     mov r12, 1
@@ -315,14 +354,6 @@ _start:
     je .arg_pattern                    ; "-" alone
 
     mov rdi, [rbp+r12*8]
-    lea rsi, [h_short]
-    call streq
-    je .help
-    mov rdi, [rbp+r12*8]
-    lea rsi, [h_long]
-    call streq
-    je .help
-    mov rdi, [rbp+r12*8]
     lea rsi, [z_short]
     call streq
     je .opt_null
@@ -330,6 +361,14 @@ _start:
     lea rsi, [z_long]
     call streq
     je .opt_null
+    mov rdi, [rbp+r12*8]
+    lea rsi, [cs_long]
+    call streq
+    je .opt_case_sens
+    mov rdi, [rbp+r12*8]
+    lea rsi, [ic_long]
+    call streq
+    je .opt_case_insens
     mov rdi, [rbp+r12*8]
     lea rsi, [l_long]
     call streq
@@ -357,6 +396,20 @@ _start:
     cmp byte [rdi+2], 0
     je .arg_end_opts                   ; "--"
     jmp bad_flag                       ; unknown long flag
+
+.opt_case_sens:
+    cmp byte [case_mode], 2
+    je bad_case_comb
+    mov byte [case_mode], 1
+    inc r12
+    jmp .args_loop
+
+.opt_case_insens:
+    cmp byte [case_mode], 1
+    je bad_case_comb
+    mov byte [case_mode], 2
+    inc r12
+    jmp .args_loop
 
 .opt_type:
     inc r12
@@ -458,6 +511,10 @@ _start:
     mov eax, 231                     ; exit_group
     syscall
 .pat_ready:
+    cmp byte [case_mode], 1
+    je .forced_sensitive
+    cmp byte [case_mode], 2
+    je .forced_insensitive
     ; smart case: one A-Z anywhere in the pattern makes it case-sensitive
     mov rsi, [pat_ptr]
     mov rcx, [pat_len]
@@ -479,6 +536,13 @@ _start:
 .sc_done:
     xor edx, 1
     mov [pat_ci], rdx
+    jmp .case_done
+.forced_sensitive:
+    mov qword [pat_ci], 0
+    jmp .case_done
+.forced_insensitive:
+    mov qword [pat_ci], 1
+.case_done:
     cmp qword [lim_left], 0          ; --limit 0 exits before fstat, mmap and threads, so
     je .exit_zero                    ;   from here on lim_left is -1 or positive
 
@@ -1538,8 +1602,8 @@ get_block:
 
 ; name_match: rdi = name, rsi = pattern, rdx = pattern length -> al
 ; literal substring search, two loops picked once by pat_ci. The folded one
-; only folds the name byte: pat_ci=1 means the pattern has no A-Z (see
-; _start), so folding a pattern byte is the identity.
+; folds both bytes: pat_ci=1 means fold both bytes. In smart mode,
+; folding a pattern byte is the identity.
 %macro MATCH_BODY 1
 %%outer:
     cmp byte [rbx], 0
@@ -1554,6 +1618,7 @@ get_block:
     mov al, [rsi]
 %if %1
     TOLOWER dl
+    TOLOWER al
 %endif
     cmp al, dl
     jne %%next
@@ -1973,6 +2038,11 @@ bad_flag:
     mov rdx, e_flag_e - e_flag
     jmp die
 
+bad_case_comb:
+    lea rsi, [e_case]
+    mov rdx, e_case_e - e_case
+    jmp die
+
 big:
     lea rsi, [e_big]
     mov rdx, e_big_e - e_big
@@ -1987,6 +2057,8 @@ scratch_full:
 ; globmatch: rdi = pattern, rsi = string (both NUL-terminated) -> al = 1 on a
 ; whole-string match. gitignore syntax: '*' stops at '/', "**/" spans any
 ; number of path components, "/**" at the end spans everything below.
+; Case flags (--case-sensitive / --ignore-case) apply only to the search pattern;
+; .gitignore pattern matching is always exact (case-sensitive).
 globmatch:
     push rbx
     push r12
