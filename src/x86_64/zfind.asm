@@ -219,12 +219,12 @@ section .rodata
     e_big_e:
     e_scratch   db "zfind: directory too large", 10
     e_scratch_e:
-    e_case      db "zfind: cannot combine --case-sensitive and --ignore-case", 10
+    e_case      db "zfind: cannot combine --case-sensitive and --case-insensitive", 10
     e_case_e:
     h_long      db "--help", 0
     z_long      db "--null", 0
     cs_long     db "--case-sensitive", 0
-    ic_long     db "--ignore-case", 0
+    ci_long     db "--case-insensitive", 0
     l_long      db "--limit", 0
     l_eq        db "--limit=", 0     ; 8 bytes of prefix
     t_long      db "--type", 0
@@ -232,12 +232,12 @@ section .rodata
     t_dir       db "d", 0
     g_long      db "--gitignore", 0
     no_long     db "--no-hidden", 0
-    help_msg    db "usage: zfind [--help] [--null] [--case-sensitive | --ignore-case] [--gitignore]", 10
-               db "              [--no-hidden] [--limit N] [--type f|d] [--] [PATTERN]", 10, 10
+    help_msg    db "usage: zfind [--help] [--null] [--case-sensitive | --case-insensitive]", 10
+               db "             [--gitignore] [--no-hidden] [--limit N] [--type f|d] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
                db "is case-insensitive unless PATTERN contains an uppercase ASCII letter", 10
-               db "(smart case). Use --case-sensitive or --ignore-case to override this;", 10
+               db "(smart case). Use --case-sensitive or --case-insensitive to override this;", 10
                db "combining both is an error. Case folding affects only PATTERN (ASCII", 10
                db "only) and does not apply to .gitignore rules. Without a pattern every", 10
                db "entry is listed unless --type restricts the result types.", 10, 10
@@ -254,7 +254,7 @@ section .rodata
                db "  --help              show this help and exit", 10
                db "  --null              separate entries with NUL, not newline", 10
                db "  --case-sensitive    match pattern case-sensitively", 10
-               db "  --ignore-case       match pattern case-insensitively (ASCII A-Z)", 10
+               db "  --case-insensitive  match pattern case-insensitively (ASCII A-Z)", 10
                db "  --gitignore         respect .gitignore rules when cwd contains .git; skip .git", 10
                db "  --no-hidden         skip entries whose name starts with .", 10
                db "  --limit N           print at most N results, then stop (0 = none)", 10
@@ -356,7 +356,7 @@ _start:
     call streq
     je .opt_case_sens
     mov rdi, [rbp+r12*8]
-    lea rsi, [ic_long]
+    lea rsi, [ci_long]
     call streq
     je .opt_case_insens
     mov rdi, [rbp+r12*8]
@@ -2047,7 +2047,7 @@ scratch_full:
 ; globmatch: rdi = pattern, rsi = string (both NUL-terminated) -> al = 1 on a
 ; whole-string match. gitignore syntax: '*' stops at '/', "**/" spans any
 ; number of path components, "/**" at the end spans everything below.
-; Case flags (--case-sensitive / --ignore-case) apply only to the search pattern;
+; Case flags (--case-sensitive / --case-insensitive) apply only to the search pattern;
 ; .gitignore pattern matching is always exact (case-sensitive).
 globmatch:
     push rbx
