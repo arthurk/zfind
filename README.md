@@ -13,14 +13,14 @@ zfind [OPTIONS] [--] [PATTERN]
 Options must appear before `PATTERN`. `--` ends option parsing; any argument following `--` is treated as `PATTERN`.
 
 ```sh
-zfind config                # Find names containing "config"
-zfind --case-sensitive foo  # Case-sensitive search for "foo"
-zfind --ignore-case FOO     # Case-insensitive search for "FOO"
-zfind --no-hidden TODO      # Find names containing "TODO" and skip hidden entries
-zfind --gitignore Cargo     # Find names containing "Cargo" and apply supported .gitignore rules
-zfind -0 --limit 100 .conf  # Print up to 100 matches, separated by NUL bytes
-zfind --type f              # List regular files, traversing directories as usual
-zfind --type f --type d     # List regular files and directories
+zfind config                    # Find names containing "config"
+zfind --case-sensitive foo      # Case-sensitive search for "foo"
+zfind --ignore-case FOO         # Case-insensitive search for "FOO"
+zfind --no-hidden TODO          # Find names containing "TODO" and skip hidden entries
+zfind --gitignore Cargo         # Find names containing "Cargo" and apply supported .gitignore rules
+zfind --null --limit 100 .conf  # Print up to 100 matches, separated by NUL bytes
+zfind --type f                  # List regular files, traversing directories as usual
+zfind --type f --type d         # List regular files and directories
 ```
 
 ## Matching and output
@@ -41,14 +41,14 @@ zfind --type f --type d     # List regular files and directories
 
 ## Options
 
-- `-h, --help` Show help and exit. A pre-scan recognizes `-h` and `--help` anywhere before `--`, including after the pattern or where an option value would normally go.
-- `-0, --null` Separate results with NUL instead of newline. Use this when filenames may contain newlines.
+- `--help` Show help and exit. A pre-scan recognizes `--help` anywhere before `--`, including after the pattern or where an option value would normally go.
+- `--null` Separate results with NUL instead of newline. Use this when filenames may contain newlines.
 - `--case-sensitive` Match pattern case-sensitively. Must appear before `PATTERN`.
 - `--ignore-case` Match pattern case-insensitively (ASCII `A`–`Z`). Must appear before `PATTERN`.
 - `--gitignore` Apply supported `.gitignore` rules and skip the `.git`
   entry itself. See [Gitignore support](#gitignore-support).
 - `--no-hidden` Skip names that begin with `.`, including hidden directories and everything inside them.
-- `--limit N`, `--limit=N` Print at most `N` results. `0` prints nothing. Use `-0` to count entries correctly when filenames may contain newlines. `--limit` consumes the next token greedily as its value.
+- `--limit N`, `--limit=N` Print at most `N` results. `0` prints nothing. Use `--null` to count entries correctly when filenames may contain newlines. `--limit` consumes the next token greedily as its value.
 - `--type f|d` Print regular files (`f`) and/or directories (`d`). Repeat the
   option to select both types; repeated values have no extra effect. Explicit
   type filters exclude symlinks and special entries. `--type f` still traverses

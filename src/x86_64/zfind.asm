@@ -1,7 +1,7 @@
 default rel                     ; x86-64: address labels RIP-relative, not via implicit ABS
 
 ; zfind, "simple search" use case only:
-;   zfind [-h] [-0] [--gitignore] [--no-hidden] [--limit N] [--type f|d] [--] [PATTERN]
+;   zfind [--help] [--null] [--gitignore] [--no-hidden] [--limit N] [--type f|d] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
 ; Every entry is searched, including hidden names and dot-directories like
@@ -221,9 +221,7 @@ section .rodata
     e_scratch_e:
     e_case      db "zfind: cannot combine --case-sensitive and --ignore-case", 10
     e_case_e:
-    h_short     db "-h", 0
     h_long      db "--help", 0
-    z_short     db "-0", 0
     z_long      db "--null", 0
     cs_long     db "--case-sensitive", 0
     ic_long     db "--ignore-case", 0
@@ -234,7 +232,7 @@ section .rodata
     t_dir       db "d", 0
     g_long      db "--gitignore", 0
     no_long     db "--no-hidden", 0
-    help_msg    db "usage: zfind [-h] [-0] [--case-sensitive | --ignore-case] [--gitignore]", 10
+    help_msg    db "usage: zfind [--help] [--null] [--case-sensitive | --ignore-case] [--gitignore]", 10
                db "              [--no-hidden] [--limit N] [--type f|d] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
@@ -245,7 +243,7 @@ section .rodata
                db "entry is listed unless --type restricts the result types.", 10, 10
                db "Options must appear before PATTERN. --limit and --type consume the next", 10
                db "token greedily as their value. -- ends options; any following argument", 10
-               db "is treated as PATTERN. -h and --help print this help and exit 0 anywhere", 10
+               db "is treated as PATTERN. --help prints this help and exits 0 anywhere", 10
                db "before --, including after PATTERN or where an option value is expected.", 10, 10
                db "Hidden entries are searched like any other, .git included; with", 10
                db "--no-hidden, entries whose name starts with . are skipped. With", 10
@@ -253,8 +251,8 @@ section .rodata
                db "directory contains .git, and the .git entry itself is skipped:", 10
                db "git never tracks anything under it. Entries are sorted by name within each", 10
                db "directory; output follows depth-first order.", 10, 10
-               db "  -h, --help          show this help and exit", 10
-               db "  -0, --null          separate entries with NUL, not newline", 10
+               db "  --help              show this help and exit", 10
+               db "  --null              separate entries with NUL, not newline", 10
                db "  --case-sensitive    match pattern case-sensitively", 10
                db "  --ignore-case       match pattern case-insensitively (ASCII A-Z)", 10
                db "  --gitignore         respect .gitignore rules when cwd contains .git; skip .git", 10
@@ -316,7 +314,7 @@ _start:
     mov rbx, [rsp]                   ; argc
     lea rbp, [rsp+8]                 ; argv
 
-    ; Pre-scan argv[1..argc) for -h or --help before the first "--"
+    ; Pre-scan argv[1..argc) for --help before the first "--"
     mov r12, 1
 .prescan_loop:
     cmp r12, rbx
@@ -325,17 +323,13 @@ _start:
     cmp byte [rdi], '-'
     jne .prescan_next
     cmp byte [rdi+1], '-'
-    jne .prescan_short
+    jne .prescan_next
     cmp byte [rdi+2], 0
     je .prescan_done                 ; stop scanning at the first "--"
     lea rsi, [h_long]
     call streq
     je .help
     jmp .prescan_next
-.prescan_short:
-    lea rsi, [h_short]
-    call streq
-    je .help
 .prescan_next:
     inc r12
     jmp .prescan_loop
@@ -353,10 +347,6 @@ _start:
     cmp byte [rdi+1], 0
     je .arg_pattern                    ; "-" alone
 
-    mov rdi, [rbp+r12*8]
-    lea rsi, [z_short]
-    call streq
-    je .opt_null
     mov rdi, [rbp+r12*8]
     lea rsi, [z_long]
     call streq
@@ -1361,7 +1351,7 @@ recycle:
 ; With --limit it also enforces the cap: count the separators first, and in the
 ; call that reaches the Nth keep the bytes through it, flush and exit_group.
 ; shortcut: with newline output N counts output lines, so a newline inside a
-;   name counts as a boundary; -0 counts entries exactly.
+;   name counts as a boundary; --null counts entries exactly.
 out_put:                                ; rdi = bytes, rsi = length
     ; lim_left is -1 (no cap) or > 0 on entry (--limit 0 exited at startup). It
     ; is 0 only after this call has found the Nth separator.
@@ -1900,7 +1890,7 @@ sort_table:
 ; the current record's last block (a new block when the line does not fit) and
 ; publishes it by bumping BLK_USED; the writer may be reading that block now.
 ; A group's walk opens a text record on its first line; the record is linked
-; into the group before its first block is requested.  With -0 the separator is
+; into the group before its first block is requested.  With --null the separator is
 ; a NUL instead of the newline.
 print_entry:
     push rbx
@@ -1947,7 +1937,7 @@ print_entry:
     mov al, 10                       ; '\n'
     cmp qword [nul_sep], 0
     je .sep
-    xor eax, eax                     ; -0: NUL, so paths with newlines survive
+    xor eax, eax                     ; --null: NUL, so paths with newlines survive
 .sep:
     mov byte [rdi], al
     add [rdx+BLK_USED], r12          ; publish
