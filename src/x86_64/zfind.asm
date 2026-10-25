@@ -1,11 +1,14 @@
 default rel                     ; x86-64: address labels RIP-relative, not via implicit ABS
 
 ; zfind, "simple search" use case only:
-;   zfind [--help] [--null] [--gitignore] [--no-hidden] [--limit N] [--type f|d] [--] [PATTERN]
+;   zfind [--help] [--null] [--case-sensitive | --case-insensitive]
+;         [--gitignore] [--hidden | --no-hidden] [--limit N]
+;         [--type f|d] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
 ; Every entry is searched, including hidden names and dot-directories like
-; .git. With --no-hidden, entries whose name starts with . are skipped.
+; .git. --hidden states the default explicitly; --no-hidden skips them. The
+; two options conflict.
 ; .gitignore rules apply only when --gitignore is given and cwd contains
 ; .git (the existing shortcut; no ancestor walk); with the flag, the .git
 ; entry itself is pruned - never printed, never walked - because git never
@@ -221,6 +224,8 @@ section .rodata
     e_scratch_e:
     e_case      db "zfind: cannot combine --case-sensitive and --case-insensitive", 10
     e_case_e:
+    e_hid       db "zfind: cannot combine --hidden and --no-hidden", 10
+    e_hid_e:
     h_long      db "--help", 0
     z_long      db "--null", 0
     cs_long     db "--case-sensitive", 0
@@ -231,9 +236,11 @@ section .rodata
     t_file      db "f", 0
     t_dir       db "d", 0
     g_long      db "--gitignore", 0
+    hidden_long db "--hidden", 0
     no_long     db "--no-hidden", 0
     help_msg    db "usage: zfind [--help] [--null] [--case-sensitive | --case-insensitive]", 10
-               db "             [--gitignore] [--no-hidden] [--limit N] [--type f|d] [--] [PATTERN]", 10, 10
+               db "             [--gitignore] [--hidden | --no-hidden] [--limit N]", 10
+               db "             [--type f|d] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
                db "is case-insensitive unless PATTERN contains an uppercase ASCII letter", 10
@@ -245,8 +252,9 @@ section .rodata
                db "token greedily as their value. -- ends options; any following argument", 10
                db "is treated as PATTERN. --help prints this help and exits 0 anywhere", 10
                db "before --, including after PATTERN or where an option value is expected.", 10, 10
-               db "Hidden entries are searched like any other, .git included; with", 10
-               db "--no-hidden, entries whose name starts with . are skipped. With", 10
+               db "Hidden entries are searched like any other, .git included; --no-hidden", 10
+               db "skips entries whose name starts with . and everything inside them.", 10
+               db "--hidden states the default explicitly; combining the two is an error. With", 10
                db "--gitignore, .gitignore rules are applied when the current", 10
                db "directory contains .git, and the .git entry itself is skipped:", 10
                db "git never tracks anything under it. Entries are sorted by name within each", 10
@@ -256,6 +264,7 @@ section .rodata
                db "  --case-sensitive    match pattern case-sensitively", 10
                db "  --case-insensitive  match pattern case-insensitively (ASCII A-Z)", 10
                db "  --gitignore         respect .gitignore rules when cwd contains .git; skip .git", 10
+               db "  --hidden            search hidden entries (the default)", 10
                db "  --no-hidden         skip entries whose name starts with .", 10
                db "  --limit N           print at most N results, then stop (0 = none)", 10
                db "  --type f|d          repeatable; print regular files and/or directories", 10
@@ -273,7 +282,7 @@ section .bss
     nul_sep:    resq 1                ; 1 = separate entries with NUL, not newline
     lim_left:   resq 1                ; results left before the writer stops; -1 = no limit
     res_ig:     resq 1                ; 1 = --gitignore: apply .gitignore rules in a repo cwd
-    res_hid:    resq 1                ; 1 = --no-hidden: skip hidden (dot-)entries, the old default
+    hid_mode:   resb 1                ; 0 = default, 1 = --hidden, 2 = --no-hidden
     case_mode:  resb 1                ; 0 = smart (default), 1 = forced sensitive, 2 = forced insensitive
     res_type:   resb 32                ; d_type bitset: DT_DIR=4, DT_REG=8
     type_seen:  resb 1
@@ -376,6 +385,11 @@ _start:
     call streq
     je .opt_git
     mov rdi, [rbp+r12*8]
+    lea rsi, [hidden_long]
+    call streq
+    je .opt_hidden
+
+    mov rdi, [rbp+r12*8]
     lea rsi, [no_long]
     call streq
     je .opt_nohid
@@ -433,8 +447,17 @@ _start:
     inc r12
     jmp .args_loop
 
+.opt_hidden:
+    cmp byte [hid_mode], 2
+    je bad_hid_comb
+    mov byte [hid_mode], 1
+    inc r12
+    jmp .args_loop
+
 .opt_nohid:
-    mov qword [res_hid], 1
+    cmp byte [hid_mode], 1
+    je bad_hid_comb
+    mov byte [hid_mode], 2
     inc r12
     jmp .args_loop
 
@@ -2033,6 +2056,11 @@ bad_case_comb:
     mov rdx, e_case_e - e_case
     jmp die
 
+bad_hid_comb:
+    lea rsi, [e_hid]
+    mov rdx, e_hid_e - e_hid
+    jmp die
+
 big:
     lea rsi, [e_big]
     mov rdx, e_big_e - e_big
@@ -2993,8 +3021,8 @@ walk_dir:
     jmp .pskip                       ; untracked by construction: never
                                      ;   collected, never descended into
 .gate_hid:
-    cmp qword [res_hid], 0
-    jne .pskip                       ; --no-hidden: hidden entries stay hidden
+    cmp byte [hid_mode], 2
+    je .pskip                        ; --no-hidden: hidden entries stay hidden
 .visible:                            ; default falls through: the dot-entry
                                      ; joins the visible path like any other
     ; Keep directories and unknown types for traversal/fallback. With a filter,
