@@ -2,17 +2,20 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 
 ; zfind, "simple search" use case only:
 ;   zfind [--help] [--null] [--case-sensitive | --case-insensitive]
-;         [--gitignore] [--hidden | --no-hidden] [--limit N]
-;         [--type f|d] [--] [PATTERN]
+;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
+;         [--limit N] [--type f|d] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
 ; Every entry is searched, including hidden names and dot-directories like
 ; .git. --hidden states the default explicitly; --no-hidden skips them. The
-; two options conflict.
+; two options conflict. --no-gitignore states the default (no .gitignore
+; rules, .git not pruned) explicitly; --gitignore applies .gitignore rules
+; when cwd contains .git and prunes .git. The two options conflict.
 ; .gitignore rules apply only when --gitignore is given and cwd contains
 ; .git (the existing shortcut; no ancestor walk); with the flag, the .git
 ; entry itself is pruned - never printed, never walked - because git never
-; tracks anything under it. The pattern is matched against the name only.
+; tracks anything under it. --no-gitignore leaves .git as an ordinary hidden
+; entry. The pattern is matched against the name only.
 ; Use -- before a PATTERN that starts with -.
 ; shortcut: no path arguments, no regex/glob, and none of the
 ;   ignore sources beyond .gitignore in the walked tree itself (no parent
@@ -226,6 +229,8 @@ section .rodata
     e_case_e:
     e_hid       db "zfind: cannot combine --hidden and --no-hidden", 10
     e_hid_e:
+    e_ig        db "zfind: cannot combine --gitignore and --no-gitignore", 10
+    e_ig_e:
     h_long      db "--help", 0
     z_long      db "--null", 0
     cs_long     db "--case-sensitive", 0
@@ -236,11 +241,12 @@ section .rodata
     t_file      db "f", 0
     t_dir       db "d", 0
     g_long      db "--gitignore", 0
+    nog_long    db "--no-gitignore", 0
     hidden_long db "--hidden", 0
     no_long     db "--no-hidden", 0
     help_msg    db "usage: zfind [--help] [--null] [--case-sensitive | --case-insensitive]", 10
-               db "             [--gitignore] [--hidden | --no-hidden] [--limit N]", 10
-               db "             [--type f|d] [--] [PATTERN]", 10, 10
+               db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
+               db "             [--limit N] [--type f|d] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
                db "is case-insensitive unless PATTERN contains an uppercase ASCII letter", 10
@@ -254,16 +260,19 @@ section .rodata
                db "before --, including after PATTERN or where an option value is expected.", 10, 10
                db "Hidden entries are searched like any other, .git included; --no-hidden", 10
                db "skips entries whose name starts with . and everything inside them.", 10
-               db "--hidden states the default explicitly; combining the two is an error. With", 10
-               db "--gitignore, .gitignore rules are applied when the current", 10
-               db "directory contains .git, and the .git entry itself is skipped:", 10
-               db "git never tracks anything under it. Entries are sorted by name within each", 10
-               db "directory; output follows depth-first order.", 10, 10
+               db "--hidden states the default explicitly; combining the two is an error.", 10
+               db "Without either gitignore flag, rules are off and .git is not pruned.", 10
+               db "--no-gitignore states this default explicitly. --gitignore applies", 10
+               db "rules when the current directory contains .git and skips .git itself.", 10
+               db "Combining the two gitignore flags is an error. Git does not track anything", 10
+               db "under .git. Entries are sorted by name within each directory; output", 10
+               db "follows depth-first order.", 10, 10
                db "  --help              show this help and exit", 10
                db "  --null              separate entries with NUL, not newline", 10
                db "  --case-sensitive    match pattern case-sensitively", 10
                db "  --case-insensitive  match pattern case-insensitively (ASCII A-Z)", 10
                db "  --gitignore         respect .gitignore rules when cwd contains .git; skip .git", 10
+               db "  --no-gitignore      do not apply .gitignore rules (the default)", 10
                db "  --hidden            search hidden entries (the default)", 10
                db "  --no-hidden         skip entries whose name starts with .", 10
                db "  --limit N           print at most N results, then stop (0 = none)", 10
@@ -281,7 +290,7 @@ section .bss
     pat_ci:     resq 1                ; 1 = fold case (both filename and pattern bytes)
     nul_sep:    resq 1                ; 1 = separate entries with NUL, not newline
     lim_left:   resq 1                ; results left before the writer stops; -1 = no limit
-    res_ig:     resq 1                ; 1 = --gitignore: apply .gitignore rules in a repo cwd
+    res_ig:     resq 1                ; 0 = default, 1 = --gitignore, 2 = --no-gitignore
     hid_mode:   resb 1                ; 0 = default, 1 = --hidden, 2 = --no-hidden
     case_mode:  resb 1                ; 0 = smart (default), 1 = forced sensitive, 2 = forced insensitive
     res_type:   resb 32                ; d_type bitset: DT_DIR=4, DT_REG=8
@@ -385,6 +394,10 @@ _start:
     call streq
     je .opt_git
     mov rdi, [rbp+r12*8]
+    lea rsi, [nog_long]
+    call streq
+    je .opt_nogit
+    mov rdi, [rbp+r12*8]
     lea rsi, [hidden_long]
     call streq
     je .opt_hidden
@@ -443,7 +456,16 @@ _start:
     jmp .args_loop
 
 .opt_git:
+    cmp qword [res_ig], 2
+    je bad_ig_comb
     mov qword [res_ig], 1
+    inc r12
+    jmp .args_loop
+
+.opt_nogit:
+    cmp qword [res_ig], 1
+    je bad_ig_comb
+    mov qword [res_ig], 2
     inc r12
     jmp .args_loop
 
@@ -560,11 +582,11 @@ _start:
     je .exit_zero                    ;   from here on lim_left is -1 or positive
 
     ; .gitignore applies only inside a repository, and only when
-    ; --gitignore was given; a .git entry in cwd is the shortcut here (no
-    ; ancestor walk, see the header). Without the flag this whole block is
-    ; skipped: git_repo stays 0 and every gate downstream reads 0.
-    cmp qword [res_ig], 0
-    je .norepo
+    ; --gitignore was given (res_ig == 1). State 0 (default) and state 2
+    ; (--no-gitignore) both skip .git detection, rule loading and the .git
+    ; prune: git_repo stays 0 and every gate downstream reads 0.
+    cmp qword [res_ig], 1
+    jne .norepo
     mov rax, 262                     ; newfstatat
     mov rdi, AT_FDCWD
     lea rsi, [gitname]
@@ -2059,6 +2081,11 @@ bad_case_comb:
 bad_hid_comb:
     lea rsi, [e_hid]
     mov rdx, e_hid_e - e_hid
+    jmp die
+
+bad_ig_comb:
+    lea rsi, [e_ig]
+    mov rdx, e_ig_e - e_ig
     jmp die
 
 big:

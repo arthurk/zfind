@@ -19,6 +19,7 @@ zfind --case-insensitive FOO    # Case-insensitive search for "FOO"
 zfind --hidden TODO             # Find names containing "TODO", hidden entries included
 zfind --no-hidden TODO          # Find names containing "TODO" and skip hidden entries
 zfind --gitignore Cargo         # Find names containing "Cargo" and apply supported .gitignore rules
+zfind --no-gitignore Cargo      # Search without applying .gitignore rules (the default)
 zfind --null --limit 100 .conf  # Print up to 100 matches, separated by NUL bytes
 zfind --type f                  # List regular files, traversing directories as usual
 zfind --type f --type d         # List regular files and directories
@@ -47,7 +48,10 @@ zfind --type f --type d         # List regular files and directories
 - `--case-sensitive` Match pattern case-sensitively. Must appear before `PATTERN`.
 - `--case-insensitive` Match pattern case-insensitively (ASCII `A`–`Z`). Must appear before `PATTERN`.
 - `--gitignore` Apply supported `.gitignore` rules and skip the `.git`
-  entry itself. See [Gitignore support](#gitignore-support).
+  entry itself. Conflicts with `--no-gitignore`. See
+  [Gitignore support](#gitignore-support).
+- `--no-gitignore` Do not apply `.gitignore` rules; this is the default. The
+  `.git` entry is not pruned. Conflicts with `--gitignore`.
 - `--hidden` Search hidden entries (the default). On its own this changes no
   results; combining it with `--no-hidden` is a usage error.
 - `--no-hidden` Skip names that begin with `.`, including hidden directories and everything inside them.
@@ -60,7 +64,7 @@ zfind --type f --type d         # List regular files and directories
 
 ## Gitignore support
 
-`--gitignore` works only when the current directory contains `.git`. zfind does not search parent directories for a repository. It reads `.gitignore` files as it walks the tree. Rules in deeper directories take precedence over inherited rules. The `.git` entry itself is never listed, walked, or counted: git never tracks anything under it.
+By default, zfind does not apply `.gitignore` rules and does not prune `.git`. `--no-gitignore` states this default explicitly. The two gitignore flags cannot be combined. `--gitignore` works only when the current directory contains `.git`; zfind does not search parent directories for a repository. It reads `.gitignore` files as it walks the tree. Rules in deeper directories take precedence over inherited rules. With `--gitignore`, the `.git` entry is never listed, walked, or counted: git never tracks anything under it.
 
 Supported syntax includes negation (`!`), `*`, `?`, anchored patterns, directory-only patterns ending in `/`, `**/`, and patterns ending in `/**`. This is not full Git compatibility.
 
