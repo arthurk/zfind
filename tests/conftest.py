@@ -54,6 +54,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=os.environ.get("ZFIND"),
         help="Path to zfind binary (defaults to $ZFIND or build/<arch>/zfind)",
     )
+    parser.addoption(
+        "--serial-zfind",
+        action="store",
+        default=os.environ.get("ZFIND_SERIAL"),
+        help="Path to serial zfind binary (defaults to $ZFIND_SERIAL or build/<arch>-serial/zfind)",
+    )
 
 
 def get_binary_path(config: pytest.Config) -> Path:
@@ -62,6 +68,13 @@ def get_binary_path(config: pytest.Config) -> Path:
         return Path(explicit).resolve()
     # Fallback to architecture-based default (e.g., x86_64, aarch64)
     return (TESTS_DIR.parent / "build" / platform.machine() / "zfind").resolve()
+
+
+def get_serial_binary_path(config: pytest.Config) -> Path:
+    explicit = config.getoption("--serial-zfind")
+    if explicit:
+        return Path(explicit).resolve()
+    return (TESTS_DIR.parent / "build" / f"{platform.machine()}-serial" / "zfind").resolve()
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -96,10 +109,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     writer.line(f"trees: {DATA_DIR}")
 
 
-@pytest.fixture(scope="session")
-def zfind(pytestconfig: pytest.Config) -> ZfindRunner:
-    binary = get_binary_path(pytestconfig)
-
+def make_zfind_runner(binary: Path) -> ZfindRunner:
     def run(tree: str, *args: str, stdout: Optional[IO[bytes]] = None) -> Result:
         done = subprocess.run(
             [str(binary), *args],
@@ -115,3 +125,18 @@ def zfind(pytestconfig: pytest.Config) -> ZfindRunner:
         )
 
     return run
+
+
+@pytest.fixture(scope="session")
+def zfind(pytestconfig: pytest.Config) -> ZfindRunner:
+    return make_zfind_runner(get_binary_path(pytestconfig))
+
+
+@pytest.fixture(scope="session")
+def serial_zfind(pytestconfig: pytest.Config) -> ZfindRunner:
+    binary = get_serial_binary_path(pytestconfig)
+    if not binary.is_file():
+        if pytestconfig.getoption("--serial-zfind"):
+            pytest.exit(f"Serial binary not found: {binary}", returncode=4)
+        pytest.skip(f"Serial binary not built: {binary}; run `make test` to build it")
+    return make_zfind_runner(binary)

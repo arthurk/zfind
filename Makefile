@@ -4,6 +4,9 @@ BUILD_DIR := build/$(ARCH)
 BIN       := $(BUILD_DIR)/zfind
 OBJ       := $(BUILD_DIR)/zfind.o
 SRC       := src/$(ARCH)/zfind.asm
+SERIAL_BUILD_DIR ?= $(BUILD_DIR)-serial
+SERIAL_BIN := $(SERIAL_BUILD_DIR)/zfind
+SERIAL_OBJ := $(SERIAL_BUILD_DIR)/zfind.o
 
 # ---------- architecture-specific settings ----------
 ifeq ($(ARCH),x86_64)
@@ -34,6 +37,15 @@ $(OBJ): $(SRC) | $(BUILD_DIR)
 $(BIN): $(OBJ)
 	ld $(LDFLAGS) -o $@ $<
 
+$(SERIAL_BUILD_DIR):
+	mkdir -p $@
+
+$(SERIAL_OBJ): $(SRC) | $(SERIAL_BUILD_DIR)
+	$(AS) $(ASFLAGS) -D FORCE_THREADS=1 $< -o $@
+
+$(SERIAL_BIN): $(SERIAL_OBJ)
+	ld $(LDFLAGS) -o $@ $<
+
 run: $(BIN)
 	./$(BIN)
 
@@ -44,6 +56,6 @@ PRESET ?= default
 testdata:
 	python3 tests/mktrees.py --preset $(PRESET)
 
-# Build, then run the tests against that binary.
-test: $(BIN)
-	pytest
+# Build parallel and serial binaries, then compare them in the test suite.
+test: $(BIN) $(SERIAL_BIN)
+	ZFIND=$(abspath $(BIN)) ZFIND_SERIAL=$(abspath $(SERIAL_BIN)) pytest

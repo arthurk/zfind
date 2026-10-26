@@ -391,6 +391,21 @@ class TestLimit:
             assert res_nul.status == 0, f"Failed at --null --limit {n}: {res_nul}"
             assert nul_entries(res_nul.out) == full_listing[:n], f"Wrong entries at --null --limit {n}"
 
+    @pytest.mark.parametrize(("tree", "args"), [
+        pytest.param("tree2", (), id="wide-tree"),
+        pytest.param("weird", ("--null",), id="newline-and-byte-names"),
+        pytest.param("ignores", ("--gitignore", "--no-hidden"), id="gitignore-and-hidden"),
+        pytest.param("camera", ("--limit", "100"), id="limited-output"),
+    ])
+    def test_parallel_output_matches_serial(
+        self, zfind: ZfindRunner, serial_zfind: ZfindRunner,
+        tree: str, args: tuple[str, ...],
+    ):
+        parallel = zfind(tree, *args)
+        serial = serial_zfind(tree, *args)
+        assert parallel.status == serial.status == 0, f"parallel={parallel}; serial={serial}"
+        assert parallel == serial, f"parallel={parallel}; serial={serial}"
+
     def test_limit_output_is_deterministic_under_concurrency(self, zfind: ZfindRunner):
         outputs = set()
         for i in range(20):
