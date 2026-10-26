@@ -8,9 +8,10 @@ two-tier name styles in one directory (camera), .gitignore probing (repo),
 recursion depth plus symlink edge classes (deep), and a three-file smoke
 tree (small).
 
-Three more trees are correctness fixtures, not cost shapes: tiny (the smallest
-tree with a directory in it, checkable by eye), ignores (a .gitignore tree whose
-ignored entries sort before and between the visible ones) and weird (names with
+Four more trees are correctness fixtures, not cost shapes: tiny (the smallest
+tree with a directory in it, checkable by eye), hidden (dot entries, including a
+dot directory with entries inside), ignores (a .gitignore tree whose ignored
+entries sort before and between the visible ones) and weird (names with
 newlines, option-like names, non-ASCII and invalid UTF-8 bytes). They are fixed,
 seedless and the same at every preset; each builder's docstring writes down what
 zfind lists for it.
@@ -70,9 +71,9 @@ import time
 
 # Tree order is also the generation order and the message order.
 TREE_NAMES = ("main", "tree2", "tree3", "camera", "repo", "deep", "small",
-              "tiny", "ignores", "weird")
+              "tiny", "ignores", "weird", "hidden")
 
-# Seeds. deep, small, tiny, ignores and weird are seedless: no random draws,
+# Seeds. deep, small, tiny, ignores, weird and hidden are seedless: no random draws,
 # fixed names, natural creation order.
 TREE_SEEDS = {"main": 1, "tree2": 5, "tree3": 11, "camera": 2, "repo": 4}
 
@@ -84,7 +85,7 @@ MANIFEST_SCHEMA = 1
 MANIFEST_SUFFIX = ".manifest.json"
 
 # Trees that ignore the preset: their manifests stay valid under any preset.
-PRESET_INDEPENDENT = frozenset(("small", "tiny", "ignores", "weird"))
+PRESET_INDEPENDENT = frozenset(("small", "tiny", "ignores", "weird", "hidden"))
 
 # Each preset is a complete list of numbers.
 # Repo: 2-10 files per dir and a 2% .gitignore chance at every preset; the
@@ -368,6 +369,27 @@ def _raw(data):
     return os.fsdecode(data)
 
 
+def gen_hidden(_rng, _cfg):
+    """hidden: dot entries in every shape --no-hidden has to handle: a dot file,
+    a dot directory with a visible-looking file and a dot file inside, and a dot
+    file inside a visible directory. zfind lists, in this order (8 entries):
+
+        .dotdir/  .dotdir/.deep  .dotdir/inside  .dotfile  sub/  sub/.dot2
+        sub/visible2  visible
+
+    and with --no-hidden only: sub/  sub/visible2  visible. Seedless."""
+    return [
+        ("", "visible", FILE, None),
+        ("", ".dotfile", FILE, None),
+        ("", ".dotdir", DIR, None),
+        (".dotdir", "inside", FILE, None),
+        (".dotdir", ".deep", FILE, None),
+        ("", "sub", DIR, None),
+        ("sub", "visible2", FILE, None),
+        ("sub", ".dot2", FILE, None),
+    ]
+
+
 def gen_weird(_rng, _cfg):
     """weird: names that trip line-oriented and option-parsing assumptions.
     Option-like names (-0, -h, -t, --limit), a newline inside a file name and
@@ -403,6 +425,7 @@ BUILDERS = {
     "tiny": gen_tiny,
     "ignores": gen_ignores,
     "weird": gen_weird,
+    "hidden": gen_hidden,
 }
 
 

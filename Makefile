@@ -21,7 +21,7 @@ else
 endif
 
 # ---------- targets ----------
-.PHONY: all run clean testdata
+.PHONY: all run clean testdata test
 
 all: $(BIN)
 
@@ -42,4 +42,8 @@ clean:
 
 PRESET ?= default
 testdata:
-	python3 tools/mktrees.py --preset $(PRESET)
+	python3 tests/mktrees.py --preset $(PRESET)
+
+# Build, then run the tests against that binary.
+test: $(BIN)
+	pytest

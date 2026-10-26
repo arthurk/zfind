@@ -4,3 +4,4 @@ zfind
 core
 core.*
 testdata/
+__pycache__

@@ -18,7 +18,8 @@
           gdb         # Debugger
           xxd         # hex + ASCII dump
           gnumake     # Makefile targets
-          python3     # testdata generator (tools/mktrees.py)
+          python314
+          python314Packages.pytest
         ];
 
         shellHook = "ulimit -c 0";   # debug live under gdb, don't litter core dumps
