@@ -87,3 +87,15 @@ single `ARCH` variable, so `make ARCH=...` selects another port once one
 exists. For the toolchain, use `nix develop` as configured in `flake.nix`.
 
 The resulting binary requires an x86-64-v3-compatible CPU.
+
+## Release
+
+After a commit is on `main` and its CI run passes, create and push a version tag:
+
+```sh
+git tag -a v1.0.0 -m "v1.0.0"
+git push origin v1.0.0
+```
+
+The tag workflow runs the tests, builds the binary, and publishes a GitHub
+Release with the `zfind-linux-x86_64-v3` asset.
