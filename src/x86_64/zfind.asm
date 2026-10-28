@@ -3,7 +3,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; zfind, "simple search" use case only:
 ;   zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
-;         [--limit N] [--type f|d] [--] [PATTERN]
+;         [--exclude-name NAME] [--limit N] [--type f|d] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
 ; Every entry is searched, including hidden names and dot-directories like
@@ -16,6 +16,11 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; entry itself is pruned - never printed, never walked - because git never
 ; tracks anything under it. --no-gitignore leaves .git as an ordinary hidden
 ; entry. The pattern is matched against the name only.
+; --exclude-name NAME is repeatable. It removes entries by exact basename,
+; bytewise and case-sensitively, before the type/pattern prefilter and
+; arena_put; a matching directory is pruned. Explicit exclusions override
+; .gitignore rules, but .gitignore detection and rule loading still happen
+; when the .gitignore entry itself is excluded.
 ; Use -- before a PATTERN that starts with -.
 ; shortcut: no path arguments, no regex/glob, and none of the
 ;   ignore sources beyond .gitignore in the walked tree itself (no parent
@@ -69,6 +74,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define AT_FDCWD    -100
 %define PATH_MAX    4096
 %define SEP_MAX     64                ; decoded --separator bytes
+%define EXCL_MAX    64                ; unique --exclude-name values
 %define ENT_BUF     32768
 %macro LAST_BATCH 0                 ; rax = bytes returned -> r13d = 1 if that was all
 %ifndef NO_EOF_SHORTCUT
@@ -249,6 +255,14 @@ section .rodata
     e_sep_incomplete_e:
     e_sep_long  db "zfind: separator too long (max 64 bytes)", 10
     e_sep_long_e:
+    e_excl_missing db "zfind: missing value for --exclude-name", 10
+    e_excl_missing_e:
+    e_excl_empty db "zfind: empty name for --exclude-name", 10
+    e_excl_empty_e:
+    e_excl_slash db "zfind: --exclude-name matches basenames only; '/' is not allowed", 10
+    e_excl_slash_e:
+    e_excl_full db "zfind: too many --exclude-name values (max 64)", 10
+    e_excl_full_e:
     h_long      db "--help", 0
     cs_long     db "--case-sensitive", 0
     ci_long     db "--case-insensitive", 0
@@ -256,6 +270,8 @@ section .rodata
     l_eq        db "--limit=", 0     ; 8 bytes of prefix
     sep_long    db "--separator", 0
     sep_eq      db "--separator=", 0 ; 12 bytes of prefix
+    excl_long   db "--exclude-name", 0
+    excl_eq     db "--exclude-name=", 0 ; 15 bytes of prefix
     t_long      db "--type", 0
     t_file      db "f", 0
     t_dir       db "d", 0
@@ -265,13 +281,15 @@ section .rodata
     no_long     db "--no-hidden", 0
     help_msg    db "usage: zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
-               db "             [--limit N] [--type f|d] [--] [PATTERN]", 10, 10
+               db "             [--exclude-name NAME]... [--limit N] [--type f|d]", 10
+               db "             [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
                db "is case-insensitive unless PATTERN contains an uppercase ASCII letter", 10
                db "(smart case). Use --case-sensitive or --case-insensitive to override this;", 10
                db "combining both is an error. Case folding affects only PATTERN (ASCII", 10
-               db "only) and does not apply to .gitignore rules. Without a pattern every", 10
+               db "only); it does not apply to .gitignore rules or --exclude-name matching.", 10
+               db "Without a pattern every", 10
                db "entry is listed unless --type restricts the result types.", 10, 10
                db "Options must appear before PATTERN. --limit, --type and --separator", 10
                db "consume the next token greedily as their value. -- ends options; any", 10
@@ -297,6 +315,9 @@ section .rodata
                db "  --no-gitignore      do not apply .gitignore rules (the default)", 10
                db "  --hidden            search hidden entries (the default)", 10
                db "  --no-hidden         skip entries whose name starts with .", 10
+               db "  --exclude-name NAME repeatable; skip entries whose basename is exactly NAME", 10
+               db "                      case-sensitive; no glob or '/'", 10
+               db "                      also --exclude-name=NAME; matching dirs are pruned", 10
                db "  --limit N           print at most N results, then stop (0 = none)", 10
                db "  --type f|d          repeatable; print regular files and/or directories", 10
                db "  --                  end options; a following argument is the PATTERN", 10
@@ -310,6 +331,8 @@ section .bss
     pat_ptr:    resq 1
     pat_len:    resq 1
     pat_ci:     resq 1                ; 1 = fold case (both filename and pattern bytes)
+    excl_n:     resq 1                ; immutable after parsing
+    excl_names: resq EXCL_MAX         ; argv pointers, unique and slash-free
     sep_buf:    resb SEP_MAX          ; decoded --separator bytes (may contain NUL)
     sep_len:    resq 1                ; decoded separator length, 1..SEP_MAX
     lim_left:    resq 1               ; writer-only remaining results; -1 = no limit or UINT64_MAX
@@ -421,6 +444,14 @@ _start:
     lea rsi, [sep_eq]
     call startswith
     je .opt_sep_eq
+    mov rdi, [rbp+r12*8]
+    lea rsi, [excl_long]
+    call streq
+    je .opt_excl_next
+    mov rdi, [rbp+r12*8]
+    lea rsi, [excl_eq]
+    call startswith
+    je .opt_excl_eq
     mov rdi, [rbp+r12*8]
     lea rsi, [g_long]
     call streq
@@ -545,6 +576,48 @@ _start:
     mov rdi, [rbp+r12*8]
     add rdi, 12                        ; len("--separator=")
     call parse_sep
+    inc r12
+    jmp .args_loop
+
+.opt_excl_next:
+    inc r12
+    cmp r12, rbx
+    jae bad_excl_missing
+    mov rdi, [rbp+r12*8]
+    jmp .opt_excl_value
+.opt_excl_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 15                        ; len("--exclude-name=")
+.opt_excl_value:
+    cmp byte [rdi], 0
+    je bad_excl_empty
+    mov r8, rdi
+    mov rdx, rdi
+.excl_validate:
+    cmp byte [rdx], 0
+    je .excl_dedupe_start
+    cmp byte [rdx], '/'
+    je bad_excl_slash
+    inc rdx
+    jmp .excl_validate
+.excl_dedupe_start:
+    xor r10d, r10d
+.excl_dedupe:
+    cmp r10, [excl_n]
+    jae .excl_add
+    mov rdi, r8
+    mov rsi, [excl_names+r10*8]
+    call streq
+    je .excl_done
+    inc r10
+    jmp .excl_dedupe
+.excl_add:
+    cmp qword [excl_n], EXCL_MAX
+    jae bad_excl_full
+    mov rax, [excl_n]
+    mov [excl_names+rax*8], r8
+    inc qword [excl_n]
+.excl_done:
     inc r12
     jmp .args_loop
 
@@ -2195,6 +2268,26 @@ bad_sep_long:
     mov rdx, e_sep_long_e - e_sep_long
     jmp die
 
+bad_excl_missing:
+    lea rsi, [e_excl_missing]
+    mov rdx, e_excl_missing_e - e_excl_missing
+    jmp die
+
+bad_excl_empty:
+    lea rsi, [e_excl_empty]
+    mov rdx, e_excl_empty_e - e_excl_empty
+    jmp die
+
+bad_excl_slash:
+    lea rsi, [e_excl_slash]
+    mov rdx, e_excl_slash_e - e_excl_slash
+    jmp die
+
+bad_excl_full:
+    lea rsi, [e_excl_full]
+    mov rdx, e_excl_full_e - e_excl_full
+    jmp die
+
 bad_type:
     lea rsi, [e_type]
     mov rdx, e_type_e - e_type
@@ -3205,6 +3298,17 @@ walk_dir:
     je .pskip                        ; --no-hidden: hidden entries stay hidden
 .visible:                            ; default falls through: the dot-entry
                                      ; joins the visible path like any other
+    xor edx, edx
+.exclude_check:
+    cmp rdx, [excl_n]
+    jae .not_excluded
+    mov rdi, r15
+    mov rsi, [excl_names+rdx*8]
+    call streq
+    je .pskip
+    inc rdx
+    jmp .exclude_check
+.not_excluded:
     ; Keep directories and unknown types for traversal/fallback. With a filter,
     ; discard known non-directory entries whose type bit is not selected.
     ; shortcut: known d_type may misclassify bind mounts; exact classification

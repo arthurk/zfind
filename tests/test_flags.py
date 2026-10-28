@@ -160,7 +160,7 @@ EXACT_LIMIT_SEPARATORS = [
 CURRENT_HELP_OPTIONS = [
     b"--separator", b"--case-sensitive", b"--case-insensitive",
     b"--gitignore", b"--no-gitignore", b"--hidden", b"--no-hidden",
-    b"--limit", b"--type", b"--help",
+    b"--exclude-name", b"--limit", b"--type", b"--help",
 ]
 
 
