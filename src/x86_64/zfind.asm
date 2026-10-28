@@ -1574,23 +1574,29 @@ out_put:                                ; rdi = bytes, rsi = length
     ret
 
 out_flush:
-    xor ecx, ecx
+    push rbx                         ; syscall clobbers rcx and r11
+    xor ebx, ebx                     ; bytes successfully written
 .loop:
-    cmp rcx, [out_len]
+    cmp rbx, [out_len]
     jae .done
     mov rax, 1                       ; sys_write
     mov edi, 1
     lea rsi, [out_buf]
-    add rsi, rcx
+    add rsi, rbx
     mov rdx, [out_len]
-    sub rdx, rcx
+    sub rdx, rbx
     syscall
     test rax, rax
-    jle wfail                        ; only a real error; short writes continue
-    add rcx, rax
+    jg .wrote                        ; short writes continue from the new offset
+    cmp rax, -4                      ; -EINTR: retry without losing progress
+    je .loop
+    jmp wfail                        ; zero or any other error is fatal
+.wrote:
+    add rbx, rax
     jmp .loop
 .done:
     mov qword [out_len], 0
+    pop rbx
     ret
 
 ; alloc: rdi = size -> rax = arena bytes. Whole chunks are reserved with one
@@ -2553,12 +2559,21 @@ load_ignore:
     mov rdx, IGBUF_SZ - 1
     sub rdx, r10
     syscall
+    test rax, rax
+    js .read_error
+    jz .read_done                    ; EOF
     add r10, rax
     add rsi, rax
-    cmp rax, 0
-    jle .read_done
     cmp r10, IGBUF_SZ - 1
     jb .read
+    jmp .read_done                   ; buffer full; remaining bytes are ignored
+.read_error:
+    cmp rax, -4                      ; -EINTR: retry the same read
+    je .read
+    mov rax, 3                       ; close; do not parse partial contents
+    mov rdi, r8
+    syscall
+    jmp .ret                         ; ignore this unreadable .gitignore
 .read_done:
     mov rax, 3                       ; close
     mov rdi, r8
