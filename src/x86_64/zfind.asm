@@ -2920,11 +2920,13 @@ walk_wide:
     shl rax, 4
     add rax, [rsp+0]
     mov r12, [rax+8]
-    call walk_dir.mkpath
     movzx r13d, byte [r12-2]
     mov [rsp+40], r13
+    mov qword [rsp+48], 0            ; path not built for this entry yet
     test r13b, r13b
     jnz .have_type
+    call walk_dir.mkpath             ; DT_UNKNOWN needs a path for lstat
+    mov qword [rsp+48], 1
     mov rax, 262                     ; DT_UNKNOWN: lstat without following
     mov rdi, AT_FDCWD
     lea rsi, [r14+path_buf]
@@ -2953,6 +2955,11 @@ walk_wide:
     mov rax, [r14+ig_chain]
     test rax, rax
     jz .no_ignore
+    cmp qword [rsp+48], 0
+    jne .ignore_path_ready
+    call walk_dir.mkpath             ; ignore rules may need the full path
+    mov qword [rsp+48], 1
+.ignore_path_ready:
     mov rdi, r12
     lea rsi, [r14+path_buf]
     xor edx, edx
@@ -2986,6 +2993,11 @@ walk_wide:
     mov [rax+r15], r13b
     cmp byte [rsp+40], 4
     jne .prep_next
+    cmp qword [rsp+48], 0
+    jne .dir_path_ready
+    call walk_dir.mkpath             ; groups need their complete directory path
+    mov qword [rsp+48], 1
+.dir_path_ready:
     mov rdi, rbp
     call make_group
     mov rcx, [rsp+32]
