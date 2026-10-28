@@ -16,6 +16,7 @@
           nasm        # Assembler
           binutils    # Linker (ld), objdump, readelf
           gdb         # Debugger
+          strace      # syscall fault injection in tests
           xxd         # hex + ASCII dump
           gnumake     # Makefile targets
           python314

@@ -7,6 +7,9 @@ SRC       := src/$(ARCH)/zfind.asm
 SERIAL_BUILD_DIR ?= $(BUILD_DIR)-serial
 SERIAL_BIN := $(SERIAL_BUILD_DIR)/zfind
 SERIAL_OBJ := $(SERIAL_BUILD_DIR)/zfind.o
+UNKNOWN_BUILD_DIR ?= $(BUILD_DIR)-unknown
+UNKNOWN_BIN := $(UNKNOWN_BUILD_DIR)/zfind
+UNKNOWN_OBJ := $(UNKNOWN_BUILD_DIR)/zfind.o
 
 # ---------- architecture-specific settings ----------
 ifeq ($(ARCH),x86_64)
@@ -46,6 +49,17 @@ $(SERIAL_OBJ): $(SRC) | $(SERIAL_BUILD_DIR)
 $(SERIAL_BIN): $(SERIAL_OBJ)
 	ld $(LDFLAGS) -o $@ $<
 
+# Test hooks: getdents reports DT_UNKNOWN for every entry and the wide prepass
+# is forced, so walk_wide's lstat fallback is exercised.
+$(UNKNOWN_BUILD_DIR):
+	mkdir -p $@
+
+$(UNKNOWN_OBJ): $(SRC) | $(UNKNOWN_BUILD_DIR)
+	$(AS) $(ASFLAGS) -D FORCE_UNKNOWN_TYPE -D FORCE_WIDE_SPLIT $< -o $@
+
+$(UNKNOWN_BIN): $(UNKNOWN_OBJ)
+	ld $(LDFLAGS) -o $@ $<
+
 run: $(BIN)
 	./$(BIN)
 
@@ -56,6 +70,8 @@ PRESET ?= default
 testdata:
 	python3 tests/mktrees.py --preset $(PRESET)
 
-# Build parallel and serial binaries, then compare them in the test suite.
-test: $(BIN) $(SERIAL_BIN)
-	ZFIND=$(abspath $(BIN)) ZFIND_SERIAL=$(abspath $(SERIAL_BIN)) pytest
+# Build parallel, serial and DT_UNKNOWN-hook binaries, then compare them in
+# the test suite.
+test: $(BIN) $(SERIAL_BIN) $(UNKNOWN_BIN)
+	ZFIND=$(abspath $(BIN)) ZFIND_SERIAL=$(abspath $(SERIAL_BIN)) \
+	ZFIND_UNKNOWN=$(abspath $(UNKNOWN_BIN)) pytest

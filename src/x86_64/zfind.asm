@@ -3295,9 +3295,14 @@ walk_dir:
     xor r9d, r9d
 .cnt:
     mov rax, [rsi+8]
+%ifdef FORCE_WIDE_SPLIT
+    inc r9                           ; test hook: FORCE_UNKNOWN_TYPE hides the
+                                     ; real count, so force walk_wide anyway
+%else
     cmp byte [rax-2], 4
     jne .cnt_next
     inc r9
+%endif
 .cnt_next:
     add rsi, 16
     dec rdx

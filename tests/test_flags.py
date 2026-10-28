@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import warnings
 from pathlib import Path
@@ -12,6 +13,8 @@ import pytest
 from conftest import Result, ZfindRunner
 
 DEV_FULL = Path("/dev/full")
+STRACE = shutil.which("strace")
+requires_strace = pytest.mark.skipif(STRACE is None, reason="requires strace")
 UINT64_MAX = (1 << 64) - 1
 UINT64_OVERFLOW = UINT64_MAX + 1
 BUFFER_SIZE_64_KIB = 64 * 1024
@@ -68,6 +71,36 @@ def run_repeated(
             f"first={first}; again={again}"
         )
     return first
+
+
+def run_injected(
+    binary: Path,
+    cwd: Path,
+    *args: str,
+    inject: str,
+    stdout=None,
+    timeout: int = 60,
+) -> Result:
+    """Run zfind under strace with one injected syscall fault.
+
+    The inject argument uses strace's syntax, for example
+    "write:error=EINTR:when=1" or "write:retval=5:when=1".
+    """
+    assert STRACE is not None
+    syscall = inject.split(":", 1)[0]
+    done = subprocess.run(
+        [
+            STRACE, "-f", "-o", os.devnull,
+            "-e", f"trace={syscall}",
+            "-e", f"inject={inject}",
+            str(binary), *args,
+        ],
+        cwd=cwd,
+        timeout=timeout,
+        stdout=stdout if stdout is not None else subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return Result(out=done.stdout or b"", err=done.stderr or b"", status=done.returncode)
 
 
 def same_binary(first: Path, second: Path) -> bool:
@@ -1259,4 +1292,172 @@ class TestSeparatorBlockBoundaries:
             assert res.err == serial.err == b"", (
                 f"Limited run at {n} wrote stderr: parallel={res}; serial={serial}"
             )
-            assert res.out == serial.out, f"Wrong prefix at --limit {n}"
+
+
+# -----------------------------------------------------------------------------
+# Syscall faults: read and write error handling
+# -----------------------------------------------------------------------------
+
+@pytest.fixture
+def repo_tree(tmp_path: Path) -> Path:
+    """A repository whose .gitignore ignores ignored.txt."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / ".git").mkdir()
+    (tree / ".gitignore").write_bytes(b"ignored.txt\nunused.tmp\n")
+    (tree / "ignored.txt").write_bytes(b"")
+    (tree / "keep.txt").write_bytes(b"")
+    return tree
+
+
+@requires_strace
+class TestSyscallErrorRecovery:
+    def test_write_eintr_is_retried(self, zfind_path: Path, repo_tree: Path):
+        baseline = run_in(zfind_path, repo_tree)
+        assert baseline.status == 0, f"Baseline run failed: {baseline}"
+
+        res = run_injected(zfind_path, repo_tree, inject="write:error=EINTR:when=1")
+        assert res.status == 0, f"Injected run failed: {res}"
+        assert res.err == b"", f"Injected run wrote stderr: {res}"
+        assert res.out == baseline.out
+
+    def test_short_write_resumes_at_reported_offset(
+        self, zfind_path: Path, repo_tree: Path, tmp_path: Path
+    ):
+        baseline = run_in(zfind_path, repo_tree)
+        assert baseline.status == 0, f"Baseline run failed: {baseline}"
+        assert len(baseline.out) > 5, f"Baseline unexpectedly short: {baseline}"
+
+        # The injected write reports five bytes without writing them. Seeding
+        # the file with those five bytes means a correct resume reproduces the
+        # baseline exactly; restarting at offset zero would append it again.
+        out = tmp_path / "stdout"
+        out.write_bytes(baseline.out[:5])
+        with out.open("ab") as stdout:
+            res = run_injected(
+                zfind_path, repo_tree, inject="write:retval=5:when=1", stdout=stdout
+            )
+
+        assert res.status == 0, f"Injected run failed: {res}"
+        assert res.err == b"", f"Injected run wrote stderr: {res}"
+        assert out.read_bytes() == baseline.out
+
+    def test_read_eintr_is_retried(self, zfind_path: Path, repo_tree: Path):
+        baseline = run_in(zfind_path, repo_tree, "--gitignore")
+        assert baseline.status == 0, f"Baseline run failed: {baseline}"
+        assert entries(baseline.out) == [b".gitignore", b"keep.txt"]
+
+        res = run_injected(
+            zfind_path, repo_tree, "--gitignore", inject="read:error=EINTR:when=1"
+        )
+        assert res.status == 0, f"Injected run failed: {res}"
+        assert res.err == b"", f"Injected run wrote stderr: {res}"
+        assert res.out == baseline.out
+
+    def test_read_error_discards_buffered_gitignore(
+        self, zfind_path: Path, repo_tree: Path
+    ):
+        # The first read returns the whole file; the second read fails. The
+        # bytes already read must be discarded instead of parsed.
+        res = run_injected(
+            zfind_path, repo_tree, "--gitignore", inject="read:error=EIO:when=2"
+        )
+        assert res.status == 0, f"Injected run failed: {res}"
+        assert res.err == b"", f"Injected run wrote stderr: {res}"
+        assert entries(res.out) == [b".gitignore", b"ignored.txt", b"keep.txt"]
+
+
+# -----------------------------------------------------------------------------
+# Lazy path construction in walk_wide
+# -----------------------------------------------------------------------------
+
+LAZY_ALL = words("""
+    .git/ .gitignore .hidden/ .hidden/inside
+    aa/ aa/bb/ aa/bb/cc/ aa/bb/cc/leaf.txt aa/bb/deep/
+    aa/bb/deep/nested.txt aa/ignored/ aa/ignored/inside.txt
+    aa/keep.log aa/local.log aa/other.tmp
+    link_dir link_file root.txt
+""")
+
+# --type f prints regular files only; symlinks are excluded.
+LAZY_FILES = [
+    path for path in LAZY_ALL
+    if not path.endswith(b"/") and path not in (b"link_dir", b"link_file")
+]
+
+# Root .gitignore: *.log, !keep.log, ignored/, aa/other.tmp.
+LAZY_IGNORED = {
+    b".git/", b"aa/ignored/", b"aa/ignored/inside.txt",
+    b"aa/local.log", b"aa/other.tmp",
+}
+LAZY_GITIGNORED = [path for path in LAZY_ALL if path not in LAZY_IGNORED]
+
+LAZY_CASES = [
+    pytest.param((), LAZY_ALL, id="all"),
+    pytest.param(("--type", "f"), LAZY_FILES, id="files"),
+    pytest.param(("--gitignore",), LAZY_GITIGNORED, id="gitignore"),
+]
+
+
+@pytest.fixture(scope="module")
+def lazy_path_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Nested tree exercising unknown types, ignore rules and directory groups."""
+    root = tmp_path_factory.mktemp("lazy-paths")
+    (root / ".git").mkdir()
+    (root / ".gitignore").write_bytes(b"*.log\n!keep.log\nignored/\naa/other.tmp\n")
+    (root / ".hidden").mkdir()
+    (root / ".hidden" / "inside").write_bytes(b"")
+    (root / "aa" / "bb" / "cc").mkdir(parents=True)
+    (root / "aa" / "bb" / "cc" / "leaf.txt").write_bytes(b"")
+    (root / "aa" / "bb" / "deep").mkdir()
+    (root / "aa" / "bb" / "deep" / "nested.txt").write_bytes(b"")
+    (root / "aa" / "ignored").mkdir()
+    (root / "aa" / "ignored" / "inside.txt").write_bytes(b"")
+    for name in ("keep.log", "local.log", "other.tmp"):
+        (root / "aa" / name).write_bytes(b"")
+    (root / "root.txt").write_bytes(b"")
+    (root / "link_dir").symlink_to("aa")
+    (root / "link_file").symlink_to("aa/other.tmp")
+    return root
+
+
+@pytest.fixture(scope="session")
+def unknown_zfind_path(zfind_path: Path) -> Path:
+    """Path to the DT_UNKNOWN/FORCE_WIDE_SPLIT test build."""
+    explicit = os.environ.get("ZFIND_UNKNOWN")
+    candidates = [Path(explicit)] if explicit else []
+    candidates.append(
+        zfind_path.parent.parent / f"{zfind_path.parent.name}-unknown" / "zfind"
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    pytest.skip("unknown-type build not found; run `make test` to build it")
+
+
+class TestLazyPathConstruction:
+    @pytest.mark.parametrize(("args", "expected"), LAZY_CASES)
+    def test_parallel_listing(
+        self,
+        zfind_path: Path,
+        lazy_path_tree: Path,
+        args: tuple[str, ...],
+        expected: list[bytes],
+    ):
+        res = run_in(zfind_path, lazy_path_tree, *args)
+        assert res.status == 0, f"Run failed: {res}"
+        assert res.err == b"", f"Run wrote stderr: {res}"
+        assert res.out == joined(expected, b"\n")
+
+    @pytest.mark.parametrize(("args", "expected"), LAZY_CASES)
+    def test_unknown_type_listing(
+        self,
+        unknown_zfind_path: Path,
+        lazy_path_tree: Path,
+        args: tuple[str, ...],
+        expected: list[bytes],
+    ):
+        res = run_in(unknown_zfind_path, lazy_path_tree, *args)
+        assert res.status == 0, f"Run failed: {res}"
+        assert res.err == b"", f"Run wrote stderr: {res}"
+        assert res.out == joined(expected, b"\n")
