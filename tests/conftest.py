@@ -77,6 +77,29 @@ def get_serial_binary_path(config: pytest.Config) -> Path:
     return (TESTS_DIR.parent / "build" / f"{platform.machine()}-serial" / "zfind").resolve()
 
 
+def _verify_trees() -> None:
+    """Fail fast if cached testdata does not match the smoke preset."""
+    done = subprocess.run(
+        [
+            sys.executable,
+            str(TESTS_DIR / "mktrees.py"),
+            "--out", str(DATA_DIR),
+            "--verify",
+            "--preset", "smoke",
+            "--only", *TREES,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if done.returncode != 0:
+        pytest.exit(
+            "tests/testdata does not match the smoke preset:\n"
+            f"{done.stdout}{done.stderr}\n"
+            f"Remove it and regenerate: rm -rf {DATA_DIR}",
+            returncode=4,
+        )
+
+
 def pytest_sessionstart(session: pytest.Session) -> None:
     binary = get_binary_path(session.config)
     if not binary.is_file():
@@ -103,6 +126,8 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     )
     if made.returncode != 0:
         pytest.exit(f"mktrees.py failed to create testdata:\n{made.stderr}", returncode=4)
+
+    _verify_trees()
 
     writer = session.config.get_terminal_writer()
     writer.line(f"zfind: {binary}")

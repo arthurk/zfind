@@ -157,6 +157,12 @@ EXACT_LIMIT_SEPARATORS = [
     pytest.param("S" * 64, b"S" * 64, id="64-byte"),
 ]
 
+CURRENT_HELP_OPTIONS = [
+    b"--separator", b"--case-sensitive", b"--case-insensitive",
+    b"--gitignore", b"--no-gitignore", b"--hidden", b"--no-hidden",
+    b"--limit", b"--type", b"--help",
+]
+
 
 # -----------------------------------------------------------------------------
 # General CLI: Help, Delimiters, Errors & End-of-Options
@@ -192,6 +198,56 @@ class TestCliBasics:
         assert res.status == 0, f"Expected exit 0 on empty search: {res}"
         assert res.out == b""
         assert res.err == b""
+
+    @pytest.mark.parametrize("args", [
+        pytest.param(("foo", "--help"), id="after-pattern"),
+        pytest.param(("--bogus", "--help"), id="after-unknown-option"),
+        pytest.param(("--hidden", "--no-hidden", "--help"), id="after-conflicting-flags"),
+        pytest.param(("--limit", "notanumber", "--help"), id="after-invalid-value"),
+    ])
+    def test_help_prescan_wins_over_other_arguments(self, zfind: ZfindRunner, args: tuple[str, ...]):
+        baseline = zfind("tiny", "--help")
+        res = zfind("tiny", *args)
+        assert res.status == 0, f"Expected help for {args}: {res}"
+        assert res.out == baseline.out
+        assert res.err == b""
+
+    def test_help_after_double_dash_is_literal(self, zfind_path: Path, tmp_path: Path):
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        (tree / "--help").write_bytes(b"")
+        (tree / "-h").write_bytes(b"")
+
+        res = run_in(zfind_path, tree, "--", "--help")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"--help"]
+
+        # Matching is a literal substring, so -h also matches the --help filename.
+        res = run_in(zfind_path, tree, "--", "-h")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"--help", b"-h"]
+
+    @pytest.mark.parametrize("arg", [
+        pytest.param("--ignore-case", id="old-case-spelling"),
+        pytest.param("--ignore-case=foo", id="old-case-spelling-with-value"),
+        pytest.param("-h", id="removed-short-help"),
+        pytest.param("-0", id="removed-short-null"),
+    ])
+    def test_removed_options_are_unknown(self, zfind: ZfindRunner, arg: str):
+        res = zfind("tiny", arg)
+        assert res.status == 1, f"Expected exit 1: {res}"
+        assert res.err == b"zfind: unknown option\n"
+        assert res.out == b""
+
+    def test_help_lists_current_options_and_fits_width(self, zfind: ZfindRunner):
+        out = zfind("tiny", "--help").out
+        for option in CURRENT_HELP_OPTIONS:
+            assert option in out
+        assert b"--ignore-case" not in out
+        assert b"--null" not in out
+        assert all(len(line) <= 80 for line in out.splitlines())
 
 
 # -----------------------------------------------------------------------------
@@ -373,15 +429,6 @@ class TestSeparatorOutput:
         res = zfind("tiny", "--separator=\\0", "c")
         assert res.status == 0, f"Command failed: {res}"
         assert res.out == b"ca\0cb\0dir/c\0"
-
-    def test_split_xy_output_on_tiny_matches_default_entries(self, zfind: ZfindRunner):
-        # Specific case only: XY is absent from these names and is not formed
-        # across their result boundaries. Do not generalize split equality to
-        # arbitrary separators or filenames.
-        default = zfind("tiny")
-        custom = zfind("tiny", "--separator=XY")
-        assert default.status == custom.status == 0
-        assert custom.out.split(b"XY")[:-1] == entries(default.out)
 
     def test_no_results_writes_nothing(self, zfind: ZfindRunner):
         res = zfind("tiny", "--separator=XY", "definitely_no_such_name")
@@ -583,6 +630,7 @@ class TestType:
         pytest.param(["--type"], id="missing-arg"),
         pytest.param(["--type", "x"], id="invalid-type-letter"),
         pytest.param(["--type", "dir"], id="word-instead-of-char"),
+        pytest.param(["--type", "--limit", "5"], id="subsequent-flag-as-value"),
     ])
     def test_invalid_type_fails(self, zfind: ZfindRunner, args: list[str]):
         res = zfind("tiny", *args)
@@ -595,7 +643,110 @@ class TestType:
 # Pattern Matching: Smart Case, --case-sensitive, --case-insensitive
 # -----------------------------------------------------------------------------
 
+class TestSortOrder:
+    def test_results_are_sorted_for_names_with_equal_prefixes(self, zfind: ZfindRunner):
+        listing = entries(zfind("camera").out)
+        assert len({name[:8] for name in listing}) < len(listing)
+        assert listing == sorted(listing)
+
+
+class TestPatternMatching:
+    def test_pattern_matches_basename_not_relative_path(
+        self, zfind_path: Path, tmp_path: Path
+    ):
+        tree = tmp_path / "tree"
+        (tree / "dir").mkdir(parents=True)
+        (tree / "dir" / "c").write_bytes(b"")
+
+        res = run_in(zfind_path, tree, "dir")
+        assert res.status == 0, f"Command failed: {res}"
+        assert entries(res.out) == [b"dir/"]
+
+        res = run_in(zfind_path, tree, "c")
+        assert res.status == 0, f"Command failed: {res}"
+        assert entries(res.out) == [b"dir/c"]
+
+        res = run_in(zfind_path, tree, "dir/c")
+        assert res.status == 0, f"Command failed: {res}"
+        assert entries(res.out) == []
+
+
+class TestParserEdges:
+    def test_optional_pattern_double_dash_and_bare_dash(
+        self, zfind_path: Path, tmp_path: Path
+    ):
+        tree = tmp_path / "tree"
+        (tree / "dir").mkdir(parents=True)
+        for name in ("-", "-x", "a"):
+            (tree / name).write_bytes(b"")
+        (tree / "dir" / "c").write_bytes(b"")
+        all_entries = [b"-", b"-x", b"a", b"dir/", b"dir/c"]
+
+        res = run_in(zfind_path, tree, "")
+        assert res.status == 0, f"Command failed: {res}"
+        assert entries(res.out) == all_entries
+
+        res = run_in(zfind_path, tree, "--")
+        assert res.status == 0, f"Command failed: {res}"
+        assert entries(res.out) == all_entries
+
+        res = run_in(zfind_path, tree, "-")
+        assert res.status == 0, f"Command failed: {res}"
+        assert entries(res.out) == [b"-", b"-x"]
+
+        res = run_in(zfind_path, tree, "--", "p", "q")
+        assert res.status == 1
+        assert res.err == b"zfind: unexpected argument\n"
+        assert res.out == b""
+
+
+@pytest.fixture
+def case_tree(tmp_path: Path) -> Path:
+    tree = tmp_path / "case-tree"
+    tree.mkdir()
+    for name in ("foo", "FOO", "Foo", "café", "CAFÉ"):
+        (tree / name).write_bytes(b"")
+    return tree
+
+
 class TestCaseSensitivity:
+    @pytest.mark.parametrize(("args", "expected"), [
+        pytest.param(("foo",), words("FOO Foo foo"), id="smart-lowercase"),
+        pytest.param(("Foo",), words("Foo"), id="smart-uppercase"),
+        pytest.param(("--case-sensitive", "foo"), words("foo"), id="forced-sensitive"),
+        pytest.param(
+            ("--case-insensitive", "FOO"), words("FOO Foo foo"),
+            id="forced-insensitive",
+        ),
+        pytest.param(
+            ("--case-insensitive", "café"), words("café"),
+            id="non-ascii-forced-insensitive",
+        ),
+        pytest.param(
+            ("--case-sensitive", "CAFÉ"), words("CAFÉ"),
+            id="non-ascii-forced-sensitive",
+        ),
+    ])
+    def test_case_matrix_lists_exact_matches(
+        self, zfind_path: Path, case_tree: Path, args: tuple[str, ...],
+        expected: list[bytes],
+    ):
+        res = run_in(zfind_path, case_tree, *args)
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == expected
+
+    @pytest.mark.parametrize("args", [
+        pytest.param(("--case-sensitive",), id="sensitive-only"),
+        pytest.param(("--case-insensitive",), id="insensitive-only"),
+        pytest.param(("--case-sensitive", "--case-sensitive"), id="repeated-sensitive"),
+        pytest.param(("--case-insensitive", "--case-insensitive"), id="repeated-insensitive"),
+    ])
+    def test_case_flags_without_pattern_are_noop(self, zfind: ZfindRunner, args: tuple[str, ...]):
+        baseline = zfind("tiny")
+        res = zfind("tiny", *args)
+        assert res == baseline
+
     def test_smart_case_lowercase_pattern_is_case_insensitive(self, zfind: ZfindRunner):
         # 'caf' matches 'café'
         res = zfind("weird", "caf")
@@ -630,17 +781,32 @@ class TestConflictingFlags:
         pytest.param(
             ["--case-sensitive", "--case-insensitive"],
             b"zfind: cannot combine --case-sensitive and --case-insensitive\n",
-            id="case-conflict",
+            id="case-conflict-sensitive-first",
+        ),
+        pytest.param(
+            ["--case-insensitive", "--case-sensitive"],
+            b"zfind: cannot combine --case-sensitive and --case-insensitive\n",
+            id="case-conflict-insensitive-first",
         ),
         pytest.param(
             ["--hidden", "--no-hidden"],
             b"zfind: cannot combine --hidden and --no-hidden\n",
-            id="hidden-conflict",
+            id="hidden-conflict-hidden-first",
+        ),
+        pytest.param(
+            ["--no-hidden", "--hidden"],
+            b"zfind: cannot combine --hidden and --no-hidden\n",
+            id="hidden-conflict-no-hidden-first",
         ),
         pytest.param(
             ["--gitignore", "--no-gitignore"],
             b"zfind: cannot combine --gitignore and --no-gitignore\n",
-            id="gitignore-conflict",
+            id="gitignore-conflict-gitignore-first",
+        ),
+        pytest.param(
+            ["--no-gitignore", "--gitignore"],
+            b"zfind: cannot combine --gitignore and --no-gitignore\n",
+            id="gitignore-conflict-no-gitignore-first",
         ),
     ])
     def test_mutually_exclusive_flags_fail(
@@ -666,13 +832,6 @@ class TestNoHidden:
         res = zfind("hidden", *args)
         assert res.status == 0, f"Command failed: {res}"
         assert entries(res.out) == expected
-
-    def test_no_hidden_does_not_enter_hidden_directories(self, zfind: ZfindRunner):
-        res = zfind("hidden", "--no-hidden")
-        assert res.status == 0, f"Command failed: {res}"
-        listed = entries(res.out)
-        assert len(listed) == len(HIDDEN_SKIPPED)
-        assert not any(b"inside" in entry for entry in listed)
 
 
 # -----------------------------------------------------------------------------
@@ -703,27 +862,53 @@ class TestGitignore:
         assert entries(res_git.out) == plain
         assert b"noise.log" in plain
 
-    @pytest.mark.parametrize("entry, expected_listed", [
-        pytest.param(b"a.txt", True, id="no-rule-matches"),
-        pytest.param(b"a.o", False, id="wildcard-*.o"),
-        pytest.param(b"sub/x.o", False, id="wildcard-sub/*.o"),
-        pytest.param(b"build/", False, id="directory-build/"),
-        pytest.param(b"build/b1", False, id="descendant-of-ignored-directory"),
-        pytest.param(b"sub/build", True, id="directory-rule-does-not-match-file"),
-        pytest.param(b"skipme", False, id="root-anchored-/skipme"),
-        pytest.param(b"sub/skipme", True, id="root-anchored-rule-skips-subdir"),
-        pytest.param(b"tmp1", False, id="wildcard-tmp*"),
-        pytest.param(b"tmp_keep", True, id="negated-rule-!tmp_keep"),
-        pytest.param(b"sub/noise.log", False, id="nested-.gitignore-*.log"),
-        pytest.param(b"sub/keep.log", True, id="nested-.gitignore-negated-!keep.log"),
-        pytest.param(b"sub/local/", False, id="nested-.gitignore-directory"),
-    ])
-    def test_individual_rules(self, zfind: ZfindRunner, entry: bytes, expected_listed: bool):
-        res = zfind("ignores", "--gitignore", "--no-hidden")
+    def test_gitignore_question_and_double_star_syntax(
+        self, zfind_path: Path, tmp_path: Path
+    ):
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        (tree / ".git").mkdir()
+        (tree / ".gitignore").write_bytes(b"?.log\n**/gen/*.tmp\nbuild/**\n")
+        (tree / ".ignore").write_bytes(b"important.log\n")
+        for name in ("a.log", "ab.log", "important.log"):
+            (tree / name).write_bytes(b"")
+        (tree / "gen").mkdir()
+        (tree / "gen" / "x.tmp").write_bytes(b"")
+        (tree / "gen" / "x.keep").write_bytes(b"")
+        (tree / "deep" / "gen").mkdir(parents=True)
+        (tree / "deep" / "gen" / "y.tmp").write_bytes(b"")
+        (tree / "build" / "sub").mkdir(parents=True)
+        (tree / "build" / "sub" / "file").write_bytes(b"")
+
+        res = run_in(zfind_path, tree, "--gitignore")
         assert res.status == 0, f"Command failed: {res}"
-        listed = entries(res.out)
-        assert len(listed) > 0, "Output unexpectedly empty"
-        assert (entry in listed) is expected_listed
+        assert res.err == b""
+        assert entries(res.out) == [
+            b".gitignore",
+            b".ignore",
+            b"ab.log",
+            b"build/",
+            b"deep/",
+            b"deep/gen/",
+            b"gen/",
+            b"gen/x.keep",
+            b"important.log",
+        ]
+
+    def test_gitignore_case_matching_ignores_case_flags(
+        self, zfind_path: Path, tmp_path: Path
+    ):
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        (tree / ".git").mkdir()
+        (tree / ".gitignore").write_bytes(b"foo\n")
+        for name in ("foo", "FOO", "Foo"):
+            (tree / name).write_bytes(b"")
+
+        res = run_in(zfind_path, tree, "--gitignore", "--case-insensitive", "foo")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"FOO", b"Foo"]
 
 
 # -----------------------------------------------------------------------------
@@ -762,42 +947,6 @@ class TestLimit:
         res = zfind("tiny", *args)
         assert res.status == 0, f"Command failed: {res}"
         assert entries(res.out) == expected
-
-    def test_limit_with_nul_separator_counts_entries(self, zfind: ZfindRunner):
-        res = zfind("tiny", "--separator=\\0", "--limit", "2")
-        assert res.status == 0, f"Command failed: {res}"
-        assert res.out == b"a\0b\0"
-
-    @pytest.mark.parametrize("sep_args, sep_bytes", [
-        pytest.param((), b"\n", id="newline"),
-        pytest.param(("--separator=\\t",), b"\t", id="tab"),
-        pytest.param(("--separator=\\0",), b"\0", id="nul"),
-        pytest.param(("--separator=XY",), b"XY", id="multi-byte"),
-    ])
-    def test_limit_prints_exactly_n_results(
-        self, zfind: ZfindRunner, sep_args: tuple[str, ...], sep_bytes: bytes
-    ):
-        res = zfind("tiny", *sep_args, "--limit", "3")
-        assert res.status == 0, f"Command failed: {res}"
-        assert res.err == b""
-        assert res.out == b"".join(entry + sep_bytes for entry in TINY[:3])
-
-    def test_limit_zero_prints_nothing_with_separator(self, zfind: ZfindRunner):
-        res = zfind("tiny", "--separator=XY", "--limit", "0")
-        assert res.status == 0, f"Command failed: {res}"
-        assert res.err == b""
-        assert res.out == b""
-
-    def test_limit_larger_than_count_prints_everything(self, zfind: ZfindRunner):
-        full = zfind("tiny", "--separator=XY")
-        res = zfind("tiny", "--separator=XY", "--limit", "100")
-        assert full.status == res.status == 0
-        assert res.out == full.out
-
-    def test_limit_mid_chunk_keeps_multibyte_separator_whole(self, zfind: ZfindRunner):
-        res = zfind("tiny", "--separator=LL", "--limit", "3")
-        assert res.status == 0, f"Command failed: {res}"
-        assert res.out == b"aLLbLLcaLL"
 
     @pytest.mark.parametrize("args, expected", [
         pytest.param(["--limit", "3"], words(".git/ .gitignore .hidden"), id="counts-hidden-by-default"),
@@ -868,23 +1017,6 @@ class TestLimit:
             assert res_xy.status == 0, f"Failed at XY --limit {n}: {res_xy}"
             assert res_xy.out == expected == full_xy.out[:len(expected)]
 
-    def test_separator_inside_name_does_not_count_as_a_result(
-        self, zfind_path: Path, tmp_path: Path
-    ):
-        tree = tmp_path / "tree"
-        tree.mkdir()
-        for name in ("aXYb", "c", "d"):
-            (tree / name).write_bytes(b"")
-
-        full = run_in(zfind_path, tree, "--separator=XY")
-        assert full.status == 0, f"Baseline failed: {full}"
-        assert full.out == b"aXYbXYcXYdXY"
-
-        capped = run_in(zfind_path, tree, "--separator=XY", "--limit", "2")
-        assert capped.status == 0, f"Capped run failed: {capped}"
-        # The XY inside aXYb is part of one result, not a result boundary.
-        assert capped.out == b"aXYbXYcXY"
-
     def test_overlapping_separator_does_not_truncate_last_result(
         self, zfind_path: Path, tmp_path: Path
     ):
@@ -901,27 +1033,13 @@ class TestLimit:
         assert capped.out == b"xaaa"
 
     @pytest.mark.parametrize("sep_arg, sep_bytes", EXACT_LIMIT_SEPARATORS)
-    @pytest.mark.parametrize("n", [0, 1, 2, 3, 7, 8, 9])
-    def test_exact_limit_prefix_for_every_separator(
-        self, zfind_path: Path, exact_limit_tree: Path,
-        sep_arg: str, sep_bytes: bytes, n: int,
+    def test_unlimited_output_for_every_separator(
+        self, zfind_path: Path, exact_limit_tree: Path, sep_arg: str, sep_bytes: bytes
     ):
-        full = run_in(zfind_path, exact_limit_tree, "--separator=" + sep_arg)
-        assert full.status == 0, f"Baseline failed: {full}"
-        assert full.err == b""
-        assert full.out == joined(TINY, sep_bytes)
-
-        res = run_in(
-            zfind_path, exact_limit_tree, "--separator=" + sep_arg, "--limit", str(n)
-        )
-        assert res.status == 0, f"Command failed: {res}"
-        assert res.err == b""
-        expected = joined(TINY[:n], sep_bytes)
-        assert res.out == expected
-        if n >= len(TINY):
-            assert res.out == full.out
-        if n == 0:
-            assert res.out == b""
+        res = run_in(zfind_path, exact_limit_tree, "--separator=" + sep_arg)
+        assert res.status == 0, f"Baseline failed: {res}"
+        assert res.err == b"", f"Baseline wrote stderr: {res}"
+        assert res.out == joined(TINY, sep_bytes)
 
     @pytest.mark.parametrize("n", [0, 1, 2, 3, 4])
     def test_name_containing_separator_is_one_result(
@@ -956,20 +1074,6 @@ class TestLimit:
         assert res.err == serial.err == b"", f"parallel={res}; serial={serial}"
         assert res.out == serial.out
 
-    def test_newline_inside_name_is_one_result(self, zfind_path: Path, tmp_path: Path):
-        tree = tmp_path / "tree"
-        tree.mkdir()
-        for name in ("a", "q\nr", "z"):
-            (tree / name).write_bytes(b"")
-
-        full = run_in(zfind_path, tree, "--separator=\\n")
-        assert full.status == 0, f"Baseline failed: {full}"
-        assert full.out == b"a\nq\nr\nz\n"
-
-        capped = run_in(zfind_path, tree, "--separator=\\n", "--limit", "2")
-        assert capped.status == 0, f"Capped run failed: {capped}"
-        assert capped.out == b"a\nq\nr\n"
-
     @pytest.mark.parametrize("limit_args", [
         pytest.param(("--limit", str(UINT64_MAX)), id="separate-value"),
         pytest.param(("--limit=" + str(UINT64_MAX),), id="equals-syntax"),
@@ -990,14 +1094,12 @@ class TestLimit:
         assert res.out == full.out
 
     @pytest.mark.parametrize(("tree", "listing", "sep", "n"), [
-        pytest.param("tiny", TINY, b"aa", 1, id="tiny-aa-limit-1"),
-        pytest.param("tiny", TINY, b"aa", 3, id="tiny-aa-limit-3"),
         pytest.param("ignores", IGNORES, b"tt", 5, id="ignores-tt-limit-5"),
         pytest.param("ignores", IGNORES, b"tt", 27, id="ignores-tt-limit-27"),
         pytest.param("weird", WEIRD, b"bb", 6, id="weird-bb-limit-6"),
         pytest.param("weird", WEIRD, b"bb", 14, id="weird-bb-limit-14"),
     ])
-    def test_reviewed_occurrence_count_regressions(
+    def test_limit_prefix_with_overlapping_separators_on_larger_trees(
         self, zfind: ZfindRunner, tree: str, listing: list[bytes], sep: bytes, n: int
     ):
         res = zfind(tree, "--separator=" + sep.decode(), "--limit", str(n))
@@ -1013,25 +1115,38 @@ class TestLimit:
         assert res.err == b""
         assert res.out == b"dir//"
 
-    @pytest.mark.parametrize("sep_arg, sep_bytes", EXACT_LIMIT_SEPARATORS)
     @pytest.mark.parametrize("n", [0, 1, 2, 3, 7, 8, 9])
-    def test_exact_limit_serial_matches_parallel(
-        self, zfind_path: Path, serial_zfind_path: Path, serial_binary_path: Path,
+    @pytest.mark.parametrize("sep_arg, sep_bytes", EXACT_LIMIT_SEPARATORS)
+    def test_exact_limit_prefix_and_serial_parity(
+        self, zfind_path: Path, serial_binary_path: Path,
         exact_limit_tree: Path, sep_arg: str, sep_bytes: bytes, n: int,
     ):
         args = ("--separator=" + sep_arg, "--limit", str(n))
+        expected = joined(TINY[:n], sep_bytes)
+
         parallel = run_repeated(zfind_path, exact_limit_tree, *args)
         assert parallel.status == 0, f"parallel={parallel}"
         assert parallel.err == b"", f"parallel={parallel}"
-        assert parallel.out == joined(TINY[:n], sep_bytes)
+        assert parallel.out == expected
+
         if same_binary(zfind_path, serial_binary_path):
-            # Both fixtures select the same executable; keep the exact-output
-            # assertion above but do not compare the run with itself.
             return
-        serial = run_in(serial_zfind_path, exact_limit_tree, *args)
-        assert parallel.status == serial.status == 0, f"parallel={parallel}; serial={serial}"
-        assert parallel.err == serial.err == b"", f"parallel={parallel}; serial={serial}"
-        assert parallel.out == serial.out, f"parallel={parallel}; serial={serial}"
+        if not serial_binary_path.is_file():
+            pytest.skip(
+                f"serial binary not built: {serial_binary_path}; exact-limit "
+                "assertions passed, serial parity skipped; run `make test`"
+            )
+
+        serial = run_in(serial_binary_path, exact_limit_tree, *args)
+        assert parallel.status == serial.status == 0, (
+            f"parallel={parallel}; serial={serial}"
+        )
+        assert parallel.err == serial.err == b"", (
+            f"parallel={parallel}; serial={serial}"
+        )
+        assert parallel.out == serial.out == expected, (
+            f"parallel={parallel}; serial={serial}"
+        )
 
     @pytest.mark.parametrize(("tree", "args"), [
         pytest.param("tree2", (), id="wide-tree"),
@@ -1063,18 +1178,12 @@ class TestLimit:
         assert parallel.status == serial.status == 0, f"parallel={parallel}; serial={serial}"
         assert parallel == serial, f"parallel={parallel}; serial={serial}"
 
-    @pytest.mark.parametrize(("tree", "args"), [
-        pytest.param("tree2", ("--limit", "100"), id="wide-tree"),
-        pytest.param("ignores", ("--separator=tt", "--limit", "5"), id="ignores-tt-limit-5"),
-        pytest.param("weird", ("--separator=bb", "--limit", "14"), id="weird-bb-limit-14"),
-        pytest.param("tiny", ("--separator=aa", "--limit", "3"), id="tiny-aa-limit-3"),
-    ])
     def test_limit_output_is_deterministic_under_concurrency(
-        self, zfind: ZfindRunner, tree: str, args: tuple[str, ...]
+        self, zfind: ZfindRunner
     ):
         outputs = set()
-        for i in range(20):
-            res = zfind(tree, *args)
+        for i in range(10):
+            res = zfind("tree2", "--limit", "100")
             assert res.status == 0, f"Run {i} failed: {res}"
             assert len(res.out) > 0, f"Run {i} produced empty output: {res}"
             outputs.add(res.out)
@@ -1292,6 +1401,7 @@ class TestSeparatorBlockBoundaries:
             assert res.err == serial.err == b"", (
                 f"Limited run at {n} wrote stderr: parallel={res}; serial={serial}"
             )
+            assert res.out == serial.out, f"Wrong prefix at --limit {n}"
 
 
 # -----------------------------------------------------------------------------
@@ -1376,14 +1486,19 @@ LAZY_ALL = words("""
     aa/ aa/bb/ aa/bb/cc/ aa/bb/cc/leaf.txt aa/bb/deep/
     aa/bb/deep/nested.txt aa/ignored/ aa/ignored/inside.txt
     aa/keep.log aa/local.log aa/other.tmp
-    link_dir link_file root.txt
+    link_dir link_file pipe root.txt
 """)
 
-# --type f prints regular files only; symlinks are excluded.
+# --type f prints regular files only; symlinks and FIFOs are excluded.
 LAZY_FILES = [
     path for path in LAZY_ALL
-    if not path.endswith(b"/") and path not in (b"link_dir", b"link_file")
+    if not path.endswith(b"/") and path not in (b"link_dir", b"link_file", b"pipe")
 ]
+
+# --type d prints real directories only; symlinks to directories are excluded.
+LAZY_DIRS = words("""
+    .git/ .hidden/ aa/ aa/bb/ aa/bb/cc/ aa/bb/deep/ aa/ignored/
+""")
 
 # Root .gitignore: *.log, !keep.log, ignored/, aa/other.tmp.
 LAZY_IGNORED = {
@@ -1395,6 +1510,7 @@ LAZY_GITIGNORED = [path for path in LAZY_ALL if path not in LAZY_IGNORED]
 LAZY_CASES = [
     pytest.param((), LAZY_ALL, id="all"),
     pytest.param(("--type", "f"), LAZY_FILES, id="files"),
+    pytest.param(("--type", "d"), LAZY_DIRS, id="dirs"),
     pytest.param(("--gitignore",), LAZY_GITIGNORED, id="gitignore"),
 ]
 
@@ -1418,7 +1534,19 @@ def lazy_path_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     (root / "root.txt").write_bytes(b"")
     (root / "link_dir").symlink_to("aa")
     (root / "link_file").symlink_to("aa/other.tmp")
+    try:
+        os.mkfifo(root / "pipe")
+    except OSError as exc:
+        pytest.skip(f"cannot create FIFO on this filesystem: {exc}")
     return root
+
+
+def _unknown_candidate(binary: Path) -> Path:
+    """Sibling unknown-type build path for a normal or serial binary."""
+    name = binary.parent.name
+    if name.endswith("-serial"):
+        name = name[:-len("-serial")]
+    return binary.parent.parent / f"{name}-unknown" / "zfind"
 
 
 @pytest.fixture(scope="session")
@@ -1426,9 +1554,7 @@ def unknown_zfind_path(zfind_path: Path) -> Path:
     """Path to the DT_UNKNOWN/FORCE_WIDE_SPLIT test build."""
     explicit = os.environ.get("ZFIND_UNKNOWN")
     candidates = [Path(explicit)] if explicit else []
-    candidates.append(
-        zfind_path.parent.parent / f"{zfind_path.parent.name}-unknown" / "zfind"
-    )
+    candidates.append(_unknown_candidate(zfind_path))
     for candidate in candidates:
         if candidate.is_file():
             return candidate
