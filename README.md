@@ -20,7 +20,8 @@ zfind --hidden TODO             # Find names containing "TODO", hidden entries i
 zfind --no-hidden TODO          # Find names containing "TODO" and skip hidden entries
 zfind --gitignore Cargo         # Find names containing "Cargo" and apply supported .gitignore rules
 zfind --no-gitignore Cargo      # Search without applying .gitignore rules (the default)
-zfind --null --limit 100 .conf  # Print up to 100 matches, separated by NUL bytes
+zfind --separator='\0' --limit 100 .conf  # Print up to 100 matches, NUL-separated
+zfind --separator='\t' config   # Print matches separated by tabs
 zfind --type f                  # List regular files, traversing directories as usual
 zfind --type f --type d         # List regular files and directories
 ```
@@ -38,13 +39,14 @@ zfind --type f --type d         # List regular files and directories
   skips them and their contents; combining the two is a usage error.
 - Results are sorted by name within each directory. Output follows depth-first order.
 - Paths are relative to the current directory. Directory results end with `/`.
+- Each result is terminated by the selected separator, including the last one. Newline is the default. A run with no results writes nothing.
 - zfind does not follow symlinked directories. Explicit `--type f` and
   `--type d` filters exclude symlinks, including symlinks to files and directories.
 
 ## Options
 
 - `--help` Show help and exit. A pre-scan recognizes `--help` anywhere before `--`, including after the pattern or where an option value would normally go.
-- `--null` Separate results with NUL instead of newline. Use this when filenames may contain newlines.
+- `--separator STR`, `--separator=STR` Terminate each result with `STR` instead of newline. The decoded value must be 1–64 bytes. Recognized escapes are `\n`, `\t`, `\r`, `\0`, and `\\`; unknown backslash escapes are rejected, and other bytes, including real control characters, are literal. `--separator` consumes the next token greedily as its value, even if it starts with `-`; repeated uses are last-wins. Pass the escape text literally, for example `--separator='\t'`. Do not use bash `$'\0'` for NUL: bash truncates the argument at the NUL byte and makes zfind see an empty value; use `--separator='\0'`. Only NUL guarantees unambiguous parsing, because a filename cannot contain NUL; a custom separator can appear in a filename or be formed across adjacent output bytes.
 - `--case-sensitive` Match pattern case-sensitively. Must appear before `PATTERN`.
 - `--case-insensitive` Match pattern case-insensitively (ASCII `A`–`Z`). Must appear before `PATTERN`.
 - `--gitignore` Apply supported `.gitignore` rules and skip the `.git`
@@ -55,7 +57,7 @@ zfind --type f --type d         # List regular files and directories
 - `--hidden` Search hidden entries (the default). On its own this changes no
   results; combining it with `--no-hidden` is a usage error.
 - `--no-hidden` Skip names that begin with `.`, including hidden directories and everything inside them.
-- `--limit N`, `--limit=N` Print at most `N` results. `0` prints nothing. Use `--null` to count entries correctly when filenames may contain newlines. `--limit` consumes the next token greedily as its value.
+- `--limit N`, `--limit=N` Print at most `N` results. `0` prints nothing. The limit counts results exactly for every separator, and limited output is the same byte prefix as an unlimited run. Use `--separator='\0'` when a consumer must split the output unambiguously. `--limit` consumes the next token greedily as its value.
 - `--type f|d` Print regular files (`f`) and/or directories (`d`). Repeat the
   option to select both types; repeated values have no extra effect. Explicit
   type filters exclude symlinks and special entries. `--type f` still traverses

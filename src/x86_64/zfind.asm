@@ -1,7 +1,7 @@
 default rel                     ; x86-64: address labels RIP-relative, not via implicit ABS
 
 ; zfind, "simple search" use case only:
-;   zfind [--help] [--null] [--case-sensitive | --case-insensitive]
+;   zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
 ;         [--limit N] [--type f|d] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
@@ -52,18 +52,23 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ;   5 ms for new lines) but an unfinished record further ahead is not written
 ;   until it is the current one, which is what keeps the order exact.
 ;
-; --limit N is enforced by the writer alone: out_put counts the separators in the
-; bytes it is handed and, in the call that reaches the Nth, keeps the bytes
-; through it, flushes and exit_groups. No stop flag is needed and the prefix is
-; the DFS order above, so it is deterministic. Workers that ran ahead of the
-; writer die with the process.
+; --limit N is enforced by the writer alone. While a limit is active,
+; print_entry frames each result with a two-byte payload length inside its
+; output block; a frame never spans blocks and BLK_USED is published only after
+; a whole frame. out_put strips the headers, copies exactly N payloads to
+; stdout and exit_groups after the Nth. Result counting is exact for every
+; separator and independent of block, record, group and worker boundaries: a
+; limited run is the unlimited DFS byte stream truncated after the Nth result.
+; No stop flag is needed. Workers that ran ahead of the writer die with the
+; process.
 ; shortcut: an error raised by a worker that ran ahead of the writer (tree or
 ;   directory too large) still exits 1, so a capped run on a tree that triggers
 ;   one may exit 0 or 1 depending on timing.
-; Requires an x86-64-v3 CPU (AVX2, POPCNT): out_put's separator count uses them.
+; Requires an x86-64-v3 CPU.
 
 %define AT_FDCWD    -100
 %define PATH_MAX    4096
+%define SEP_MAX     64                ; decoded --separator bytes
 %define ENT_BUF     32768
 %macro LAST_BATCH 0                 ; rax = bytes returned -> r13d = 1 if that was all
 %ifndef NO_EOF_SHORTCUT
@@ -108,6 +113,9 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define FD_KEEP_MAX  64               ; directories one thread keeps open while recursing
 %define SORT_RUN    16               ; insertion-sort runs this long, merge above
 %define BLK_DATA    (BLK_SZ - BLK_HDR)
+%if 2 + PATH_MAX + 1 + SEP_MAX > BLK_DATA
+    %error "a result frame (2 + path + '/' + separator) must fit in one block"
+%endif
 %define BLK_NEXT    0                ; next block of the record / free-list link
 %define BLK_USED    8                ; bytes of data written so far
 %define BLK_OWNER   16               ; thread that gets it back
@@ -231,12 +239,23 @@ section .rodata
     e_hid_e:
     e_ig        db "zfind: cannot combine --gitignore and --no-gitignore", 10
     e_ig_e:
+    e_sep_missing db "zfind: missing value for --separator", 10
+    e_sep_missing_e:
+    e_sep_empty db "zfind: empty separator", 10
+    e_sep_empty_e:
+    e_sep_escape db "zfind: unknown escape sequence in separator", 10
+    e_sep_escape_e:
+    e_sep_incomplete db "zfind: incomplete escape sequence in separator", 10
+    e_sep_incomplete_e:
+    e_sep_long  db "zfind: separator too long (max 64 bytes)", 10
+    e_sep_long_e:
     h_long      db "--help", 0
-    z_long      db "--null", 0
     cs_long     db "--case-sensitive", 0
     ci_long     db "--case-insensitive", 0
     l_long      db "--limit", 0
     l_eq        db "--limit=", 0     ; 8 bytes of prefix
+    sep_long    db "--separator", 0
+    sep_eq      db "--separator=", 0 ; 12 bytes of prefix
     t_long      db "--type", 0
     t_file      db "f", 0
     t_dir       db "d", 0
@@ -244,7 +263,7 @@ section .rodata
     nog_long    db "--no-gitignore", 0
     hidden_long db "--hidden", 0
     no_long     db "--no-hidden", 0
-    help_msg    db "usage: zfind [--help] [--null] [--case-sensitive | --case-insensitive]", 10
+    help_msg    db "usage: zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
                db "             [--limit N] [--type f|d] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
@@ -254,10 +273,11 @@ section .rodata
                db "combining both is an error. Case folding affects only PATTERN (ASCII", 10
                db "only) and does not apply to .gitignore rules. Without a pattern every", 10
                db "entry is listed unless --type restricts the result types.", 10, 10
-               db "Options must appear before PATTERN. --limit and --type consume the next", 10
-               db "token greedily as their value. -- ends options; any following argument", 10
-               db "is treated as PATTERN. --help prints this help and exits 0 anywhere", 10
-               db "before --, including after PATTERN or where an option value is expected.", 10, 10
+               db "Options must appear before PATTERN. --limit, --type and --separator", 10
+               db "consume the next token greedily as their value. -- ends options; any", 10
+               db "following argument is treated as PATTERN. --help prints this help and", 10
+               db "exits 0 anywhere before --, including after PATTERN or where an option", 10
+               db "value is expected.", 10, 10
                db "Hidden entries are searched like any other, .git included; --no-hidden", 10
                db "skips entries whose name starts with . and everything inside them.", 10
                db "--hidden states the default explicitly; combining the two is an error.", 10
@@ -268,7 +288,9 @@ section .rodata
                db "under .git. Entries are sorted by name within each directory; output", 10
                db "follows depth-first order.", 10, 10
                db "  --help              show this help and exit", 10
-               db "  --null              separate entries with NUL, not newline", 10
+               db "  --separator STR     terminate results with STR, 1-64 bytes", 10
+               db "                      (also --separator=STR); decodes \n \t \r \0 \\", 10
+               db "                      default: newline", 10
                db "  --case-sensitive    match pattern case-sensitively", 10
                db "  --case-insensitive  match pattern case-insensitively (ASCII A-Z)", 10
                db "  --gitignore         respect .gitignore rules when cwd contains .git; skip .git", 10
@@ -288,8 +310,11 @@ section .bss
     pat_ptr:    resq 1
     pat_len:    resq 1
     pat_ci:     resq 1                ; 1 = fold case (both filename and pattern bytes)
-    nul_sep:    resq 1                ; 1 = separate entries with NUL, not newline
-    lim_left:   resq 1                ; results left before the writer stops; -1 = no limit
+    sep_buf:    resb SEP_MAX          ; decoded --separator bytes (may contain NUL)
+    sep_len:    resq 1                ; decoded separator length, 1..SEP_MAX
+    lim_left:    resq 1               ; writer-only remaining results; -1 = no limit or UINT64_MAX
+    limit_given: resq 1               ; read-only after parsing: 1 = --limit was supplied
+    limit_mode:  resq 1               ; read-only after startup: 1 = frame results
     res_ig:     resq 1                ; 0 = default, 1 = --gitignore, 2 = --no-gitignore
     hid_mode:   resb 1                ; 0 = default, 1 = --hidden, 2 = --no-hidden
     case_mode:  resb 1                ; 0 = smart (default), 1 = forced sensitive, 2 = forced insensitive
@@ -354,6 +379,9 @@ _start:
 
 .prescan_done:
     mov qword [lim_left], -1
+    mov qword [limit_given], 0
+    mov qword [sep_len], 1
+    mov byte [sep_buf], 10
     xor r13d, r13d
     mov r12, 1
 .args_loop:
@@ -365,10 +393,6 @@ _start:
     cmp byte [rdi+1], 0
     je .arg_pattern                    ; "-" alone
 
-    mov rdi, [rbp+r12*8]
-    lea rsi, [z_long]
-    call streq
-    je .opt_null
     mov rdi, [rbp+r12*8]
     lea rsi, [cs_long]
     call streq
@@ -389,6 +413,14 @@ _start:
     lea rsi, [l_eq]
     call startswith
     je .opt_limit_eq
+    mov rdi, [rbp+r12*8]
+    lea rsi, [sep_long]
+    call streq
+    je .opt_sep_next
+    mov rdi, [rbp+r12*8]
+    lea rsi, [sep_eq]
+    call startswith
+    je .opt_sep_eq
     mov rdi, [rbp+r12*8]
     lea rsi, [g_long]
     call streq
@@ -450,11 +482,6 @@ _start:
     inc r12
     jmp .args_loop
 
-.opt_null:
-    mov qword [nul_sep], 1
-    inc r12
-    jmp .args_loop
-
 .opt_git:
     cmp qword [res_ig], 2
     je bad_ig_comb
@@ -491,6 +518,7 @@ _start:
     call parse_u64
     jc bad_limit
     mov [lim_left], rax
+    mov qword [limit_given], 1
     inc r12
     jmp .args_loop
 
@@ -500,6 +528,23 @@ _start:
     call parse_u64
     jc bad_limit
     mov [lim_left], rax
+    mov qword [limit_given], 1
+    inc r12
+    jmp .args_loop
+
+.opt_sep_next:
+    inc r12
+    cmp r12, rbx
+    jae bad_sep_missing
+    mov rdi, [rbp+r12*8]
+    call parse_sep
+    inc r12
+    jmp .args_loop
+
+.opt_sep_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 12                        ; len("--separator=")
+    call parse_sep
     inc r12
     jmp .args_loop
 
@@ -578,8 +623,14 @@ _start:
 .forced_insensitive:
     mov qword [pat_ci], 1
 .case_done:
-    cmp qword [lim_left], 0          ; --limit 0 exits before fstat, mmap and threads, so
-    je .exit_zero                    ;   from here on lim_left is -1 or positive
+    ; Decide limit_mode from whether --limit was supplied, not from lim_left:
+    ; UINT64_MAX stores the same -1 as the no-limit sentinel but is still framed.
+    cmp qword [limit_given], 0
+    je .no_limit_mode
+    cmp qword [lim_left], 0          ; --limit 0 exits before fstat, mmap and threads
+    je .exit_zero
+    mov qword [limit_mode], 1        ; immutable from here on: print_entry frames results
+.no_limit_mode:
 
     ; .gitignore applies only inside a repository, and only when
     ; --gitignore was given (res_ig == 1). State 0 (default) and state 2
@@ -790,6 +841,58 @@ parse_u64:
     ret
 .bad:
     stc
+    ret
+
+; parse_sep: rdi = NUL-terminated argv value -> sep_buf/sep_len. Decodes exactly
+; \n, \t, \r, \0 and \\; every other byte is literal. The result is a byte
+; string, not a C string, and may contain NUL. Errors exit through die.
+; Only caller-saved registers are touched; r12 stays the argv index.
+parse_sep:
+    lea rsi, [sep_buf]
+    xor ecx, ecx                       ; decoded bytes
+.loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .done
+    inc rdi
+    cmp al, 92                         ; '\\'
+    jne .store
+    movzx eax, byte [rdi]
+    test al, al
+    jz bad_sep_incomplete
+    inc rdi
+    cmp al, 'n'
+    je .esc_n
+    cmp al, 't'
+    je .esc_t
+    cmp al, 'r'
+    je .esc_r
+    cmp al, '0'
+    je .esc_0
+    cmp al, 92
+    jne bad_sep_escape
+    jmp .store
+.esc_n:
+    mov al, 10
+    jmp .store
+.esc_t:
+    mov al, 9
+    jmp .store
+.esc_r:
+    mov al, 13
+    jmp .store
+.esc_0:
+    xor eax, eax
+.store:
+    cmp rcx, SEP_MAX
+    jae bad_sep_long
+    mov [rsi+rcx], al
+    inc rcx
+    jmp .loop
+.done:
+    test rcx, rcx
+    jz bad_sep_empty
+    mov [sep_len], rcx
     ret
 
 ; startswith: rdi = string, rsi = prefix -> ZF=1 if string begins with prefix
@@ -1393,21 +1496,23 @@ recycle:
 
 ; out_put: rdi = bytes, rsi = length. One buffered write() per OUT_SZ, so a
 ; 1.5M-line search is a few hundred syscalls instead of one per line.
-; With --limit it also enforces the cap: count the separators first, and in the
-; call that reaches the Nth keep the bytes through it, flush and exit_group.
-; shortcut: with newline output N counts output lines, so a newline inside a
-;   name counts as a boundary; --null counts entries exactly.
+; Without a limit, copy the bytes unchanged. With --limit, the bytes are frames
+; from print_entry: a u16 payload length followed by the payload. Copy no
+; headers, decrement lim_left once per frame and, after the Nth payload, flush
+; and exit_group. Every chunk starts and ends on a frame boundary (print_entry
+; publishes BLK_USED only after a whole frame), so no parser state crosses
+; calls. A payload fits in OUT_SZ, so a flush never splits one.
+; shortcut: frames never span blocks, so a chunk always holds whole frames.
+; out_put pushes rbx/r12/r13, so emit_record's callee-saved registers survive.
 out_put:                                ; rdi = bytes, rsi = length
-    ; lim_left is -1 (no cap) or > 0 on entry (--limit 0 exited at startup). It
-    ; is 0 only after this call has found the Nth separator.
     push rbx
     push r12
+    push r13
     mov rbx, rdi
     mov r12, rsi
-    mov rax, [lim_left]
-    cmp rax, -1
-    jne .count                          ; a cap is set: look at the separators
-.loop:                                  ; the copy loop, unchanged
+    cmp qword [limit_mode], 0
+    jne .frames
+.loop:                                  ; no limit: the copy loop, unchanged
     test r12, r12
     jz .done
     mov rcx, [out_len]
@@ -1432,71 +1537,41 @@ out_put:                                ; rdi = bytes, rsi = length
     jne .loop
     call out_flush
     jmp .loop
-.done:
-    cmp qword [lim_left], 0
-    je .stop                            ; the cap was reached in this call
-    pop r12
-    pop rbx
-    ret
-.stop:
+
+.frames:
+    test r12, r12
+    jz .done
+    movzx r13d, word [rbx]              ; payload length; chunk is frame-aligned
+    add rbx, 2
+    sub r12, 2
+    mov rcx, [out_len]
+    mov rax, OUT_SZ
+    sub rax, rcx
+    cmp r13, rax
+    jbe .frame_fits
+    call out_flush
+    xor ecx, ecx
+.frame_fits:
+    lea rdi, [out_buf]
+    add rdi, rcx
+    mov rsi, rbx
+    mov rcx, r13
+    rep movsb
+    add [out_len], r13
+    add rbx, r13
+    sub r12, r13
+    dec qword [lim_left]
+    jnz .frames
     call out_flush
     xor edi, edi
     mov eax, 231                        ; exit_group: workers die with us
     syscall
 
-.count:                                 ; rax = lim_left, > 0
-    mov r10d, 10
-    cmp qword [nul_sep], 0
-    je .have_sep
-    xor r10d, r10d
-.have_sep:
-    vmovd xmm1, r10d
-    vpbroadcastb ymm1, xmm1             ; the separator in every byte lane
-    mov rsi, rbx                        ; cursor
-    xor r8d, r8d                        ; separators seen
-    mov rcx, r12
-    shr rcx, 5                          ; whole 32-byte steps
-    jz .vec_done
-.vec:
-    vpcmpeqb ymm0, ymm1, [rsi]          ; unaligned load, inside [rbx, rbx+r12)
-    vpmovmskb edx, ymm0
-    popcnt edx, edx
-    add r8, rdx
-    add rsi, 32
-    dec rcx
-    jnz .vec
-.vec_done:
-    vzeroupper
-    lea rdi, [rbx+r12]                  ; end
-.tail:                                  ; fewer than 32 bytes left, branch-free
-    cmp rsi, rdi
-    jae .counted
-    xor edx, edx
-    cmp byte [rsi], r10b
-    sete dl
-    add r8, rdx
-    inc rsi
-    jmp .tail
-.counted:
-    cmp r8, rax
-    jae .cap
-    sub rax, r8                         ; the cap is not reached in this call
-    mov [lim_left], rax
-    jmp .loop
-.cap:                                   ; the rax-th separator ends the output
-    xor ecx, ecx                        ; cold: runs once, then the process exits
-.find:
-    cmp byte [rbx+rcx], r10b
-    jne .next_byte
-    dec rax
-    jz .found
-.next_byte:
-    inc rcx
-    jmp .find
-.found:
-    lea r12, [rcx+1]                    ; keep the bytes through that separator
-    mov qword [lim_left], 0             ; 0 = capped: .done flushes and exits
-    jmp .loop
+.done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 out_flush:
     xor ecx, ecx
@@ -1931,19 +2006,23 @@ sort_table:
 .quick:
     ret
 
-; print_entry: rdi = path length, rsi = is dir. Appends "path[/]\n" straight into
-; the current record's last block (a new block when the line does not fit) and
-; publishes it by bumping BLK_USED; the writer may be reading that block now.
+; print_entry: rdi = path length, rsi = is dir. Appends "path[/]SEP" straight
+; into the current record's last block (a new block when the line does not fit)
+; and publishes it by bumping BLK_USED; the writer may be reading that block now.
 ; A group's walk opens a text record on its first line; the record is linked
-; into the group before its first block is requested.  With --null the separator is
-; a NUL instead of the newline.
+; into the group before its first block is requested.  SEP is sep_buf[0..sep_len)
+; and may contain NUL. While limit_mode is set, the bytes written to the block
+; are a frame: a u16 little-endian payload length followed by the payload
+; "path[/]SEP". Frames are internal to the block; BLK_USED counts framed bytes,
+; a frame never spans blocks, and it is published only after the whole frame.
 print_entry:
     push rbx
     push r12
     push r13
     mov rbx, rdi                     ; path length
     mov r13, rsi                     ; is_dir
-    lea r12, [rdi+rsi+1]             ; line length, separator included
+    lea r12, [rdi+rsi]               ; payload length: path + '/' + separator
+    add r12, [sep_len]
     cmp qword [r14+cur_task], 0
     jne .rec
     call new_text_record
@@ -1951,8 +2030,12 @@ print_entry:
     mov rdx, [r14+cur_blk]
     test rdx, rdx
     jz .newblk
-    mov rcx, [rdx+BLK_USED]
-    add rcx, r12
+    mov rcx, r12                     ; frame length: payload + optional u16 header
+    cmp qword [limit_mode], 0
+    je .have_frame_len
+    add rcx, 2
+.have_frame_len:
+    add rcx, [rdx+BLK_USED]
     cmp rcx, BLK_DATA
     jbe .room
 .newblk:
@@ -1971,21 +2054,39 @@ print_entry:
 .room:
     mov rdi, [rdx+BLK_USED]
     lea rdi, [rdx+rdi+BLK_HDR]       ; where the line goes
+    cmp qword [limit_mode], 0
+    je .payload
+    mov rax, r12                     ; u16 little-endian payload length
+    mov [rdi], al
+    shr rax, 8
+    mov [rdi+1], al
+    add rdi, 2
+.payload:
     lea rsi, [r14+path_buf]
     mov rcx, rbx
     rep movsb
     test r13, r13
-    jz .nl
+    jz .sep
     mov byte [rdi], '/'
     inc rdi
-.nl:
-    mov al, 10                       ; '\n'
-    cmp qword [nul_sep], 0
-    je .sep
-    xor eax, eax                     ; --null: NUL, so paths with newlines survive
 .sep:
+    mov rax, [sep_len]
+    cmp rax, 1
+    jne .sep_multi
+    mov al, [sep_buf]                ; newline/NUL and other short fast path
     mov byte [rdi], al
-    add [rdx+BLK_USED], r12          ; publish
+    jmp .publish
+.sep_multi:
+    lea rsi, [sep_buf]
+    mov rcx, rax
+    rep movsb
+.publish:
+    mov rcx, r12
+    cmp qword [limit_mode], 0
+    je .publish_plain
+    add rcx, 2
+.publish_plain:
+    add [rdx+BLK_USED], rcx          ; publish only after the complete frame
     pop r13
     pop r12
     pop rbx
@@ -2061,6 +2162,31 @@ bad_args:
 bad_limit:
     lea rsi, [e_limit]
     mov rdx, e_limit_e - e_limit
+    jmp die
+
+bad_sep_missing:
+    lea rsi, [e_sep_missing]
+    mov rdx, e_sep_missing_e - e_sep_missing
+    jmp die
+
+bad_sep_empty:
+    lea rsi, [e_sep_empty]
+    mov rdx, e_sep_empty_e - e_sep_empty
+    jmp die
+
+bad_sep_escape:
+    lea rsi, [e_sep_escape]
+    mov rdx, e_sep_escape_e - e_sep_escape
+    jmp die
+
+bad_sep_incomplete:
+    lea rsi, [e_sep_incomplete]
+    mov rdx, e_sep_incomplete_e - e_sep_incomplete
+    jmp die
+
+bad_sep_long:
+    lea rsi, [e_sep_long]
+    mov rdx, e_sep_long_e - e_sep_long
     jmp die
 
 bad_type:

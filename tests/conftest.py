@@ -128,15 +128,36 @@ def make_zfind_runner(binary: Path) -> ZfindRunner:
 
 
 @pytest.fixture(scope="session")
+def zfind_path(pytestconfig: pytest.Config) -> Path:
+    """Path to the zfind binary, for tests that need to run it in a temporary tree."""
+    return get_binary_path(pytestconfig)
+
+
+@pytest.fixture(scope="session")
+def serial_binary_path(pytestconfig: pytest.Config) -> Path:
+    """Configured serial binary path; unlike serial_zfind_path, it need not exist.
+
+    Tests use this to detect when zfind_path itself points at the serial build.
+    """
+    return get_serial_binary_path(pytestconfig)
+
+
+@pytest.fixture(scope="session")
 def zfind(pytestconfig: pytest.Config) -> ZfindRunner:
     return make_zfind_runner(get_binary_path(pytestconfig))
 
 
 @pytest.fixture(scope="session")
-def serial_zfind(pytestconfig: pytest.Config) -> ZfindRunner:
+def serial_zfind_path(pytestconfig: pytest.Config) -> Path:
+    """Path to the serial zfind binary, for tests that need a temporary tree."""
     binary = get_serial_binary_path(pytestconfig)
     if not binary.is_file():
         if pytestconfig.getoption("--serial-zfind"):
             pytest.exit(f"Serial binary not found: {binary}", returncode=4)
         pytest.skip(f"Serial binary not built: {binary}; run `make test` to build it")
-    return make_zfind_runner(binary)
+    return binary
+
+
+@pytest.fixture(scope="session")
+def serial_zfind(serial_zfind_path: Path) -> ZfindRunner:
+    return make_zfind_runner(serial_zfind_path)
