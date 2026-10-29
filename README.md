@@ -20,6 +20,8 @@ zfind --hidden TODO             # Find names containing "TODO", hidden entries i
 zfind --no-hidden TODO          # Find names containing "TODO" and skip hidden entries
 zfind --gitignore Cargo         # Find names containing "Cargo" and apply supported .gitignore rules
 zfind --no-gitignore Cargo      # Search without applying .gitignore rules (the default)
+zfind --exclude-name=.git --exclude-name=node_modules config
+zfind --exclude-name='a*b' config   # literal a*b, not a glob
 zfind --separator='\0' --limit 100 .conf  # Print up to 100 matches, NUL-separated
 zfind --separator='\t' config   # Print matches separated by tabs
 zfind --type f                  # List regular files, traversing directories as usual
@@ -33,7 +35,7 @@ zfind --type f --type d         # List regular files and directories
 - `--case-insensitive` forces ASCII case-insensitive comparison, regardless of whether the pattern contains uppercase letters.
 - Combining `--case-sensitive` and `--case-insensitive` is a usage error.
 - Case folding is ASCII-only (`A`–`Z`). Non-ASCII bytes are compared unchanged in all modes.
-- Case flags affect only `PATTERN` matching; `.gitignore` matching is unaffected.
+- Case flags affect only `PATTERN` matching; `.gitignore` and `--exclude-name` matching are unaffected.
 - Hidden entries, including `.git/`, are searched by default. `--hidden`
   states that explicitly; on its own it changes no results. `--no-hidden`
   skips them and their contents; combining the two is a usage error.
@@ -57,6 +59,14 @@ zfind --type f --type d         # List regular files and directories
 - `--hidden` Search hidden entries (the default). On its own this changes no
   results; combining it with `--no-hidden` is a usage error.
 - `--no-hidden` Skip names that begin with `.`, including hidden directories and everything inside them.
+- `--exclude-name NAME`, `--exclude-name=NAME` Skip every entry whose basename
+  is exactly `NAME`. Repeatable; repeating a name has no additional effect.
+  Matching is bytewise and case-sensitive regardless of
+  `--case-sensitive`/`--case-insensitive`; it does not interpret glob or regex
+  syntax, decode backslash escapes, or normalize Unicode. `NAME` must be
+  non-empty and cannot contain `/`. A matching directory is neither printed nor
+  descended. Explicit exclusions always apply, including over `.gitignore`
+  negations. Options must appear before `PATTERN`.
 - `--limit N`, `--limit=N` Print at most `N` results. `0` prints nothing. The limit counts results exactly for every separator, and limited output is the same byte prefix as an unlimited run. Use `--separator='\0'` when a consumer must split the output unambiguously. `--limit` consumes the next token greedily as its value.
 - `--type f|d` Print regular files (`f`) and/or directories (`d`). Repeat the
   option to select both types; repeated values have no extra effect. Explicit
@@ -67,6 +77,12 @@ zfind --type f --type d         # List regular files and directories
 ## Gitignore support
 
 By default, zfind does not apply `.gitignore` rules and does not prune `.git`. `--no-gitignore` states this default explicitly. The two gitignore flags cannot be combined. `--gitignore` works only when the current directory contains `.git`; zfind does not search parent directories for a repository. It reads `.gitignore` files as it walks the tree. Rules in deeper directories take precedence over inherited rules. With `--gitignore`, the `.git` entry is never listed, walked, or counted: git never tracks anything under it.
+
+Explicit `--exclude-name` exclusions are independent of `.gitignore` and
+override its rules, including `!` negations. Excluding `.gitignore` itself
+hides the file but does not disable its rules; excluding a directory prevents
+its nested `.gitignore` from being read because the directory is never
+traversed.
 
 Supported syntax includes negation (`!`), `*`, `?`, anchored patterns, directory-only patterns ending in `/`, `**/`, and patterns ending in `/**`. This is not full Git compatibility.
 
