@@ -61,13 +61,16 @@ Contract:
   never hard code a count without that arithmetic or a live count.
 """
 
+import os
 import argparse
 import hashlib
 import json
-import os
 import random
 import sys
 import time
+
+# Base directory for generated fixture trees; override per-invocation with $ZFIND_TESTDATA.
+ZFIND_TESTDATA = os.environ.get("ZFIND_TESTDATA", "/tmp/zfind-testdata")
 
 # Tree order is also the generation order and the message order.
 TREE_NAMES = ("main", "tree2", "tree3", "camera", "repo", "deep", "small",
@@ -769,7 +772,7 @@ def _staleness_notes(manifest, preset):
     return notes
 
 
-def generate(out="testdata", preset="default", only=None, like="/usr", log=None):
+def generate(out=ZFIND_TESTDATA, preset="default", only=None, like="/usr", log=None):
     """Create the selected trees under out and return one dict per tree:
 
         tree, path, status ("created", "kept" or "skipped"), seed, entries (the
@@ -887,8 +890,8 @@ def main(argv=None):
         prog="mktrees.py",
         description="Generate fixed-shape testdata trees for zfind.",
     )
-    ap.add_argument("--out", default="testdata", metavar="DIR",
-                    help="target directory, trees land in DIR/NAME (default: testdata)")
+    ap.add_argument("--out", default=ZFIND_TESTDATA, metavar="DIR",
+                    help="target directory, trees land in DIR/NAME (default: $ZFIND_TESTDATA)")
     ap.add_argument("--preset", choices=tuple(PRESETS), default=None,
                     help="smoke|default|stress (default: default; with --verify "
                          "it is checked only when given)")

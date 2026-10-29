@@ -9,10 +9,12 @@ import sys
 from pathlib import Path
 from typing import IO, NamedTuple, Optional, Protocol
 
+ZFIND_TESTDATA = os.environ.get("ZFIND_TESTDATA", "/tmp/zfind-testdata")
+
 import pytest
 
 TESTS_DIR = Path(__file__).resolve().parent
-DATA_DIR = TESTS_DIR / "testdata"
+DATA_DIR = Path(ZFIND_TESTDATA)
 
 # Trees required by the smoke/flags test suite (see tests/mktrees.py)
 TREES = ["tiny", "hidden", "ignores", "weird", "camera", "tree2"]

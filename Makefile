@@ -67,8 +67,9 @@ clean:
 	rm -rf build
 
 PRESET ?= default
+ZFIND_TESTDATA ?= /tmp/zfind-testdata
 testdata:
-	python3 tests/mktrees.py --preset $(PRESET)
+	ZFIND_TESTDATA=$(ZFIND_TESTDATA) python3 tests/mktrees.py --preset $(PRESET)
 
 # Build parallel, serial and DT_UNKNOWN-hook binaries, then compare them in
 # the test suite.
