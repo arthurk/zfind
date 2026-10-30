@@ -4,6 +4,7 @@ BUILD_DIR := build/$(ARCH)
 BIN       := $(BUILD_DIR)/zfind
 OBJ       := $(BUILD_DIR)/zfind.o
 SRC       := src/$(ARCH)/zfind.asm
+RELEASE_BIN := $(BUILD_DIR)/zfind.release
 SERIAL_BUILD_DIR ?= $(BUILD_DIR)-serial
 SERIAL_BIN := $(SERIAL_BUILD_DIR)/zfind
 SERIAL_OBJ := $(SERIAL_BUILD_DIR)/zfind.o
@@ -27,7 +28,7 @@ else
 endif
 
 # ---------- targets ----------
-.PHONY: all run clean testdata test
+.PHONY: all run clean testdata test release
 
 all: $(BIN)
 
@@ -39,6 +40,14 @@ $(OBJ): $(SRC) | $(BUILD_DIR)
 
 $(BIN): $(OBJ)
 	ld $(LDFLAGS) -o $@ $<
+
+# Production artifact: a stripped copy of $(BIN). $(BIN) keeps its symbols so
+# it can still be disassembled with source line numbers (objdump -d -l), while
+# the copy that gets distributed carries no .symtab or .debug_* sections.
+release: $(RELEASE_BIN)
+
+$(RELEASE_BIN): $(BIN)
+	strip --strip-all -o $@ $<
 
 $(SERIAL_BUILD_DIR):
 	mkdir -p $@

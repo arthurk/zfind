@@ -20,8 +20,8 @@ jobs:
 
       - name: Test and build
         run: |
-          nix develop -c make test
-          install -D -m 755 build/x86_64/zfind dist/zfind-linux-x86_64-v3
+          nix develop -c make test release
+          install -D -m 755 build/x86_64/zfind.release dist/zfind-linux-x86_64-v3
 
       - name: Publish release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
