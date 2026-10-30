@@ -3,7 +3,8 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; zfind, "simple search" use case only:
 ;   zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
-;         [--exclude-name NAME] [--limit N] [--type f|d] [--] [PATTERN]
+;         [--exclude-name NAME] [--limit N] [--type f|d]
+;         [--config PATH | --no-config] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
 ; Every entry is searched, including hidden names and dot-directories like
@@ -22,6 +23,18 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; .gitignore rules, but .gitignore detection and rule loading still happen
 ; when the .gitignore entry itself is excluded.
 ; Use -- before a PATTERN that starts with -.
+; Settings may also come from a config file: --config PATH, else
+; $XDG_CONFIG_HOME/zfind/config (non-empty absolute path), else
+; $HOME/.config/zfind/config. --no-config reads none. The file is one option per
+; line (--name, --name=value or --name value, # comment lines, matching quotes
+; around a value) and is read by the same parser as the command line
+; (parse_args), so each line is checked exactly like its flag. The layers are
+; the built-in defaults, then the file, then the command line: a mode
+; (case, hidden, gitignore) set on the command line replaces the file's, a scalar
+; (--separator, --limit) is overwritten, and --type / --exclude-name accumulate.
+; Opposing modes within one source are an error. A missing default file is
+; normal; anything else wrong with the file stops zfind before the walk, and
+; the error names the file and line.
 ; shortcut: no path arguments, no regex/glob, and none of the
 ;   ignore sources beyond .gitignore in the walked tree itself (no parent
 ;   dirs, no global gitignore, no .ignore, no [] or \ in patterns);
@@ -75,6 +88,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define PATH_MAX    4096
 %define SEP_MAX     64                ; decoded --separator bytes
 %define EXCL_MAX    64                ; unique --exclude-name values
+%define CFG_MAX     65536             ; config file bytes; a larger file is an error
 %define ENT_BUF     32768
 %macro LAST_BATCH 0                 ; rax = bytes returned -> r13d = 1 if that was all
 %ifndef NO_EOF_SHORTCUT
@@ -263,6 +277,25 @@ section .rodata
     e_excl_slash_e:
     e_excl_full db "zfind: too many --exclude-name values (max 64)", 10
     e_excl_full_e:
+    e_cfg_missing db "zfind: missing value for --config", 10
+    e_cfg_missing_e:
+    e_cfg_comb  db "zfind: cannot combine --config and --no-config", 10
+    e_cfg_comb_e:
+    e_cfg_read  db "zfind: cannot read config file", 10
+    e_cfg_read_e:
+    e_cfg_big   db "zfind: config file too large (max 65536 bytes)", 10
+    e_cfg_big_e:
+    e_cfg_nul   db "zfind: NUL byte in config file", 10
+    e_cfg_nul_e:
+    e_cfg_notopt db "zfind: config lines must be long options", 10
+    e_cfg_notopt_e:
+    e_cfg_cli   db "zfind: option not allowed in a config file", 10
+    e_cfg_cli_e:
+    e_cfg_quote db "zfind: malformed quotes in config value", 10
+    e_cfg_quote_e:
+    e_cfg_path  db "zfind: config path too long", 10
+    e_cfg_path_e:
+    e_pfx       db "zfind: "          ; 7 bytes: every message starts with it
     h_long      db "--help", 0
     cs_long     db "--case-sensitive", 0
     ci_long     db "--case-insensitive", 0
@@ -279,10 +312,20 @@ section .rodata
     nog_long    db "--no-gitignore", 0
     hidden_long db "--hidden", 0
     no_long     db "--no-hidden", 0
+    cfg_long    db "--config", 0
+    cfg_eq      db "--config=", 0    ; 9 bytes of prefix
+    nocfg_long  db "--no-config", 0
+    dd_long     db "--", 0
+    env_xdg     db "XDG_CONFIG_HOME=", 0   ; 16 bytes of prefix
+    env_home    db "HOME=", 0              ; 5 bytes of prefix
+    cfg_sfx_xdg db "/zfind/config", 0
+    cfg_sfx_xdg_e:
+    cfg_sfx_home db "/.config/zfind/config", 0
+    cfg_sfx_home_e:
     help_msg    db "usage: zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
                db "             [--exclude-name NAME]... [--limit N] [--type f|d]", 10
-               db "             [--] [PATTERN]", 10, 10
+               db "             [--config PATH | --no-config] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
                db "is case-insensitive unless PATTERN contains an uppercase ASCII letter", 10
@@ -296,6 +339,10 @@ section .rodata
                db "following argument is treated as PATTERN. --help prints this help and", 10
                db "exits 0 anywhere before --, including after PATTERN or where an option", 10
                db "value is expected.", 10, 10
+               db "Settings are also read from $XDG_CONFIG_HOME/zfind/config, else", 10
+               db "~/.config/zfind/config: one option per line, # starts a comment line.", 10
+               db "Command-line options override the file, except --type and --exclude-name,", 10
+               db "which add to it. --config and --no-config are command-line only.", 10, 10
                db "Hidden entries are searched like any other, .git included; --no-hidden", 10
                db "skips entries whose name starts with . and everything inside them.", 10
                db "--hidden states the default explicitly; combining the two is an error.", 10
@@ -320,6 +367,9 @@ section .rodata
                db "                      also --exclude-name=NAME; matching dirs are pruned", 10
                db "  --limit N           print at most N results, then stop (0 = none)", 10
                db "  --type f|d          repeatable; print regular files and/or directories", 10
+               db "  --config PATH       read settings from PATH instead of the default file", 10
+               db "                      (also --config=PATH); the file must exist", 10
+               db "  --no-config         read no config file", 10
                db "  --                  end options; a following argument is the PATTERN", 10
     help_msg_e:
     align 8
@@ -332,7 +382,7 @@ section .bss
     pat_len:    resq 1
     pat_ci:     resq 1                ; 1 = fold case (both filename and pattern bytes)
     excl_n:     resq 1                ; immutable after parsing
-    excl_names: resq EXCL_MAX         ; argv pointers, unique and slash-free
+    excl_names: resq EXCL_MAX         ; argv or config-buffer pointers, unique and slash-free
     sep_buf:    resb SEP_MAX          ; decoded --separator bytes (may contain NUL)
     sep_len:    resq 1                ; decoded separator length, 1..SEP_MAX
     lim_left:    resq 1               ; writer-only remaining results; -1 = no limit or UINT64_MAX
@@ -344,6 +394,16 @@ section .bss
     res_type:   resb 32                ; d_type bitset: DT_DIR=4, DT_REG=8
     type_seen:  resb 1
     git_repo:   resq 1
+    cfg_mode:   resb 1                ; 0 = default location, 1 = --config, 2 = --no-config
+    cfg_case:   resb 1                ; the config file's modes, parked while the
+    cfg_hid:    resb 1                ;   command line is parsed (0 = not set)
+    alignb 8
+    cfg_ig:     resq 1
+    cfg_path:   resq 1                ; file to read (argv string or cfg_pathbuf)
+    envp_ptr:   resq 1
+    err_path:   resq 1                ; nonzero while the config file is being read:
+    err_line:   resq 1                ;   die names this file, and this line if nonzero
+    cfg_argv:   resq 3                ; [0] unused, [1] option, [2] its value: one config line
     tstate_map: resq 1
     stacks:     resq 1
     scratch_map: resq 1
@@ -368,6 +428,9 @@ section .bss
     emit_cur:   resq 1                ; record the writer is on (never throttled)
     out_len:    resq 1
     statbuf0:   resb 144              ; only _start's .git check, before any thread
+    cfg_pathbuf: resb PATH_MAX        ; default config location
+    cfg_buf:    resb CFG_MAX + 2      ; whole config file; excl_names points into it
+    err_buf:    resb PATH_MAX + 512   ; "zfind: PATH:LINE: message"
     cpuset:     resb 128
     out_buf:    resb OUT_SZ
     alignb 64
@@ -405,240 +468,46 @@ _start:
     mov qword [limit_given], 0
     mov qword [sep_len], 1
     mov byte [sep_buf], 10
-    xor r13d, r13d
-    mov r12, 1
-.args_loop:
-    cmp r12, rbx
-    jae .args_done
-    mov rdi, [rbp+r12*8]
-    cmp byte [rdi], '-'
-    jne .arg_pattern
-    cmp byte [rdi+1], 0
-    je .arg_pattern                    ; "-" alone
 
-    mov rdi, [rbp+r12*8]
-    lea rsi, [cs_long]
-    call streq
-    je .opt_case_sens
-    mov rdi, [rbp+r12*8]
-    lea rsi, [ci_long]
-    call streq
-    je .opt_case_insens
-    mov rdi, [rbp+r12*8]
-    lea rsi, [l_long]
-    call streq
-    je .opt_limit_next
-    mov rdi, [rbp+r12*8]
-    lea rsi, [t_long]
-    call streq
-    je .opt_type
-    mov rdi, [rbp+r12*8]
-    lea rsi, [l_eq]
-    call startswith
-    je .opt_limit_eq
-    mov rdi, [rbp+r12*8]
-    lea rsi, [sep_long]
-    call streq
-    je .opt_sep_next
-    mov rdi, [rbp+r12*8]
-    lea rsi, [sep_eq]
-    call startswith
-    je .opt_sep_eq
-    mov rdi, [rbp+r12*8]
-    lea rsi, [excl_long]
-    call streq
-    je .opt_excl_next
-    mov rdi, [rbp+r12*8]
-    lea rsi, [excl_eq]
-    call startswith
-    je .opt_excl_eq
-    mov rdi, [rbp+r12*8]
-    lea rsi, [g_long]
-    call streq
-    je .opt_git
-    mov rdi, [rbp+r12*8]
-    lea rsi, [nog_long]
-    call streq
-    je .opt_nogit
-    mov rdi, [rbp+r12*8]
-    lea rsi, [hidden_long]
-    call streq
-    je .opt_hidden
-
-    mov rdi, [rbp+r12*8]
-    lea rsi, [no_long]
-    call streq
-    je .opt_nohid
-
-    mov rdi, [rbp+r12*8]
-    cmp byte [rdi+1], '-'
-    jne bad_flag                       ; unknown short flag
-    cmp byte [rdi+2], 0
-    je .arg_end_opts                   ; "--"
-    jmp bad_flag                       ; unknown long flag
-
-.opt_case_sens:
-    cmp byte [case_mode], 2
-    je bad_case_comb
-    mov byte [case_mode], 1
-    inc r12
-    jmp .args_loop
-
-.opt_case_insens:
-    cmp byte [case_mode], 1
-    je bad_case_comb
-    mov byte [case_mode], 2
-    inc r12
-    jmp .args_loop
-
-.opt_type:
-    inc r12
-    cmp r12, rbx
-    jae bad_type
-    mov rdi, [rbp+r12*8]
-    lea rsi, [t_file]
-    call streq
-    je .type_file
-    mov rdi, [rbp+r12*8]
-    lea rsi, [t_dir]
-    call streq
-    jne bad_type
-    mov byte [type_seen], 1
-    bts qword [res_type], 4
-    jmp .type_next
-.type_file:
-    mov byte [type_seen], 1
-    bts qword [res_type], 8
-.type_next:
-    inc r12
-    jmp .args_loop
-
-.opt_git:
-    cmp qword [res_ig], 2
-    je bad_ig_comb
-    mov qword [res_ig], 1
-    inc r12
-    jmp .args_loop
-
-.opt_nogit:
-    cmp qword [res_ig], 1
-    je bad_ig_comb
-    mov qword [res_ig], 2
-    inc r12
-    jmp .args_loop
-
-.opt_hidden:
-    cmp byte [hid_mode], 2
-    je bad_hid_comb
-    mov byte [hid_mode], 1
-    inc r12
-    jmp .args_loop
-
-.opt_nohid:
-    cmp byte [hid_mode], 1
-    je bad_hid_comb
-    mov byte [hid_mode], 2
-    inc r12
-    jmp .args_loop
-
-.opt_limit_next:
-    inc r12
-    cmp r12, rbx
-    jae bad_limit
-    mov rdi, [rbp+r12*8]
-    call parse_u64
-    jc bad_limit
-    mov [lim_left], rax
-    mov qword [limit_given], 1
-    inc r12
-    jmp .args_loop
-
-.opt_limit_eq:
-    mov rdi, [rbp+r12*8]
-    add rdi, 8                         ; len("--limit=")
-    call parse_u64
-    jc bad_limit
-    mov [lim_left], rax
-    mov qword [limit_given], 1
-    inc r12
-    jmp .args_loop
-
-.opt_sep_next:
-    inc r12
-    cmp r12, rbx
-    jae bad_sep_missing
-    mov rdi, [rbp+r12*8]
-    call parse_sep
-    inc r12
-    jmp .args_loop
-
-.opt_sep_eq:
-    mov rdi, [rbp+r12*8]
-    add rdi, 12                        ; len("--separator=")
-    call parse_sep
-    inc r12
-    jmp .args_loop
-
-.opt_excl_next:
-    inc r12
-    cmp r12, rbx
-    jae bad_excl_missing
-    mov rdi, [rbp+r12*8]
-    jmp .opt_excl_value
-.opt_excl_eq:
-    mov rdi, [rbp+r12*8]
-    add rdi, 15                        ; len("--exclude-name=")
-.opt_excl_value:
-    cmp byte [rdi], 0
-    je bad_excl_empty
-    mov r8, rdi
-    mov rdx, rdi
-.excl_validate:
-    cmp byte [rdx], 0
-    je .excl_dedupe_start
-    cmp byte [rdx], '/'
-    je bad_excl_slash
-    inc rdx
-    jmp .excl_validate
-.excl_dedupe_start:
-    xor r10d, r10d
-.excl_dedupe:
-    cmp r10, [excl_n]
-    jae .excl_add
-    mov rdi, r8
-    mov rsi, [excl_names+r10*8]
-    call streq
-    je .excl_done
-    inc r10
-    jmp .excl_dedupe
-.excl_add:
-    cmp qword [excl_n], EXCL_MAX
-    jae bad_excl_full
-    mov rax, [excl_n]
-    mov [excl_names+rax*8], r8
-    inc qword [excl_n]
-.excl_done:
-    inc r12
-    jmp .args_loop
-
-.arg_end_opts:
-    inc r12
-    cmp r12, rbx
-    jae .args_done
-    mov r13, [rbp+r12*8]
-    inc r12
-    cmp r12, rbx
-    jne bad_args
-    jmp .args_done
-
-.arg_pattern:
-    mov r13, [rbp+r12*8]
-    inc r12
-    cmp r12, rbx
-    jne bad_args
-    jmp .args_done
-
-.args_done:
+    ; Settings come from layers, lowest first: the defaults above, the config
+    ; file, then the command line. One parser (parse_args) reads both the file
+    ; and argv. Modes (case, hidden, gitignore) use 0 = "not set by this layer",
+    ; so the file's choice is parked while the command line is parsed and
+    ; restored for any mode the command line left alone. Scalars are plain
+    ; last-wins overwrites and the lists (--type, --exclude-name) accumulate, so
+    ; neither needs a merge step. All of this finishes before the first mmap.
+    lea rax, [rbp+rbx*8+8]           ; envp follows argv's NULL terminator
+    mov [envp_ptr], rax
+    call find_config                 ; --config / --no-config (rbx, rbp kept)
+    call load_config                 ; the file's settings, if one is selected
+    mov al, [case_mode]
+    mov [cfg_case], al
+    mov byte [case_mode], 0
+    mov al, [hid_mode]
+    mov [cfg_hid], al
+    mov byte [hid_mode], 0
+    mov rax, [res_ig]
+    mov [cfg_ig], rax
+    mov qword [res_ig], 0
+    mov rdi, rbp
+    mov rsi, rbx
+    call parse_args
+    mov r13, rax                     ; PATTERN or 0
+    cmp byte [case_mode], 0
+    jne .merge_hid
+    mov al, [cfg_case]
+    mov [case_mode], al
+.merge_hid:
+    cmp byte [hid_mode], 0
+    jne .merge_ig
+    mov al, [cfg_hid]
+    mov [hid_mode], al
+.merge_ig:
+    cmp qword [res_ig], 0
+    jne .have_args
+    mov rax, [cfg_ig]
+    mov [res_ig], rax
+.have_args:
     test r13, r13
     jz .no_pat
     mov [pat_ptr], r13
@@ -860,6 +729,705 @@ _start:
     xor edi, edi                     ; every normal path exits 0, even no match
     mov rax, 231                     ; exit_group
     syscall
+
+; parse_args: rdi = argv-like array (entry 0 unused), rsi = entry count ->
+; rax = the PATTERN (NUL-terminated) or 0 when there is none. This is the
+; option parser for the command line; cfg_line feeds it one config line at a
+; time as a one- or two-entry array, so a config option is checked exactly like
+; its flag. A config line never reaches the pattern branches, but cfg_line
+; still rejects a non-zero result. An option added to this loop is
+; automatically valid in the config file: decide that on purpose.
+; Errors exit through die. Preserves rbx, rbp, r12, r13.
+parse_args:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    mov rbp, rdi
+    mov rbx, rsi
+    xor r13d, r13d
+    mov r12, 1
+.args_loop:
+    cmp r12, rbx
+    jae .args_done
+    mov rdi, [rbp+r12*8]
+    cmp byte [rdi], '-'
+    jne .arg_pattern
+    cmp byte [rdi+1], 0
+    je .arg_pattern                    ; "-" alone
+
+    mov rdi, [rbp+r12*8]
+    lea rsi, [cs_long]
+    call streq
+    je .opt_case_sens
+    mov rdi, [rbp+r12*8]
+    lea rsi, [ci_long]
+    call streq
+    je .opt_case_insens
+    mov rdi, [rbp+r12*8]
+    lea rsi, [l_long]
+    call streq
+    je .opt_limit_next
+    mov rdi, [rbp+r12*8]
+    lea rsi, [t_long]
+    call streq
+    je .opt_type
+    mov rdi, [rbp+r12*8]
+    lea rsi, [l_eq]
+    call startswith
+    je .opt_limit_eq
+    mov rdi, [rbp+r12*8]
+    lea rsi, [sep_long]
+    call streq
+    je .opt_sep_next
+    mov rdi, [rbp+r12*8]
+    lea rsi, [sep_eq]
+    call startswith
+    je .opt_sep_eq
+    mov rdi, [rbp+r12*8]
+    lea rsi, [excl_long]
+    call streq
+    je .opt_excl_next
+    mov rdi, [rbp+r12*8]
+    lea rsi, [excl_eq]
+    call startswith
+    je .opt_excl_eq
+    mov rdi, [rbp+r12*8]
+    lea rsi, [g_long]
+    call streq
+    je .opt_git
+    mov rdi, [rbp+r12*8]
+    lea rsi, [nog_long]
+    call streq
+    je .opt_nogit
+    mov rdi, [rbp+r12*8]
+    lea rsi, [hidden_long]
+    call streq
+    je .opt_hidden
+
+    mov rdi, [rbp+r12*8]
+    lea rsi, [no_long]
+    call streq
+    je .opt_nohid
+    mov rdi, [rbp+r12*8]
+    lea rsi, [cfg_long]
+    call streq
+    je .opt_cfg_next
+    mov rdi, [rbp+r12*8]
+    lea rsi, [cfg_eq]
+    call startswith
+    je .opt_cfg_skip
+    mov rdi, [rbp+r12*8]
+    lea rsi, [nocfg_long]
+    call streq
+    je .opt_cfg_skip
+
+    mov rdi, [rbp+r12*8]
+    cmp byte [rdi+1], '-'
+    jne bad_flag                       ; unknown short flag
+    cmp byte [rdi+2], 0
+    je .arg_end_opts                   ; "--"
+    jmp bad_flag                       ; unknown long flag
+
+.opt_case_sens:
+    cmp byte [case_mode], 2
+    je bad_case_comb
+    mov byte [case_mode], 1
+    inc r12
+    jmp .args_loop
+
+.opt_case_insens:
+    cmp byte [case_mode], 1
+    je bad_case_comb
+    mov byte [case_mode], 2
+    inc r12
+    jmp .args_loop
+
+.opt_type:
+    inc r12
+    cmp r12, rbx
+    jae bad_type
+    mov rdi, [rbp+r12*8]
+    lea rsi, [t_file]
+    call streq
+    je .type_file
+    mov rdi, [rbp+r12*8]
+    lea rsi, [t_dir]
+    call streq
+    jne bad_type
+    mov byte [type_seen], 1
+    bts qword [res_type], 4
+    jmp .type_next
+.type_file:
+    mov byte [type_seen], 1
+    bts qword [res_type], 8
+.type_next:
+    inc r12
+    jmp .args_loop
+
+.opt_git:
+    cmp qword [res_ig], 2
+    je bad_ig_comb
+    mov qword [res_ig], 1
+    inc r12
+    jmp .args_loop
+
+.opt_nogit:
+    cmp qword [res_ig], 1
+    je bad_ig_comb
+    mov qword [res_ig], 2
+    inc r12
+    jmp .args_loop
+
+.opt_hidden:
+    cmp byte [hid_mode], 2
+    je bad_hid_comb
+    mov byte [hid_mode], 1
+    inc r12
+    jmp .args_loop
+
+.opt_nohid:
+    cmp byte [hid_mode], 1
+    je bad_hid_comb
+    mov byte [hid_mode], 2
+    inc r12
+    jmp .args_loop
+
+.opt_limit_next:
+    inc r12
+    cmp r12, rbx
+    jae bad_limit
+    mov rdi, [rbp+r12*8]
+    call parse_u64
+    jc bad_limit
+    mov [lim_left], rax
+    mov qword [limit_given], 1
+    inc r12
+    jmp .args_loop
+
+.opt_limit_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 8                         ; len("--limit=")
+    call parse_u64
+    jc bad_limit
+    mov [lim_left], rax
+    mov qword [limit_given], 1
+    inc r12
+    jmp .args_loop
+
+.opt_sep_next:
+    inc r12
+    cmp r12, rbx
+    jae bad_sep_missing
+    mov rdi, [rbp+r12*8]
+    call parse_sep
+    inc r12
+    jmp .args_loop
+
+.opt_sep_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 12                        ; len("--separator=")
+    call parse_sep
+    inc r12
+    jmp .args_loop
+
+.opt_excl_next:
+    inc r12
+    cmp r12, rbx
+    jae bad_excl_missing
+    mov rdi, [rbp+r12*8]
+    jmp .opt_excl_value
+.opt_excl_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 15                        ; len("--exclude-name=")
+.opt_excl_value:
+    cmp byte [rdi], 0
+    je bad_excl_empty
+    mov r8, rdi
+    mov rdx, rdi
+.excl_validate:
+    cmp byte [rdx], 0
+    je .excl_dedupe_start
+    cmp byte [rdx], '/'
+    je bad_excl_slash
+    inc rdx
+    jmp .excl_validate
+.excl_dedupe_start:
+    xor r10d, r10d
+.excl_dedupe:
+    cmp r10, [excl_n]
+    jae .excl_add
+    mov rdi, r8
+    mov rsi, [excl_names+r10*8]
+    call streq
+    je .excl_done
+    inc r10
+    jmp .excl_dedupe
+.excl_add:
+    cmp qword [excl_n], EXCL_MAX
+    jae bad_excl_full
+    mov rax, [excl_n]
+    mov [excl_names+rax*8], r8
+    inc qword [excl_n]
+.excl_done:
+    inc r12
+    jmp .args_loop
+
+.opt_cfg_next:                         ; --config PATH: find_config already took it
+    inc r12
+    cmp r12, rbx
+    jae bad_cfg_missing
+.opt_cfg_skip:                         ; --config=PATH, --no-config: nothing to do here
+    inc r12
+    jmp .args_loop
+
+.arg_end_opts:
+    inc r12
+    cmp r12, rbx
+    jae .args_done
+    mov r13, [rbp+r12*8]
+    inc r12
+    cmp r12, rbx
+    jne bad_args
+    jmp .args_done
+
+.arg_pattern:
+    mov r13, [rbp+r12*8]
+    inc r12
+    cmp r12, rbx
+    jne bad_args
+    jmp .args_done
+
+.args_done:
+    mov rax, r13
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; find_config: pre-scan argv for --config PATH / --config=PATH / --no-config
+; and record the choice in cfg_mode / cfg_path. Like the main loop it stops at
+; "--" or the first non-option, and it steps over the value of the options that
+; take one, so "--separator --no-config" is a separator, not a config choice.
+; Needs rbx = argc, rbp = argv; keeps them.
+find_config:
+    push r12
+    mov r12, 1
+.loop:
+    cmp r12, rbx
+    jae .done
+    mov rdi, [rbp+r12*8]
+    cmp byte [rdi], '-'
+    jne .done                        ; the PATTERN: options are over
+    cmp byte [rdi+1], 0
+    je .done                         ; "-" alone is a pattern
+    cmp byte [rdi+1], '-'
+    jne .next                        ; unknown short flag: the main loop rejects it
+    cmp byte [rdi+2], 0
+    je .done                         ; "--"
+    lea rsi, [cfg_long]
+    call streq
+    je .cfg_next
+    mov rdi, [rbp+r12*8]
+    lea rsi, [cfg_eq]
+    call startswith
+    je .cfg_eq
+    mov rdi, [rbp+r12*8]
+    lea rsi, [nocfg_long]
+    call streq
+    je .nocfg
+    mov rdi, [rbp+r12*8]
+    lea rsi, [l_long]
+    call streq
+    je .skip
+    mov rdi, [rbp+r12*8]
+    lea rsi, [t_long]
+    call streq
+    je .skip
+    mov rdi, [rbp+r12*8]
+    lea rsi, [sep_long]
+    call streq
+    je .skip
+    mov rdi, [rbp+r12*8]
+    lea rsi, [excl_long]
+    call streq
+    je .skip
+    jmp .next
+.skip:                               ; the next token is this option's value
+    inc r12
+    jmp .next
+.cfg_next:
+    inc r12
+    cmp r12, rbx
+    jae bad_cfg_missing
+    mov rdi, [rbp+r12*8]
+    jmp .cfg_set
+.cfg_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 9                       ; len("--config=")
+.cfg_set:
+    cmp byte [rdi], 0
+    je bad_cfg_missing
+    cmp byte [cfg_mode], 2
+    je bad_cfg_comb
+    mov byte [cfg_mode], 1
+    mov [cfg_path], rdi              ; repeated --config: the last one wins
+    jmp .next
+.nocfg:
+    cmp byte [cfg_mode], 1
+    je bad_cfg_comb
+    mov byte [cfg_mode], 2
+.next:
+    inc r12
+    jmp .loop
+.done:
+    pop r12
+    ret
+
+; cfg_auto_path -> rax = the default config path (in cfg_pathbuf), or 0 if
+; neither location can be resolved. $XDG_CONFIG_HOME counts only when it is
+; non-empty and absolute; $HOME only when non-empty. Dies if the path would not
+; fit in PATH_MAX. The first of duplicate variables wins, as with getenv.
+cfg_auto_path:
+    mov r8, [envp_ptr]
+    xor r9d, r9d                     ; XDG_CONFIG_HOME value
+    xor r10d, r10d                   ; HOME value
+.env:
+    mov rdi, [r8]
+    test rdi, rdi
+    jz .env_done
+    test r9, r9
+    jnz .try_home
+    lea rsi, [env_xdg]
+    call startswith
+    jne .try_home
+    lea r9, [rdi+16]
+    jmp .env_next
+.try_home:
+    test r10, r10
+    jnz .env_next
+    lea rsi, [env_home]
+    call startswith
+    jne .env_next
+    lea r10, [rdi+5]
+.env_next:
+    add r8, 8
+    jmp .env
+.env_done:
+    test r9, r9
+    jz .home
+    cmp byte [r9], '/'
+    jne .home                        ; empty or relative: ignored
+    mov r8, r9
+    lea r9, [cfg_sfx_xdg]
+    mov r10d, cfg_sfx_xdg_e - cfg_sfx_xdg
+    jmp .build
+.home:
+    test r10, r10
+    jz .none
+    cmp byte [r10], 0
+    je .none
+    mov r8, r10
+    lea r9, [cfg_sfx_home]
+    mov r10d, cfg_sfx_home_e - cfg_sfx_home
+.build:                              ; r8 = directory, r9 = suffix, r10 = suffix size with its NUL
+    mov rdi, r8
+    call strlen
+    lea rcx, [rax+r10]
+    cmp rcx, PATH_MAX
+    ja bad_cfg_path
+    lea rdi, [cfg_pathbuf]
+    mov rsi, r8
+    mov rcx, rax
+    rep movsb
+    mov rsi, r9
+    mov rcx, r10
+    rep movsb
+    lea rax, [cfg_pathbuf]
+    ret
+.none:
+    xor eax, eax
+    ret
+
+; load_config: read the selected config file and apply it line by line.
+; While it runs err_path / err_line are set, so every error is reported as
+; "zfind: PATH:LINE: message". A missing default file is normal; a missing
+; --config file, an unreadable or oversized file, or any bad line is fatal,
+; before the walk. Keeps rbx and rbp.
+load_config:
+    push r12
+    push r13
+    push r14
+    push r15
+    movzx eax, byte [cfg_mode]
+    cmp eax, 2
+    je .ret                          ; --no-config
+    cmp eax, 1
+    je .path_ready                   ; --config PATH: cfg_path is set
+    call cfg_auto_path
+    test rax, rax
+    jz .ret                          ; nowhere to look: built-in defaults
+    mov [cfg_path], rax
+.path_ready:
+    mov rax, [cfg_path]
+    mov [err_path], rax
+    mov qword [err_line], 0
+    mov eax, 257                     ; openat
+    mov rdi, AT_FDCWD
+    mov rsi, [cfg_path]
+    xor edx, edx                     ; O_RDONLY
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    jns .opened
+    cmp rax, -2                      ; -ENOENT
+    je .missing
+    cmp rax, -20                     ; -ENOTDIR: a parent is no directory, so the file
+    jne bad_cfg_read                 ;   cannot exist (e.g. HOME is a regular file)
+.missing:
+    cmp byte [cfg_mode], 1
+    je bad_cfg_read                  ; a file named with --config must exist
+    mov qword [err_path], 0          ; no default config: nothing to load
+    jmp .ret
+.opened:
+    mov r12, rax                     ; fd
+    xor r13d, r13d                   ; bytes read
+.read:
+    xor eax, eax                     ; sys_read
+    mov rdi, r12
+    lea rsi, [cfg_buf]
+    add rsi, r13
+    mov edx, CFG_MAX + 1             ; one byte more than allowed: that proves "too large"
+    sub rdx, r13
+    syscall
+    test rax, rax
+    js .read_error
+    jz .eof
+    add r13, rax
+    cmp r13, CFG_MAX + 1
+    jb .read
+    jmp bad_cfg_big
+.read_error:
+    cmp rax, -4                      ; -EINTR: retry the same read
+    je .read
+    jmp bad_cfg_read                 ; also a directory (EISDIR)
+.eof:
+    mov eax, 3                       ; close
+    mov rdi, r12
+    syscall
+    lea r14, [cfg_buf]
+    add r14, r13                     ; end of the content
+    mov byte [r14], 0                ; sentinel: the last line needs no newline
+    lea r15, [cfg_buf]               ; start of the next line
+    xor r12d, r12d                   ; line number
+.line:
+    cmp r15, r14
+    jae .done
+    inc r12
+    mov [err_line], r12
+    mov r13, r15                     ; this line
+    mov rsi, r15
+.scan:
+    cmp rsi, r14
+    jae .eol
+    mov al, [rsi]
+    cmp al, 10
+    je .eol
+    test al, al
+    jz bad_cfg_nul                   ; would silently cut the line short
+    inc rsi
+    jmp .scan
+.eol:
+    mov byte [rsi], 0
+    lea r15, [rsi+1]
+    mov rdi, r13
+    call cfg_line
+    jmp .line
+.done:
+    mov qword [err_path], 0
+    mov qword [err_line], 0
+.ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+; cfg_line: rdi = one config line, NUL-terminated, newline removed. Blank lines
+; and lines whose first non-blank is # do nothing. Anything else must be
+; "--name", "--name=value" or "--name value" (surrounding blanks and \r are
+; ignored; the value may be wrapped in matching quotes, which are removed).
+; It is run through parse_args as a one-entry argv, or a two-entry one when the
+; option takes a value (--limit, --type, --separator, --exclude-name): text after
+; a flag is an error, so a line can never carry a second option. The line is
+; edited in place and the buffer lives for the whole run: excl_names points into
+; it. --help, --config, --no-config and "--" are command-line only.
+cfg_line:
+.lead:                               ; skip leading blanks and \r
+    mov al, [rdi]
+    cmp al, ' '
+    je .lead_next
+    cmp al, 9
+    je .lead_next
+    cmp al, 13
+    jne .lead_done
+.lead_next:
+    inc rdi
+    jmp .lead
+.lead_done:
+    mov rsi, rdi
+.tail:                               ; rsi -> the terminating NUL
+    cmp byte [rsi], 0
+    je .trim
+    inc rsi
+    jmp .tail
+.trim:                               ; drop trailing blanks and \r
+    cmp rsi, rdi
+    je .trimmed
+    mov al, [rsi-1]
+    cmp al, ' '
+    je .trim_one
+    cmp al, 9
+    je .trim_one
+    cmp al, 13
+    jne .trimmed
+.trim_one:
+    dec rsi
+    mov byte [rsi], 0
+    jmp .trim
+.trimmed:
+    mov al, [rdi]
+    test al, al
+    jz .ret                          ; blank line
+    cmp al, '#'
+    je .ret                          ; comment
+    cmp al, '-'
+    jne bad_cfg_notopt
+    cmp byte [rdi+1], '-'
+    jne bad_cfg_notopt
+    mov r10, rdi                     ; the name ends at the first blank or '='
+.name:
+    mov al, [r10]
+    test al, al
+    jz .name_end
+    cmp al, '='
+    je .name_end
+    cmp al, ' '
+    je .name_end
+    cmp al, 9
+    je .name_end
+    inc r10
+    jmp .name
+.name_end:
+    movzx r8d, byte [r10]            ; what ended the name
+    mov byte [r10], 0                ; cut it off to compare it
+    lea rsi, [dd_long]
+    call streq
+    je bad_cfg_cli
+    lea rsi, [h_long]
+    call streq
+    je bad_cfg_cli
+    lea rsi, [cfg_long]
+    call streq
+    je bad_cfg_cli
+    lea rsi, [nocfg_long]
+    call streq
+    je bad_cfg_cli
+    mov [r10], r8b                   ; put it back
+    test r8b, r8b
+    jz .one                          ; "--name" alone: flag, or a value the parser will miss
+    cmp r8b, '='
+    je .equals
+    mov byte [r10], 0                ; "--name value": the name ends here
+    lea rsi, [l_long]
+    call streq
+    je .split
+    lea rsi, [t_long]
+    call streq
+    je .split
+    lea rsi, [sep_long]
+    call streq
+    je .split
+    lea rsi, [excl_long]
+    call streq
+    je .split
+    ; A flag with text after it. Parse the name alone first, so that an unknown
+    ; name is still reported as unknown, then reject the rest of the line.
+    mov [cfg_argv+8], rdi
+    lea rdi, [cfg_argv]
+    mov esi, 2
+    call parse_args
+    jmp bad_args
+.split:                              ; the rest of the line is this option's value
+    inc r10
+.blanks:
+    mov al, [r10]
+    cmp al, ' '
+    je .blank_next
+    cmp al, 9
+    jne .value
+.blank_next:
+    inc r10
+    jmp .blanks
+.value:                              ; trailing blanks were trimmed, so a value is here
+    mov rsi, r10
+    call cfg_unquote
+    mov [cfg_argv+8], rdi
+    mov [cfg_argv+16], r10
+    mov esi, 3
+    jmp .parse
+.equals:                             ; "--name=value" stays one entry
+    lea rsi, [r10+1]
+    call cfg_unquote
+.one:
+    mov [cfg_argv+8], rdi
+    mov esi, 2
+.parse:
+    lea rdi, [cfg_argv]
+    call parse_args
+    test rax, rax
+    jnz bad_args                     ; a stray word after a flag
+.ret:
+    ret
+
+; cfg_unquote: rsi = a value, NUL-terminated. If it starts with ' or ", the
+; value must end with that same quote and contain no other one; both are
+; removed in place. Otherwise it is left alone (so it-s-fine, a"b"). Keeps rdi,
+; r8 and r10.
+cfg_unquote:
+    movzx eax, byte [rsi]
+    cmp al, "'"
+    je .quoted
+    cmp al, '"'
+    jne .ret
+.quoted:
+    lea rdx, [rsi+1]
+.find:
+    movzx ecx, byte [rdx]
+    test cl, cl
+    jz bad_cfg_quote                 ; never closed
+    cmp cl, al
+    je .closing
+    inc rdx
+    jmp .find
+.closing:
+    cmp byte [rdx+1], 0
+    jne bad_cfg_quote                ; a matching quote inside, or text after it
+    mov r11, rsi
+    lea r9, [rsi+1]
+.shift:
+    cmp r9, rdx
+    jae .shifted
+    mov cl, [r9]
+    mov [r11], cl
+    inc r9
+    inc r11
+    jmp .shift
+.shifted:
+    mov byte [r11], 0
+.ret:
+    ret
 
 ; strlen: rdi = str -> rax = len
 strlen:
@@ -2221,6 +2789,57 @@ new_text_record:
 
 
 die:                                 ; rsi, rdx = message; exits 1
+    cmp qword [err_path], 0
+    je .write
+    ; Inside the config file the message becomes "zfind: PATH[:LINE]: text":
+    ; its own "zfind: " (7 bytes) is replaced by the prefix built here.
+    mov r8, rsi
+    mov r9, rdx
+    lea rdi, [err_buf]
+    lea rsi, [e_pfx]
+    mov ecx, 7
+    rep movsb
+    mov rsi, [err_path]
+    xor ecx, ecx
+.plen:                               ; path length, capped to what err_buf holds
+    cmp ecx, PATH_MAX
+    jae .pcopy
+    cmp byte [rsi+rcx], 0
+    je .pcopy
+    inc ecx
+    jmp .plen
+.pcopy:
+    rep movsb
+    mov rax, [err_line]
+    test rax, rax
+    jz .colon
+    mov byte [rdi], ':'
+    inc rdi
+    xor ecx, ecx
+    mov r10d, 10
+.dig:                                ; decimal digits, pushed least significant first
+    xor edx, edx
+    div r10
+    add dl, '0'
+    push rdx
+    inc ecx
+    test rax, rax
+    jnz .dig
+.pop:
+    pop rax
+    stosb
+    dec ecx
+    jnz .pop
+.colon:
+    mov word [rdi], ': '
+    add rdi, 2
+    lea rsi, [r8+7]
+    lea rcx, [r9-7]
+    rep movsb
+    lea rsi, [err_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+.write:
     mov rdi, 2
     mov rax, 1
     syscall
@@ -2311,6 +2930,51 @@ bad_hid_comb:
 bad_ig_comb:
     lea rsi, [e_ig]
     mov rdx, e_ig_e - e_ig
+    jmp die
+
+bad_cfg_missing:
+    lea rsi, [e_cfg_missing]
+    mov rdx, e_cfg_missing_e - e_cfg_missing
+    jmp die
+
+bad_cfg_comb:
+    lea rsi, [e_cfg_comb]
+    mov rdx, e_cfg_comb_e - e_cfg_comb
+    jmp die
+
+bad_cfg_read:
+    lea rsi, [e_cfg_read]
+    mov rdx, e_cfg_read_e - e_cfg_read
+    jmp die
+
+bad_cfg_big:
+    lea rsi, [e_cfg_big]
+    mov rdx, e_cfg_big_e - e_cfg_big
+    jmp die
+
+bad_cfg_nul:
+    lea rsi, [e_cfg_nul]
+    mov rdx, e_cfg_nul_e - e_cfg_nul
+    jmp die
+
+bad_cfg_notopt:
+    lea rsi, [e_cfg_notopt]
+    mov rdx, e_cfg_notopt_e - e_cfg_notopt
+    jmp die
+
+bad_cfg_cli:
+    lea rsi, [e_cfg_cli]
+    mov rdx, e_cfg_cli_e - e_cfg_cli
+    jmp die
+
+bad_cfg_quote:
+    lea rsi, [e_cfg_quote]
+    mov rdx, e_cfg_quote_e - e_cfg_quote
+    jmp die
+
+bad_cfg_path:
+    lea rsi, [e_cfg_path]
+    mov rdx, e_cfg_path_e - e_cfg_path
     jmp die
 
 big:

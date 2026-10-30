@@ -7,7 +7,7 @@ import platform
 import subprocess
 import sys
 from pathlib import Path
-from typing import IO, NamedTuple, Optional, Protocol
+from typing import IO, Iterator, NamedTuple, Optional, Protocol
 
 ZFIND_TESTDATA = os.environ.get("ZFIND_TESTDATA", "/tmp/zfind-testdata")
 
@@ -152,6 +152,21 @@ def make_zfind_runner(binary: Path) -> ZfindRunner:
         )
 
     return run
+
+
+@pytest.fixture(scope="session", autouse=True)
+def no_user_config(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """Keep the developer's real ~/.config/zfind/config out of every test.
+
+    zfind reads a user config by default, so on a machine that has one every
+    other test would silently change. Subprocesses inherit this environment;
+    test_config.py builds its own explicit environments instead.
+    """
+    empty = tmp_path_factory.mktemp("no-user-config")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("HOME", str(empty))
+        patch.setenv("XDG_CONFIG_HOME", str(empty / "xdg"))
+        yield
 
 
 @pytest.fixture(scope="session")
