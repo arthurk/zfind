@@ -1,7 +1,7 @@
-zfind
 *.o
 .envrc
 core
 core.*
 testdata/
 __pycache__
+build
