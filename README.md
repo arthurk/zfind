@@ -26,6 +26,8 @@ zfind --separator='\0' --limit 100 .conf  # Print up to 100 matches, NUL-separat
 zfind --separator='\t' config   # Print matches separated by tabs
 zfind --type f                  # List regular files, traversing directories as usual
 zfind --type f --type d         # List regular files and directories
+zfind --config ./zfind.conf foo # Read settings from this file instead of the default config
+zfind --no-config foo           # Ignore the config file for this run
 ```
 
 ## Matching and output
@@ -72,6 +74,11 @@ zfind --type f --type d         # List regular files and directories
   option to select both types; repeated values have no extra effect. Explicit
   type filters exclude symlinks and special entries. `--type f` still traverses
   directories so matching files below them can be found. `--type` consumes the next token greedily as its value.
+- `--config PATH`, `--config=PATH` Read settings from `PATH` instead of the
+  default config file. The file must exist. Command-line only; see
+  [Configuration](#configuration). `--config` consumes the next token greedily
+  as its value; a repeated `--config` is last-wins. Conflicts with `--no-config`.
+- `--no-config` Read no config file for this run. Conflicts with `--config`.
 - `--` End option parsing. Put it before a pattern that starts with `-`, as in `zfind -- -draft` to search for the name substring `-draft`. Any following argument is treated as positional (the pattern).
 
 ## Gitignore support
@@ -93,6 +100,86 @@ Supported syntax includes negation (`!`), `*`, `?`, anchored patterns, directory
   never tracks anything under it. Use `--no-hidden` to skip all
   dot-prefixed entries.
 - Each `.gitignore` file is limited to 65,535 bytes. zfind keeps at most 1,024 rules per directory.
+
+## Configuration
+
+zfind can read persistent defaults from one config file. Command-line options
+override them for a single run.
+
+Which file is read:
+
+1. The file given with `--config PATH` (relative paths are relative to the
+   current directory). It must exist.
+2. Otherwise `$XDG_CONFIG_HOME/zfind/config`, when `XDG_CONFIG_HOME` is a
+   non-empty absolute path.
+3. Otherwise `$HOME/.config/zfind/config`, when `HOME` is set and non-empty.
+
+If neither default location can be resolved, or the default file does not
+exist, zfind runs with its built-in defaults. A file that exists but cannot be
+read, is larger than 65,536 bytes, or contains an error stops zfind before any
+search, with a message that names the file and the line:
+
+```
+zfind: /home/me/.config/zfind/config:3: unknown option
+```
+
+zfind does not search the current or parent directories for a config and does
+not support includes. `--no-config` skips the file; `--help` never reads it.
+`--config` and `--no-config` are command-line options only and must appear
+before `PATTERN`.
+
+### Format
+
+One option per line, using the same names and the same value rules as the
+command line:
+
+```
+# Personal zfind defaults
+--case-insensitive
+--no-hidden
+--gitignore
+--exclude-name=node_modules
+--exclude-name='build output'
+--separator='\t'
+--limit 200
+```
+
+- Blank lines are ignored. A line whose first non-blank character is `#` is a
+  comment. Inline comments are not supported: a `#` elsewhere is part of the value.
+- A line is `--name`, `--name=value` or `--name value`. Leading and trailing
+  spaces, tabs and `\r` are ignored. Text after a flag (for example a second
+  option) is an error; after an option that takes a value, the rest of the line
+  is that value. Write `--type f`, not `--type=f`, exactly
+  as on the command line.
+- A value may be wrapped in matching single or double quotes, which are
+  removed; this lets it start or end with a space. The same quote cannot appear
+  inside the value. Quotes elsewhere in a value are literal.
+- Backslashes are not processed by the config parser; the option itself
+  decides what they mean, so `--separator='\t'` is a tab, as on the command line.
+- Nothing is expanded: no shell variables, `~`, globs or command substitution.
+- Short options, `PATTERN`, `--`, `--help`, `--config` and `--no-config` are
+  not allowed in the file. Unknown or malformed lines are errors, never ignored.
+
+Every behavior option the command line accepts is accepted in the file, with
+the same validation.
+
+### Precedence
+
+Built-in defaults, then the config file, then the command line.
+
+- **Modes** (`--case-sensitive`/`--case-insensitive`, `--hidden`/`--no-hidden`,
+  `--gitignore`/`--no-gitignore`): a mode given on the command line replaces the
+  file's. Opposing modes within one source are an error, so a file cannot rely
+  on line order. A file's `--case-sensitive` can be overridden with
+  `--case-insensitive`, and vice versa; there is no way to ask for smart case
+  again from the command line.
+- **Scalars** (`--separator`, `--limit`): the command line overwrites the file,
+  and the last value within one source wins. A later `--limit N` replaces a
+  configured limit, but nothing cancels one yet: `--limit 0` prints nothing.
+- **Lists** (`--type`, `--exclude-name`): the command line adds to the file's
+  entries; repeating a value has no extra effect. Together they still count
+  toward the 64 unique `--exclude-name` values. To ignore the file's lists, use
+  `--no-config`.
 
 ## Build
 
