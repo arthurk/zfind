@@ -2,30 +2,11 @@
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import Result, ZfindRunner
 from expected import IGNORES, IGNORES_GITIGNORE, IGNORES_GITIGNORE_NO_HIDDEN
-
-
-def entries(out: bytes) -> list[bytes]:
-    """Parse newline-separated output into individual entry byte-strings."""
-    assert out == b"" or out.endswith(b"\n"), "Output must be newline-terminated or empty"
-    return out.split(b"\n")[:-1]
-
-
-def run_in(binary: Path, cwd: Path, *args: str, timeout: int = 60) -> Result:
-    """Run zfind in an arbitrary directory (for temporary test trees)."""
-    done = subprocess.run(
-        [str(binary), *args],
-        cwd=cwd,
-        timeout=timeout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    return Result(out=done.stdout or b"", err=done.stderr or b"", status=done.returncode)
+from helpers import ZfindRunner, entries, run_in
 
 
 class TestGitignore:

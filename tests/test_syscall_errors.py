@@ -8,26 +8,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import Result
+from helpers import Result, entries, run_in
 
 STRACE = shutil.which("strace")
 requires_strace = pytest.mark.skipif(STRACE is None, reason="requires strace")
-
-
-def entries(out: bytes) -> list[bytes]:
-    assert out == b"" or out.endswith(b"\n"), "Output must be newline-terminated or empty"
-    return out.split(b"\n")[:-1]
-
-
-def run_in(binary: Path, cwd: Path, *args: str, timeout: int = 60) -> Result:
-    done = subprocess.run(
-        [str(binary), *args],
-        cwd=cwd,
-        timeout=timeout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    return Result(out=done.stdout or b"", err=done.stderr or b"", status=done.returncode)
 
 
 def run_injected(

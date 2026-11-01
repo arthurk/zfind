@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 import pytest
-from conftest import Result, ZfindRunner, entries, run_in, words
+from helpers import Result, ZfindRunner, entries, run_in, words
 
 
 class TestExcludeNameParser:

@@ -2,33 +2,10 @@
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import Result, ZfindRunner
-
-
-# -----------------------------------------------------------------------------
-# Output Parsing Helpers
-# -----------------------------------------------------------------------------
-
-def entries(out: bytes) -> list[bytes]:
-    """Parse newline-separated output into individual entry byte-strings."""
-    assert out == b"" or out.endswith(b"\n"), "Output must be newline-terminated or empty"
-    return out.split(b"\n")[:-1]
-
-
-def run_in(binary: Path, cwd: Path, *args: str, timeout: int = 60) -> Result:
-    """Run zfind in an arbitrary directory (for temporary test trees)."""
-    done = subprocess.run(
-        [str(binary), *args],
-        cwd=cwd,
-        timeout=timeout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    return Result(out=done.stdout or b"", err=done.stderr or b"", status=done.returncode)
+from helpers import ZfindRunner, entries, run_in
 
 
 # -----------------------------------------------------------------------------
@@ -135,7 +112,10 @@ class TestCliBasics:
 
 class TestSortOrder:
     def test_results_are_sorted_for_names_with_equal_prefixes(self, zfind: ZfindRunner):
-        listing = entries(zfind("camera").out)
+        res = zfind("camera")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        listing = entries(res.out)
         assert len({name[:8] for name in listing}) < len(listing)
         assert listing == sorted(listing)
 

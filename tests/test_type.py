@@ -3,16 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from conftest import ZfindRunner
-
-
-def words(text: str) -> list[bytes]:
-    return [word.encode() for word in text.split()]
-
-
-def entries(out: bytes) -> list[bytes]:
-    assert out == b"" or out.endswith(b"\n"), "Output must be newline-terminated or empty"
-    return out.split(b"\n")[:-1]
+from helpers import ZfindRunner, entries, words
 
 
 TINY = words("a b ca cb dir/ dir/c dir/d e")

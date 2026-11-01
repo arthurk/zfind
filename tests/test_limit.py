@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import Result, ZfindRunner
+from helpers import Result, ZfindRunner, entries, joined, run_in, words
 from expected import IGNORES
 
 DEV_FULL = Path("/dev/full")
@@ -32,33 +31,9 @@ EXACT_LIMIT_SEPARATORS = [
 ]
 
 
-def words(text: str) -> list[bytes]:
-    return [word.encode() for word in text.split()]
-
-
-def joined(entries: list[bytes], sep: bytes) -> bytes:
-    return b"".join(entry + sep for entry in entries)
-
-
-def entries(out: bytes) -> list[bytes]:
-    assert out == b"" or out.endswith(b"\n"), "Output must be newline-terminated or empty"
-    return out.split(b"\n")[:-1]
-
-
 def nul_entries(out: bytes) -> list[bytes]:
     assert out == b"" or out.endswith(b"\0"), "Output must be NUL-terminated or empty"
     return out.split(b"\0")[:-1]
-
-
-def run_in(binary: Path, cwd: Path, *args: str, timeout: int = 60) -> Result:
-    done = subprocess.run(
-        [str(binary), *args],
-        cwd=cwd,
-        timeout=timeout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    return Result(out=done.stdout or b"", err=done.stderr or b"", status=done.returncode)
 
 
 def run_repeated(

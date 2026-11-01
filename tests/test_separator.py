@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import warnings
 from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-from conftest import Result, ZfindRunner
+from helpers import Result, ZfindRunner, joined, run_in
 
 BLK_DATA = 16384 - 32  # src/x86_64/zfind.asm: BLK_SZ - BLK_HDR
 TINY = [word.encode() for word in "a b ca cb dir/ dir/c dir/d e".split()]
@@ -19,27 +18,10 @@ WEIRD = [
 ]
 
 
-def joined(entries: list[bytes], sep: bytes) -> bytes:
-    """Unlimited output for entries: every result, including the last, terminated."""
-    return b"".join(entry + sep for entry in entries)
-
-
 def nul_entries(out: bytes) -> list[bytes]:
     """Parse NUL-separated output into individual entry byte-strings."""
     assert out == b"" or out.endswith(b"\0"), "Output must be NUL-terminated or empty"
     return out.split(b"\0")[:-1]
-
-
-def run_in(binary: Path, cwd: Path, *args: str, timeout: int = 60) -> Result:
-    """Run zfind in an arbitrary directory (for temporary test trees)."""
-    done = subprocess.run(
-        [str(binary), *args],
-        cwd=cwd,
-        timeout=timeout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    return Result(out=done.stdout or b"", err=done.stderr or b"", status=done.returncode)
 
 
 def run_repeated(

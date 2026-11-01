@@ -7,11 +7,12 @@ import platform
 import subprocess
 import sys
 from pathlib import Path
-from typing import IO, Iterator, NamedTuple, Optional, Protocol
+from typing import IO, Iterator, Optional
 
 ZFIND_TESTDATA = os.environ.get("ZFIND_TESTDATA", "/tmp/zfind-testdata")
 
 import pytest
+from helpers import Result, ZfindRunner
 
 TESTS_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(ZFIND_TESTDATA)
@@ -20,53 +21,6 @@ DATA_DIR = Path(ZFIND_TESTDATA)
 TREES = ["tiny", "hidden", "ignores", "weird", "camera", "tree2"]
 
 collect_ignore = ["testdata"]
-
-
-class Result(NamedTuple):
-    out: bytes
-    err: bytes
-    status: int
-
-    def __repr__(self) -> str:
-        # Prevents 64KB+ output dumps from blowing out terminal/AI context windows on failure
-        out_preview = (
-            f"{self.out[:120]!r}... ({len(self.out)} bytes)"
-            if len(self.out) > 120
-            else repr(self.out)
-        )
-        return f"Result(status={self.status}, err={self.err!r}, out={out_preview})"
-
-
-def words(text: str) -> list[bytes]:
-    return [word.encode() for word in text.split()]
-
-
-def joined(names: list[bytes], sep: bytes) -> bytes:
-    return b"".join(name + sep for name in names)
-
-
-def entries(out: bytes) -> list[bytes]:
-    assert out == b"" or out.endswith(b"\n"), "Output must be newline-terminated or empty"
-    return out.split(b"\n")[:-1]
-
-
-def run_in(binary: Path, cwd: Path, *args: str, timeout: int = 60) -> Result:
-    done = subprocess.run(
-        [str(binary), *args], cwd=cwd, timeout=timeout,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    return Result(out=done.stdout or b"", err=done.stderr or b"", status=done.returncode)
-
-
-class ZfindRunner(Protocol):
-    def __call__(
-        self,
-        tree: str,
-        *args: str,
-        stdout: Optional[IO[bytes]] = None,
-    ) -> Result:
-        """Run zfind in tests/testdata/<tree>."""
-        ...
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
