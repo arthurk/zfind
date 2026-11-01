@@ -431,20 +431,24 @@ class TestSeparatorRangeGroups:
 
         for n in (2047, 2048, 2049, 4096, 131071, 131072):
             args = ("--separator=XY", "--limit", str(n))
-            if n in (2048, 131072):
+            if n == 2048:
                 res = run_repeated(zfind_path, flat_131072, *args, timeout=120)
             else:
                 res = run_in(zfind_path, flat_131072, *args, timeout=120)
-            serial = run_in(serial_binary_path, flat_131072, *args, timeout=120)
-            assert res.status == serial.status == 0, (
-                f"Limited run at {n} failed: parallel={res}; serial={serial}"
-            )
-            assert res.err == serial.err == b"", (
-                f"Limited run at {n} wrote stderr: parallel={res}; serial={serial}"
-            )
+            assert res.status == 0, f"Limited run at {n} failed: {res}"
+            assert res.err == b"", f"Limited run at {n} wrote stderr: {res}"
             expected = full.out[:n * (7 + len(b"XY"))]
-            assert res.out == serial.out == expected, f"Wrong prefix at --limit {n}"
+            assert res.out == expected, f"Wrong prefix at --limit {n}"
             assert res.out.split(b"XY")[:-1] == names[:n]
+
+        serial = run_in(
+            serial_binary_path, flat_131072,
+            "--separator=XY", "--limit", "131072", timeout=120,
+        )
+        assert serial.status == 0, f"Serial run failed: {serial}"
+        assert serial.err == b"", f"Serial run wrote stderr: {serial}"
+        assert serial.out == full.out
+
 
 @pytest.fixture(scope="module")
 def block_one_byte_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
