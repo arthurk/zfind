@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 import pytest
-from conftest import Result
-from test_flags import entries, joined
+from conftest import Result, entries, joined
 
 CFG_MAX = 65536  # config file size limit (CFG_MAX in zfind.asm)
 

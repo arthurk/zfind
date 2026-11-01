@@ -37,6 +37,27 @@ class Result(NamedTuple):
         return f"Result(status={self.status}, err={self.err!r}, out={out_preview})"
 
 
+def words(text: str) -> list[bytes]:
+    return [word.encode() for word in text.split()]
+
+
+def joined(names: list[bytes], sep: bytes) -> bytes:
+    return b"".join(name + sep for name in names)
+
+
+def entries(out: bytes) -> list[bytes]:
+    assert out == b"" or out.endswith(b"\n"), "Output must be newline-terminated or empty"
+    return out.split(b"\n")[:-1]
+
+
+def run_in(binary: Path, cwd: Path, *args: str, timeout: int = 60) -> Result:
+    done = subprocess.run(
+        [str(binary), *args], cwd=cwd, timeout=timeout,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    return Result(out=done.stdout or b"", err=done.stderr or b"", status=done.returncode)
+
+
 class ZfindRunner(Protocol):
     def __call__(
         self,
