@@ -37,6 +37,18 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=os.environ.get("ZFIND_SERIAL"),
         help="Path to serial zfind binary (defaults to $ZFIND_SERIAL or build/<arch>-serial/zfind)",
     )
+    parser.addoption(
+        "--unknown-zfind",
+        action="store",
+        default=os.environ.get("ZFIND_UNKNOWN"),
+        help="Path to DT_UNKNOWN-hook binary (defaults to $ZFIND_UNKNOWN or build/<arch>-unknown/zfind)",
+    )
+    parser.addoption(
+        "--range-zfind",
+        action="store",
+        default=os.environ.get("ZFIND_RANGE"),
+        help="Path to range-hook binary (defaults to $ZFIND_RANGE or build/<arch>-range/zfind)",
+    )
 
 
 def get_binary_path(config: pytest.Config) -> Path:
@@ -52,6 +64,14 @@ def get_serial_binary_path(config: pytest.Config) -> Path:
     if explicit:
         return Path(explicit).resolve()
     return (TESTS_DIR.parent / "build" / f"{platform.machine()}-serial" / "zfind").resolve()
+
+
+def get_variant_binary_path(config: pytest.Config, kind: str) -> Path:
+    """Path of a test-hook build: kind is "unknown" or "range"."""
+    explicit = config.getoption(f"--{kind}-zfind")
+    if explicit:
+        return Path(explicit).resolve()
+    return (TESTS_DIR.parent / "build" / f"{platform.machine()}-{kind}" / "zfind").resolve()
 
 
 def _verify_trees() -> None:
@@ -178,3 +198,24 @@ def serial_zfind_path(pytestconfig: pytest.Config) -> Path:
 @pytest.fixture(scope="session")
 def serial_zfind(serial_zfind_path: Path) -> ZfindRunner:
     return make_zfind_runner(serial_zfind_path)
+
+
+def _variant_path(config: pytest.Config, kind: str) -> Path:
+    binary = get_variant_binary_path(config, kind)
+    if not binary.is_file():
+        if config.getoption(f"--{kind}-zfind"):
+            pytest.exit(f"{kind} binary not found: {binary}", returncode=4)
+        pytest.skip(f"{kind}-hook binary not built: {binary}; run `make test` to build it")
+    return binary
+
+
+@pytest.fixture(scope="session")
+def unknown_zfind_path(pytestconfig: pytest.Config) -> Path:
+    """DT_UNKNOWN hook build (every type resolved by lstat, wide prepass forced)."""
+    return _variant_path(pytestconfig, "unknown")
+
+
+@pytest.fixture(scope="session")
+def range_zfind_path(pytestconfig: pytest.Config) -> Path:
+    """DT_UNKNOWN hook build with RANGE_MIN/CHUNK_MIN lowered to reach walk_range."""
+    return _variant_path(pytestconfig, "range")

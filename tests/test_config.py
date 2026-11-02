@@ -94,6 +94,18 @@ def tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture
+def links_cfg(zfind_path: Path, tmp_path: Path, home: Path) -> ConfigRunner:
+    """A runner over a small tree with a file, a directory and two symlinks."""
+    root = tmp_path / "links"
+    (root / "dir").mkdir(parents=True)
+    (root / "dir" / "inner").write_bytes(b"")
+    (root / "file").write_bytes(b"")
+    (root / "lnk").symlink_to("file")
+    (root / "dlnk").symlink_to("dir")
+    return ConfigRunner(zfind_path, root, home)
+
+
+@pytest.fixture
 def home(tmp_path: Path) -> Path:
     """A HOME whose .config/zfind directory exists but holds no config yet."""
     path = tmp_path / "home"
@@ -262,7 +274,7 @@ class TestConfigSelection:
             (("--exclude-name", "--config", "config"), listing([b".git/config"])),
             (("--separator", "--config=x", "config"), Result(b".git/config--config=x", b"", 0)),
             (("--limit", "--no-config"), failure(b"zfind: invalid limit\n")),
-            (("--type", "--no-config"), failure(b"zfind: expected f or d after --type\n")),
+            (("--type", "--no-config"), failure(b"zfind: expected f, d or l after --type\n")),
         ],
     )
     def test_value_options_swallow_config_option_names(
@@ -411,8 +423,13 @@ class TestConfigSyntax:
         cfg.write("--separator --config=x\n--limit 1\n")
         assert cfg("config") == Result(out=b".git/config--config=x", err=b"", status=0)
 
-    def test_type_uses_the_blank_form(self, cfg: ConfigRunner):
-        cfg.write("--type f\n")
+    @pytest.mark.parametrize(
+        "line",
+        ["--type f\n", "--type=f\n", "--type 'f'\n", "--type='f'\n", "--type  f  \n"],
+        ids=["blank", "equals", "blank-quoted", "equals-quoted", "blank-padded"],
+    )
+    def test_type_takes_the_blank_and_the_equals_form(self, cfg: ConfigRunner, line: str):
+        cfg.write(line)
         # Directories d/, my dir/ and node_modules/ also contain a "d".
         assert cfg("d") == listing([b".hidden", b"Config.md"])
 
@@ -431,7 +448,6 @@ class TestConfigErrors:
         [
             pytest.param("--bogus\n", 1, "unknown option", id="unknown-option"),
             pytest.param("--hidden=foo\n", 1, "unknown option", id="value-on-a-flag"),
-            pytest.param("--type=f\n", 1, "unknown option", id="type-has-no-equals-form"),
             pytest.param("--HIDDEN\n", 1, "unknown option", id="case-matters"),
             pytest.param("--limit\n", 1, "invalid limit", id="limit-without-value"),
             pytest.param("--limit=abc\n", 1, "invalid limit", id="limit-not-a-number"),
@@ -443,8 +459,14 @@ class TestConfigErrors:
             pytest.param("--exclude-name\n", 1, "missing value for --exclude-name", id="exclude-without-value"),
             pytest.param("--exclude-name=''\n", 1, "empty name for --exclude-name", id="exclude-empty-quoted"),
             pytest.param("--exclude-name=a/b\n", 1, "--exclude-name matches basenames only; '/' is not allowed", id="exclude-slash"),
-            pytest.param("--type\n", 1, "expected f or d after --type", id="type-without-value"),
-            pytest.param("--type x\n", 1, "expected f or d after --type", id="type-bad-value"),
+            pytest.param("--type\n", 1, "expected f, d or l after --type", id="type-without-value"),
+            pytest.param("--type x\n", 1, "expected f, d or l after --type", id="type-bad-value"),
+            pytest.param("--type=\n", 1, "expected f, d or l after --type", id="type-equals-without-value"),
+            pytest.param("--type=x\n", 1, "expected f, d or l after --type", id="type-equals-bad-value"),
+            pytest.param("--type=ff\n", 1, "expected f, d or l after --type", id="type-equals-two-letters"),
+            pytest.param("--type=''\n", 1, "expected f, d or l after --type", id="type-equals-empty-quoted"),
+            pytest.param("--type f d\n", 1, "expected f, d or l after --type", id="type-value-is-the-rest-of-the-line"),
+            pytest.param("--type=f d\n", 1, "expected f, d or l after --type", id="type-equals-value-is-the-rest-of-the-line"),
             pytest.param("--exclude-name='abc\n", 1, "malformed quotes in config value", id="quote-never-closed"),
             pytest.param("--exclude-name='a'b'\n", 1, "malformed quotes in config value", id="quote-inside-quoted"),
             pytest.param("--exclude-name='a'b\n", 1, "malformed quotes in config value", id="text-after-closing-quote"),
@@ -594,6 +616,16 @@ class TestConfigPrecedence:
         assert b"a.txt" in both and b"d/" in both
         assert cfg("--type", "f").out == cfg().out  # a repeated value changes nothing
 
+    def test_l_selects_symlinks_in_the_file_in_either_form(self, links_cfg: ConfigRunner):
+        for line in ("--type l\n", "--type=l\n"):
+            links_cfg.write(line)
+            assert links_cfg() == listing([b"dlnk", b"lnk"]), line
+
+    def test_types_accumulate_with_l_across_layers(self, links_cfg: ConfigRunner):
+        links_cfg.write("--type=l\n")
+        assert links_cfg("--type=f") == listing([b"dir/inner", b"dlnk", b"file", b"lnk"])
+        assert links_cfg("--type", "d") == listing([b"dir/", b"dlnk", b"lnk"])
+
     def test_exclude_name_table_is_shared_between_layers(self, cfg: ConfigRunner):
         cfg.write("".join(f"--exclude-name=n{i}\n" for i in range(64)))
         assert cfg("config") == listing(CONFIG_HITS)
@@ -614,6 +646,9 @@ class TestNoConfigIsInert:
         ("--no-hidden", "config"),
         ("--type", "f"),
         ("--type", "d"),
+        ("--type", "l"),
+        ("--type=f",),
+        ("--type=l",),
         ("--limit", "2"),
         ("--limit", "0"),
         ("--separator", ";", "config"),

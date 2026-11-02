@@ -3,7 +3,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; zfind, "simple search" use case only:
 ;   zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
-;         [--exclude-name NAME] [--limit N] [--type f|d]
+;         [--exclude-name NAME] [--limit N] [--type f|d|l]
 ;         [--config PATH | --no-config] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
@@ -224,12 +224,16 @@ endstruc
 %define GRP_RANGE     1
 %define GRP_TAG       1
 %define EMIT_STACK_MAX 8192
-%define RANGE_MIN     (1 << 17)
+%ifndef RANGE_MIN
+%define RANGE_MIN     (1 << 17)        ; test builds lower it to reach walk_range
+%endif
 %ifndef SPLIT_CAP
 %define SPLIT_CAP     8192             ; upper bound on wide-split groups
 %endif
 %define NESTED_WIDTH_MAX 20           ; wider root: child groups do not split again
-%define CHUNK_MIN     (1 << 11)
+%ifndef CHUNK_MIN
+%define CHUNK_MIN     (1 << 11)        ; test builds lower it with RANGE_MIN
+%endif
 %define MAX_RANGE_CHUNKS 128
 ; ignore-rule chain node (arena)
 %define NODE_RULES  0
@@ -245,7 +249,7 @@ section .rodata
     e_arg_e:
     e_limit     db "zfind: invalid limit", 10
     e_limit_e:
-    e_type      db "zfind: expected f or d after --type", 10
+    e_type      db "zfind: expected f, d or l after --type", 10
     e_type_e:
     e_flag      db "zfind: unknown option", 10
     e_flag_e:
@@ -308,8 +312,7 @@ section .rodata
     excl_long   db "--exclude-name", 0
     excl_eq     db "--exclude-name=", 0 ; 15 bytes of prefix
     t_long      db "--type", 0
-    t_file      db "f", 0
-    t_dir       db "d", 0
+    t_eq        db "--type=", 0      ; 7 bytes of prefix
     g_long      db "--gitignore", 0
     nog_long    db "--no-gitignore", 0
     hidden_long db "--hidden", 0
@@ -326,7 +329,7 @@ section .rodata
     cfg_sfx_home_e:
     help_msg    db "usage: zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
-               db "             [--exclude-name NAME]... [--limit N] [--type f|d]", 10
+               db "             [--exclude-name NAME]... [--limit N] [--type f|d|l]", 10
                db "             [--config PATH | --no-config] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
@@ -368,7 +371,8 @@ section .rodata
                db "                      case-sensitive; no glob or '/'", 10
                db "                      also --exclude-name=NAME; matching dirs are pruned", 10
                db "  --limit N           print at most N results, then stop (0 = none)", 10
-               db "  --type f|d          repeatable; print regular files and/or directories", 10
+               db "  --type f|d|l        repeatable; print regular files, directories, symlinks", 10
+               db "                      also --type=V", 10
                db "  --config PATH       read settings from PATH instead of the default file", 10
                db "                      (also --config=PATH); the file must exist", 10
                db "  --no-config         read no config file", 10
@@ -835,6 +839,10 @@ parse_args:
     call streq
     je .opt_type
     mov rdi, [rbp+r12*8]
+    lea rsi, [t_eq]
+    call startswith
+    je .opt_type_eq
+    mov rdi, [rbp+r12*8]
     lea rsi, [l_eq]
     call startswith
     je .opt_limit_eq
@@ -910,20 +918,31 @@ parse_args:
     cmp r12, rbx
     jae bad_type
     mov rdi, [rbp+r12*8]
-    lea rsi, [t_file]
-    call streq
-    je .type_file
+    jmp .opt_type_value
+.opt_type_eq:
     mov rdi, [rbp+r12*8]
-    lea rsi, [t_dir]
-    call streq
+    add rdi, 7                         ; len("--type=")
+.opt_type_value:                       ; rdi = the value: exactly one of f, d, l
+    movzx eax, byte [rdi]
+    test al, al
+    jz bad_type                        ; "--type=" with nothing after it
+    cmp byte [rdi+1], 0
+    jne bad_type                       ; "ff", "file", ...
+    cmp al, 'f'
+    je .type_file
+    cmp al, 'd'
+    je .type_dir
+    cmp al, 'l'
     jne bad_type
-    mov byte [type_seen], 1
-    bts qword [res_type], 4
-    jmp .type_next
+    bts qword [res_type], 10           ; DT_LNK
+    jmp .type_set
+.type_dir:
+    bts qword [res_type], 4            ; DT_DIR
+    jmp .type_set
 .type_file:
+    bts qword [res_type], 8            ; DT_REG
+.type_set:
     mov byte [type_seen], 1
-    bts qword [res_type], 8
-.type_next:
     inc r12
     jmp .args_loop
 
@@ -4023,8 +4042,13 @@ walk_wide:
     je .type_dir
     cmp eax, 0x8000
     je .type_file
+    cmp eax, 0xA000                  ; S_IFLNK
+    je .type_lnk
 .type_unknown:
     mov byte [r12-2], 0
+    jmp .have_type
+.type_lnk:
+    mov byte [r12-2], 10             ; DT_LNK
     jmp .have_type
 .type_dir:
     mov byte [r12-2], 4
@@ -4463,7 +4487,12 @@ walk_dir:
     je .unknown_dir
     cmp eax, 0x8000                  ; S_IFREG
     je .unknown_file
-    jmp .notdir                      ; symlinks and special entries remain type 0
+    cmp eax, 0xA000                  ; S_IFLNK
+    je .unknown_lnk
+    jmp .notdir                      ; special entries remain type 0
+.unknown_lnk:
+    mov byte [rsp+56], 10            ; DT_LNK, not a directory: no descent
+    jmp .notdir
 .unknown_dir:
     mov byte [rsp+56], 4             ; DT_DIR
     jmp .isdir
@@ -4615,7 +4644,13 @@ walk_range:
     je .unknown_dir
     cmp eax, 0x8000
     je .unknown_file
+    cmp eax, 0xA000                  ; S_IFLNK
+    je .unknown_lnk
 .unknown_other:
+    xor r13d, r13d
+    jmp .resolved
+.unknown_lnk:
+    mov byte [rsp+0], 10             ; DT_LNK
     xor r13d, r13d
     jmp .resolved
 .unknown_dir:

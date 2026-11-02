@@ -130,7 +130,9 @@ zfind --case-insensitive FOO # Force case-insensitive match for "foo", "Foo", et
 ```sh
 zfind --type f              # List all regular files
 zfind --type d              # List all directories (output ends with /)
-zfind --type f --type d     # List both regular files and directories (excludes symlinks)
+zfind --type l              # List all symlinks
+zfind --type f --type d     # List regular files and directories (excludes symlinks)
+zfind --type=f              # Same as --type f; --type=VALUE accepts f, d and l
 ```
 
 #### Filtering & Ignoring
@@ -166,7 +168,7 @@ zfind --type f | fzf
 | `--no-hidden` | — | Off | Prune all hidden files and directories from traversal. |
 | `--gitignore` | — | Off | Parse and apply `.gitignore` rules (skips `.git/`). |
 | `--no-gitignore` | — | Enabled | Do not apply `.gitignore` rules; walk all non-pruned trees. |
-| `--type` | `f` \| `d` | All types | Filter output by regular files (`f`) or directories (`d`). Repeatable. |
+| `--type` | `f`, `d`, `l` | All types | Filter output by regular files (`f`), directories (`d`) or symlinks (`l`). Repeatable; also `--type=VALUE`. |
 | `--exclude-name` | `NAME` | None | Prune entries whose exact basename matches `NAME`. Repeatable (up to 64). |
 | `--separator` | `STR` (escaped) | `\n` | Terminate each result with `STR` (1–64 bytes). Supports escapes like `\0`, `\t`. |
 | `--limit` | `N` (integer) | Unlimited | Print at most `N` results (`0` prints nothing). |
@@ -198,12 +200,13 @@ zfind --type f | fzf
 
 ### Symlinks & Type Filtering
 
-- `zfind` **never descends into symlinked directories**.
+- `zfind` **never follows symlinks**, so symlinked directories are not descended into.
 - By default, all entry types (files, directories, symlinks, special files) are output.
 - `--type f` restricts output to regular files. Directory traversal continues unaffected so child files can be found.
 - `--type d` restricts output to directories. Output paths for directories always end with a trailing slash (`/`).
-- Repeating `--type` (e.g., `--type f --type d`) allows both regular files and directories.
-- Explicit `--type` filters **exclude all symlinks**, even if the target is a regular file or directory.
+- `--type l` restricts output to symlinks, whether they point to a file, to a directory, or nowhere (dangling). A symlink to a directory is a symlink result: it gets no trailing slash and is never descended.
+- Repeating `--type` (e.g., `--type f --type l`) selects several types.
+- Explicit `--type f` and `--type d` filters exclude symlinks; use `--type l` to select them. Special entries (FIFOs, sockets, devices) are excluded by every type filter.
 
 ### Output Format & Separators
 
@@ -313,7 +316,7 @@ The configuration file uses a line-oriented format matching command-line option 
 --limit 500
 ```
 
-- **Lines:** Each non-blank line represents one option: `--name`, `--name=value`, or `--name value`.
+- **Lines:** Each non-blank line represents one option: `--name`, `--name=value`, or `--name value`. Options that take a value accept both forms, including `--type`.
 - **Comments:** Lines starting with `#` (ignoring leading whitespace) are comments. Inline comments are not supported (`#` elsewhere is treated as part of the value).
 - **Quoting:** Values may be enclosed in single (`'...'`) or double (`"..."`) quotes to preserve leading or trailing whitespace. The enclosing quote character cannot appear inside the string.
 - **Escapes & Expansions:** Shell variables (`$VAR`), tilde (`~`), globs, and command substitutions are not expanded. Backslashes are passed directly to the corresponding option handler (e.g. `--separator='\t'`).
