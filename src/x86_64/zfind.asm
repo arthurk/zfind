@@ -90,6 +90,8 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define EXCL_MAX    64                ; unique --exclude-name values
 %define CFG_MAX     65536             ; config file bytes; a larger file is an error
 %define ENT_BUF     32768
+%define PAT_BUF     4096             ; longest d_name the dirent model allows;
+                                    ;   also the size of the padded pattern copy
 %macro LAST_BATCH 0                 ; rax = bytes returned -> r13d = 1 if that was all
 %ifndef NO_EOF_SHORTCUT
     ; A local filesystem fills the buffer until the next entry does not fit. A
@@ -374,12 +376,31 @@ section .rodata
     help_msg_e:
     align 8
     poll_ts     dq 0, 5000000         ; 5 ms: how stale streamed output can get
+    align 16
+    c_upper_lo: times 16 db 0x40      ; 'A' - 1: pcmpgtb picks x > 0x40
+    c_upper_hi: times 16 db 0x5b      ; 'Z' + 1: and 0x5b > x
+    c_fold:     times 16 db 0x20
+    align 16
+    nul_below:                          ; (1 << p) - 1, first NUL at p
+%assign j 0
+%rep 16
+        dd (1 << j) - 1
+%assign j j+1
+%endrep
+    align 16
+    lowmask:
+%assign i 0
+%rep 17
+        dd (1 << i) - 1
+%assign i i+1
+%endrep
 
 section .bss
     arena_base: resq 1
     g_resv:     resq 1                ; next free arena byte (xadd'd)
     pat_ptr:    resq 1
     pat_len:    resq 1
+    pat_buf:    resb PAT_BUF + 16     ; folded, 16-byte-padded pattern copy
     pat_ci:     resq 1                ; 1 = fold case (both filename and pattern bytes)
     excl_n:     resq 1                ; immutable after parsing
     excl_names: resq EXCL_MAX         ; argv or config-buffer pointers, unique and slash-free
@@ -437,7 +458,7 @@ section .bss
     ret_heads:  resb 64 * MAX_THREADS ; per owner: blocks the writer returned
 
 section .text
-    global _start
+    global _start:function (_start.end_func - _start)
 
 _start:
     mov rbx, [rsp]                   ; argc
@@ -565,6 +586,45 @@ _start:
 .forced_insensitive:
     mov qword [pat_ci], 1
 .case_done:
+    ; The matcher reads 16-byte pattern windows, so the pattern needs readable
+    ; padding behind it; argv memory has none. Copy it once (folded when pat_ci
+    ; is set) into pat_buf. A pattern longer than PAT_BUF keeps the scalar loop
+    ; in name_match, which never reads past the pattern byte it compares.
+    mov rcx, [pat_len]
+    test rcx, rcx
+    jz .pat_padded
+    cmp rcx, PAT_BUF
+    ja .pat_padded
+    mov rsi, [pat_ptr]
+    lea rdi, [pat_buf]
+    cmp qword [pat_ci], 0
+    je .pat_copy
+.pat_fold:
+    mov al, [rsi]
+    test al, al
+    jz .pat_copied
+    cmp al, 'A'
+    jb .pat_fold_store
+    cmp al, 'Z'
+    ja .pat_fold_store
+    or al, 0x20
+.pat_fold_store:
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .pat_fold
+.pat_copy:
+    mov al, [rsi]
+    test al, al
+    jz .pat_copied
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .pat_copy
+.pat_copied:
+    lea rax, [pat_buf]
+    mov [pat_ptr], rax
+.pat_padded:
     ; Decide limit_mode from whether --limit was supplied, not from lim_left:
     ; UINT64_MAX stores the same -1 as the no-limit sentinel but is still framed.
     cmp qword [limit_given], 0
@@ -729,6 +789,7 @@ _start:
     xor edi, edi                     ; every normal path exits 0, even no match
     mov rax, 231                     ; exit_group
     syscall
+_start.end_func:
 
 ; parse_args: rdi = argv-like array (entry 0 unused), rsi = entry count ->
 ; rax = the PATTERN (NUL-terminated) or 0 when there is none. This is the
@@ -738,6 +799,7 @@ _start:
 ; still rejects a non-zero result. An option added to this loop is
 ; automatically valid in the config file: decide that on purpose.
 ; Errors exit through die. Preserves rbx, rbp, r12, r13.
+    global parse_args:function (parse_args.end_func - parse_args)
 parse_args:
     push rbx
     push rbp
@@ -1005,12 +1067,14 @@ parse_args:
     pop rbp
     pop rbx
     ret
+parse_args.end_func:
 
 ; find_config: pre-scan argv for --config PATH / --config=PATH / --no-config
 ; and record the choice in cfg_mode / cfg_path. Like the main loop it stops at
 ; "--" or the first non-option, and it steps over the value of the options that
 ; take one, so "--separator --no-config" is a separator, not a config choice.
 ; Needs rbx = argc, rbp = argv; keeps them.
+    global find_config:function (find_config.end_func - find_config)
 find_config:
     push r12
     mov r12, 1
@@ -1084,11 +1148,13 @@ find_config:
 .done:
     pop r12
     ret
+find_config.end_func:
 
 ; cfg_auto_path -> rax = the default config path (in cfg_pathbuf), or 0 if
 ; neither location can be resolved. $XDG_CONFIG_HOME counts only when it is
 ; non-empty and absolute; $HOME only when non-empty. Dies if the path would not
 ; fit in PATH_MAX. The first of duplicate variables wins, as with getenv.
+    global cfg_auto_path:function (cfg_auto_path.end_func - cfg_auto_path)
 cfg_auto_path:
     mov r8, [envp_ptr]
     xor r9d, r9d                     ; XDG_CONFIG_HOME value
@@ -1149,12 +1215,14 @@ cfg_auto_path:
 .none:
     xor eax, eax
     ret
+cfg_auto_path.end_func:
 
 ; load_config: read the selected config file and apply it line by line.
 ; While it runs err_path / err_line are set, so every error is reported as
 ; "zfind: PATH:LINE: message". A missing default file is normal; a missing
 ; --config file, an unreadable or oversized file, or any bad line is fatal,
 ; before the walk. Keeps rbx and rbp.
+    global load_config:function (load_config.end_func - load_config)
 load_config:
     push r12
     push r13
@@ -1253,6 +1321,7 @@ load_config:
     pop r13
     pop r12
     ret
+load_config.end_func:
 
 ; cfg_line: rdi = one config line, NUL-terminated, newline removed. Blank lines
 ; and lines whose first non-blank is # do nothing. Anything else must be
@@ -1263,6 +1332,7 @@ load_config:
 ; a flag is an error, so a line can never carry a second option. The line is
 ; edited in place and the buffer lives for the whole run: excl_names points into
 ; it. --help, --config, --no-config and "--" are command-line only.
+    global cfg_line:function (cfg_line.end_func - cfg_line)
 cfg_line:
 .lead:                               ; skip leading blanks and \r
     mov al, [rdi]
@@ -1390,11 +1460,13 @@ cfg_line:
     jnz bad_args                     ; a stray word after a flag
 .ret:
     ret
+cfg_line.end_func:
 
 ; cfg_unquote: rsi = a value, NUL-terminated. If it starts with ' or ", the
 ; value must end with that same quote and contain no other one; both are
 ; removed in place. Otherwise it is left alone (so it-s-fine, a"b"). Keeps rdi,
 ; r8 and r10.
+    global cfg_unquote:function (cfg_unquote.end_func - cfg_unquote)
 cfg_unquote:
     movzx eax, byte [rsi]
     cmp al, "'"
@@ -1428,8 +1500,10 @@ cfg_unquote:
     mov byte [r11], 0
 .ret:
     ret
+cfg_unquote.end_func:
 
 ; strlen: rdi = str -> rax = len
+    global strlen:function (strlen.end_func - strlen)
 strlen:
     xor rax, rax
 .loop:
@@ -1439,8 +1513,10 @@ strlen:
     jmp .loop
 .done:
     ret
+strlen.end_func:
 
 ; streq: rdi, rsi = two NUL-terminated strings -> ZF = 1 if they are equal
+    global streq:function (streq.end_func - streq)
 streq:
     xor ecx, ecx
 .loop:
@@ -1453,8 +1529,10 @@ streq:
     jmp .loop
 .ret:
     ret
+streq.end_func:
 
 ; parse_u64: rdi = NUL-terminated decimal -> rax = value, CF=1 on error
+    global parse_u64:function (parse_u64.end_func - parse_u64)
 parse_u64:
     xor eax, eax
     xor ecx, ecx                       ; digits seen
@@ -1483,11 +1561,13 @@ parse_u64:
 .bad:
     stc
     ret
+parse_u64.end_func:
 
 ; parse_sep: rdi = NUL-terminated argv value -> sep_buf/sep_len. Decodes exactly
 ; \n, \t, \r, \0 and \\; every other byte is literal. The result is a byte
 ; string, not a C string, and may contain NUL. Errors exit through die.
 ; Only caller-saved registers are touched; r12 stays the argv index.
+    global parse_sep:function (parse_sep.end_func - parse_sep)
 parse_sep:
     lea rsi, [sep_buf]
     xor ecx, ecx                       ; decoded bytes
@@ -1535,8 +1615,10 @@ parse_sep:
     jz bad_sep_empty
     mov [sep_len], rcx
     ret
+parse_sep.end_func:
 
 ; startswith: rdi = string, rsi = prefix -> ZF=1 if string begins with prefix
+    global startswith:function (startswith.end_func - startswith)
 startswith:
     xor ecx, ecx
 .loop:
@@ -1553,9 +1635,11 @@ startswith:
 .no:
     or eax, 1                          ; ZF=0
     ret
+startswith.end_func:
 
 ; cpu_count -> rax = walking thread count, 2..MAX_THREADS (the main thread
 ; writes and is not counted). -DFORCE_THREADS=n pins it for stress tests.
+    global cpu_count:function (cpu_count.end_func - cpu_count)
 cpu_count:
 %ifdef FORCE_THREADS
     mov eax, FORCE_THREADS
@@ -1593,11 +1677,13 @@ cpu_count:
 .fallback:
     mov eax, 4
     ret
+cpu_count.end_func:
 
 ; thread_main: entered by a fresh clone with r12 = its id, r13 = its state block
 ; and its own stack.  Every thread claims groups from the shared work stack
 ; until pending is zero; whoever claims the root group performs its prepass and
 ; publishes the first level for the others.
+    global thread_main:function (thread_main.end_func - thread_main)
 thread_main:
     mov r14, r13
     mov [r14+TSTATE.id], r12
@@ -1606,9 +1692,11 @@ thread_main:
     mov eax, 60                      ; SYS_exit: leave the other threads alone
     xor edi, edi
     syscall
+thread_main.end_func:
 
 ; run_workers: claim NEW groups from the LIFO until pending is zero and none
 ; are left.  The snapshot-before-check protocol prevents lost wake-ups.
+    global run_workers:function (run_workers.end_func - run_workers)
 run_workers:
 .loop:
     mov edx, [ev_seq]
@@ -1630,9 +1718,11 @@ run_workers:
     jmp .loop
 .done:
     ret
+run_workers.end_func:
 
 ; pop_group -> rax = a NEW group, now RUNNING, or 0.  Stale stack entries for
 ; groups that another worker already claimed, or that finished, are skipped.
+    global pop_group:function (pop_group.end_func - pop_group)
 pop_group:
 .retry:
     mov rax, [work_head]
@@ -1651,10 +1741,12 @@ pop_group:
 .none:
     xor eax, eax
     ret
+pop_group.end_func:
 
 ; notify_ev: something the writer or an idle worker may be waiting for changed.
 ; The increment is the full barrier that orders the caller's stores before the
 ; waiter check; a waiter that registers later sees the new value in the futex.
+    global notify_ev:function (notify_ev.end_func - notify_ev)
 notify_ev:
     lock inc dword [ev_seq]
     cmp dword [ev_waiters], 0
@@ -1666,10 +1758,12 @@ notify_ev:
     syscall
 .ret:
     ret
+notify_ev.end_func:
 
 ; ev_sleep: edx = the ev_seq value read BEFORE the caller's last look at the
 ; state, r10 = relative timeout or 0. A change in between makes the futex
 ; return at once, so no wake-up can be lost.
+    global ev_sleep:function (ev_sleep.end_func - ev_sleep)
 ev_sleep:
     lock inc dword [ev_waiters]
     lea rdi, [ev_seq]
@@ -1678,11 +1772,13 @@ ev_sleep:
     syscall
     lock dec dword [ev_waiters]
     ret
+ev_sleep.end_func:
 
 ; walk_group: rdi = GRP.  Saves the caller's walk context, executes the group's
 ; directory or range body, marks it DONE, then helps any child groups that are
 ; still NEW.  f_deep is deliberately preserved: an inline child runs while the
 ; caller's directory descriptors are still open.
+    global walk_group:function (walk_group.end_func - walk_group)
 walk_group:
     push rbx
     push rbp
@@ -1787,9 +1883,11 @@ walk_group:
     pop rbp
     pop rbx
     ret
+walk_group.end_func:
 
 ; push_group: rdi = a fully initialised NEW group.  Publish it on the global
 ; LIFO and account for it before the notify.
+    global push_group:function (push_group.end_func - push_group)
 push_group:
     lock inc qword [pending]
 .retry:
@@ -1798,10 +1896,12 @@ push_group:
     lock cmpxchg [work_head], rdi
     jne .retry
     jmp notify_ev
+push_group.end_func:
 
 ; make_group: rdi = path length.  Copies path_buf[0..len) and the current ignore
 ; chain into a fully initialised NEW directory group and pushes it.  The group
 ; is not linked yet; the wide prepass builds all siblings before publishing.
+    global make_group:function (make_group.end_func - make_group)
 make_group:
     lock inc qword [group_count]
     push rbx
@@ -1841,12 +1941,14 @@ make_group:
     pop rbp
     pop rbx
     ret
+make_group.end_func:
 
 ; link_group: rdi = a NEW (or already claimed/done) child group.  Close the
 ; current text record so the group lands at this exact output position, link
 ; it, then claim it if it is still NEW.  Claiming means executing it inline;
 ; the wide prepass has already pushed every sibling, so this cannot serialise
 ; the level.  If another worker claimed it, that worker owns it.
+    global link_group:function (link_group.end_func - link_group)
 link_group:
     push rbx
     push r15
@@ -1872,10 +1974,12 @@ link_group:
     pop r15
     pop rbx
     ret
+link_group.end_func:
 
 ; help_group: rdi = a completed group.  Make one pass over its immutable item
 ; list and execute any child group still NEW.  Children claimed by another
 ; worker are simply skipped; text records are not work.
+    global help_group:function (help_group.end_func - help_group)
 help_group:
     push rbx
     push rbp
@@ -1909,23 +2013,29 @@ help_group:
     pop rbp
     pop rbx
     ret
+help_group.end_func:
 
 ; mark_done: rdi = record. Its blocks and HEAD are final; tell the writer.
+    global mark_done:function (mark_done.end_func - mark_done)
 mark_done:
     mov dword [rdi+REC_DONE], 1
     jmp notify_ev
+mark_done.end_func:
 
 ; emit_main: the main thread.  It walks the output tree in order, writing each
 ; record as its producer fills it, and flushes whenever it has to wait.
+    global emit_main:function (emit_main.end_func - emit_main)
 emit_main:
     lea rdi, [root_grp]
     jmp emit_group
+emit_main.end_func:
 
 ; emit_group: rdi = root group.  One explicit stack frame per open group:
 ;   +0 group, +8 current tagged item, +16 ready byte (24-byte stride).
 ; The current item is kept until its NEXT is known to be zero and the group is
 ; observed DONE; STATE is always read before FIRST/NEXT.  See
 ; IMPL_TASK_SPLIT.md section 7.
+    global emit_group:function (emit_group.end_func - emit_group)
 emit_group:
     push rbx
     push rbp
@@ -2054,11 +2164,13 @@ emit_group:
     pop rbp
     pop rbx
     ret
+emit_group.end_func:
 
 ; emit_record: rbx = record. Writes its blocks as they fill, hands each block
 ; back to its owner once written, returns when the record is done and drained.
 ; Clobbers rbp (current block), r13 (bytes of it written), r14 (done snapshot),
 ; r15 (ev_seq snapshot).
+    global emit_record:function (emit_record.end_func - emit_record)
 emit_record:
     xor ebp, ebp
     xor r13d, r13d
@@ -2109,10 +2221,12 @@ emit_record:
     call recycle
 .ret:
     ret
+emit_record.end_func:
 
 ; recycle: rdi = a block the writer is done with. Back to its owner's list (only
 ; the owner takes from it, and takes everything at once, so no ABA), and wake
 ; one producer that was waiting for room.
+    global recycle:function (recycle.end_func - recycle)
 recycle:
     mov rax, [rdi+BLK_OWNER]
     shl rax, 6
@@ -2134,6 +2248,7 @@ recycle:
     syscall
 .ret:
     ret
+recycle.end_func:
 
 ; out_put: rdi = bytes, rsi = length. One buffered write() per OUT_SZ, so a
 ; 1.5M-line search is a few hundred syscalls instead of one per line.
@@ -2145,6 +2260,7 @@ recycle:
 ; calls. A payload fits in OUT_SZ, so a flush never splits one.
 ; shortcut: frames never span blocks, so a chunk always holds whole frames.
 ; out_put pushes rbx/r12/r13, so emit_record's callee-saved registers survive.
+    global out_put:function (out_put.end_func - out_put)
 out_put:                                ; rdi = bytes, rsi = length
     push rbx
     push r12
@@ -2213,7 +2329,9 @@ out_put:                                ; rdi = bytes, rsi = length
     pop r12
     pop rbx
     ret
+out_put.end_func:
 
+    global out_flush:function (out_flush.end_func - out_flush)
 out_flush:
     push rbx                         ; syscall clobbers rcx and r11
     xor ebx, ebx                     ; bytes successfully written
@@ -2239,12 +2357,14 @@ out_flush:
     mov qword [out_len], 0
     pop rbx
     ret
+out_flush.end_func:
 
 ; alloc: rdi = size -> rax = arena bytes. Whole chunks are reserved with one
 ; cmpxchg on g_resv, so threads only meet at chunk granularity. Clobbers rax,
 ; rcx, rdx, rdi and nothing else: callers keep cursors in r8/r9/rsi across it
 ; (load_ignore's buffer cursor and walk_dir's name pointer both did, and a
 ; chunk reservation that clobbered r8 corrupted them).
+    global alloc:function (alloc.end_func - alloc)
 alloc:
     ; round the request up: tagged item pointers use bit 0, so every block has
     ; to start 8-aligned (the arena base and every chunk are, being page sizes)
@@ -2280,10 +2400,12 @@ alloc:
 .store:
     mov [r14+TSTATE.my_top], rcx
     ret
+alloc.end_func:
 
 ; salloc: rdi = size -> rax = scratch bytes. Stack discipline: walk_dir notes
 ; sc_top on entry and puts it back on exit, so a directory's names, sort table
 ; and rules die with its frame. Clobbers rax, rcx, rdi.
+    global salloc:function (salloc.end_func - salloc)
 salloc:
     add rdi, 7
     and rdi, -8
@@ -2293,14 +2415,18 @@ salloc:
     ja scratch_full
     mov [r14+TSTATE.sc_top], rcx
     ret
+salloc.end_func:
 
 ; ig_alloc: rdi = size.  Groups can outlive the frame that loaded their rules,
 ; so every ignore node/rule array is arena-backed now.
+    global ig_alloc:function (ig_alloc.end_func - ig_alloc)
 ig_alloc:
     jmp alloc
+ig_alloc.end_func:
 
 ; get_block -> rax = an empty block owned by this thread. Waits while
 ; BLK_LIMIT blocks are in flight, unless the writer is waiting on our record.
+    global get_block:function (get_block.end_func - get_block)
 get_block:
     push rbx
 .admit:
@@ -2346,6 +2472,7 @@ get_block:
     mov qword [rax+BLK_USED], 0
     pop rbx
     ret
+get_block.end_func:
 
 ; tolower the byte in al (ASCII only)
 %macro TOLOWER 1
@@ -2357,21 +2484,19 @@ get_block:
 %%done:
 %endmacro
 
-; name_match: rdi = name, rsi = pattern, rdx = pattern length -> al
-; literal substring search, two loops picked once by pat_ci. The folded one
-; folds both bytes: pat_ci=1 means fold both bytes. In smart mode,
-; folding a pattern byte is the identity.
+; Long-pattern fallback: the scalar loop, used only when pat_len > PAT_BUF.
+; rbx = name, r12 = pattern, r13 = length; jumps to name_match.ret.
 %macro MATCH_BODY 1
 %%outer:
     cmp byte [rbx], 0
     je %%no
     mov rdi, rbx
-    mov rsi, r13
-    mov rcx, r14
+    mov rsi, r12
+    mov rcx, r13
 %%inner:
     mov dl, [rdi]
     test dl, dl
-    jz %%next                        ; name ended inside the pattern
+    jz %%next
     mov al, [rsi]
 %if %1
     TOLOWER dl
@@ -2392,29 +2517,196 @@ get_block:
     xor eax, eax
     jmp .ret
 %endmacro
+
+; name_match: rdi = name, rsi = pattern, rdx = pattern length -> al
+; Literal substring search over a 16-byte-padded pattern copy (folded when
+; pat_ci is set). Each window finds the positions whose first byte can start a
+; match -- (name byte | 0x20) == (pattern[0] | 0x20) is a superset of the folded
+; equality -- and each candidate is verified with 16-byte compares. Both phases
+; read at most 15 bytes past the name's NUL, which the dirent buffer (followed
+; by igbuf) and the scratch region (16-byte tail guard) make safe. A pattern
+; longer than PAT_BUF uses the scalar loop, which never over-reads.
+; Clobbers rax, rcx, rdx, rsi, rdi, xmm0-xmm6; keeps r8-r11, r15.
+    global name_match:function (name_match.end_func - name_match)
 name_match:
     push rbx
     push r12
     push r13
-    push r14
-    mov rbx, rdi                     ; current start in the name
-    mov r13, rsi
-    mov r14, rdx
-    test r14, r14
-    jz .yes                          ; an empty pattern matches every entry
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    test r13, r13
+    jz .yes
+    cmp r13, PAT_BUF
+    ja .long_pat
     cmp qword [pat_ci], 0
     jne .ci
-    MATCH_BODY 0
+.cs:
+    movzx eax, byte [r12]
+    movd xmm3, eax
+    punpcklbw xmm3, xmm3
+    punpcklwd xmm3, xmm3
+    pshufd xmm3, xmm3, 0             ; pattern[0] in every byte
+    pxor xmm4, xmm4
+    xor ecx, ecx
+.cs_window:
+    movdqu xmm0, [rbx+rcx]
+    movdqa xmm1, xmm0
+    pcmpeqb xmm1, xmm3
+    pmovmskb eax, xmm1               ; candidate start positions
+    pcmpeqb xmm0, xmm4
+    pmovmskb edx, xmm0               ; NUL positions
+    movd xmm6, edx
+    test edx, edx
+    jz .cs_cand_ready
+    bsf esi, edx                    ; candidates must start before the NUL
+    lea rdi, [nul_below]
+    and eax, [rdi+rsi*4]
+.cs_cand_ready:
+    test eax, eax
+    jz .cs_advance
+.cs_cand:
+    tzcnt esi, eax
+    btr eax, esi
+    push rax
+    lea rdi, [rbx+rcx]
+    add rdi, rsi
+    call .verify_cs
+    test eax, eax
+    pop rax
+    jnz .yes
+    test eax, eax
+    jnz .cs_cand
+.cs_advance:
+    movd edx, xmm6
+    test edx, edx
+    jnz .no
+    add ecx, 16
+    jmp .cs_window
 .ci:
+    movzx eax, byte [r12]
+    or al, 0x20
+    movd xmm3, eax
+    punpcklbw xmm3, xmm3
+    punpcklwd xmm3, xmm3
+    pshufd xmm3, xmm3, 0             ; pattern[0] folded, in every byte
+    pxor xmm4, xmm4
+    xor ecx, ecx
+.ci_window:
+    movdqu xmm0, [rbx+rcx]
+    movdqa xmm1, xmm0
+    por xmm1, [c_fold]
+    pcmpeqb xmm1, xmm3
+    pmovmskb eax, xmm1
+    pcmpeqb xmm0, xmm4
+    pmovmskb edx, xmm0
+    movd xmm6, edx
+    test edx, edx
+    jz .ci_cand_ready
+    bsf esi, edx                    ; candidates must start before the NUL
+    lea rdi, [nul_below]
+    and eax, [rdi+rsi*4]
+.ci_cand_ready:
+    test eax, eax
+    jz .ci_advance
+.ci_cand:
+    tzcnt esi, eax
+    btr eax, esi
+    push rax
+    lea rdi, [rbx+rcx]
+    add rdi, rsi
+    call .verify_ci
+    test eax, eax
+    pop rax
+    jnz .yes
+    test eax, eax
+    jnz .ci_cand
+.ci_advance:
+    movd edx, xmm6
+    test edx, edx
+    jnz .no
+    add ecx, 16
+    jmp .ci_window
+
+; verify_cs: rdi = candidate start -> al
+.verify_cs:
+    mov rsi, rdi
+    mov rdi, r12
+    mov rdx, r13
+.vcs_block:
+    movdqu xmm0, [rsi]
+    movdqu xmm5, [rdi]
+    pcmpeqb xmm0, xmm5
+    pmovmskb eax, xmm0
+    cmp rdx, 16
+    jbe .vcs_tail
+    cmp eax, 0xffff
+    jne .vno
+    add rsi, 16
+    add rdi, 16
+    sub rdx, 16
+    jmp .vcs_block
+.vcs_tail:
+    lea rdi, [lowmask]
+    and eax, [rdi+rdx*4]
+    cmp eax, [rdi+rdx*4]
+    jne .vno
+    mov eax, 1
+    ret
+
+; verify_ci: rdi = candidate start -> al; folds the name bytes exactly
+.verify_ci:
+    mov rsi, rdi
+    mov rdi, r12
+    mov rdx, r13
+.vci_block:
+    movdqu xmm0, [rsi]
+    movdqa xmm1, [c_upper_hi]
+    pcmpgtb xmm1, xmm0               ; 0x5b > x
+    movdqa xmm2, xmm0
+    pcmpgtb xmm2, [c_upper_lo]       ; x > 0x40
+    pand xmm1, xmm2
+    pand xmm1, [c_fold]
+    por xmm0, xmm1                   ; tolower(x)
+    movdqu xmm5, [rdi]
+    pcmpeqb xmm0, xmm5
+    pmovmskb eax, xmm0
+    cmp rdx, 16
+    jbe .vci_tail
+    cmp eax, 0xffff
+    jne .vno
+    add rsi, 16
+    add rdi, 16
+    sub rdx, 16
+    jmp .vci_block
+.vci_tail:
+    lea rdi, [lowmask]
+    and eax, [rdi+rdx*4]
+    cmp eax, [rdi+rdx*4]
+    jne .vno
+    mov eax, 1
+    ret
+.vno:
+    xor eax, eax
+    ret
+
+.long_pat:
+    cmp qword [pat_ci], 0
+    jne .long_ci
+    MATCH_BODY 0
+.long_ci:
     MATCH_BODY 1
+.no:
+    xor eax, eax
+    jmp .ret
 .yes:
     mov eax, 1
 .ret:
-    pop r14
     pop r13
     pop r12
     pop rbx
     ret
+name_match.end_func:
 
 ; The table of a directory holds 16-byte entries {key, name pointer}; two
 ; metadata bytes precede each pointed-to name. The key is
@@ -2429,6 +2721,7 @@ name_match:
 ; before the NUL of the shorter one, so bytes past a NUL never decide.
 ; Reads up to 7 bytes past a name: scratch regions keep a 16-byte tail guard.
 ; Clobbers rax, rcx, rdx, xmm0, xmm1.
+    global tie_cmp:function (tie_cmp.end_func - tie_cmp)
 tie_cmp:
     mov ecx, 8
 .word:
@@ -2461,9 +2754,11 @@ tie_cmp:
 .gt:
     mov eax, 1
     ret
+tie_cmp.end_func:
 
 ; isort: insertion-sort the entries in [r8, r9). Clobbers rax, rcx, rdx, rsi,
 ; rdi, r10, r11, rbp, r12, xmm0, xmm1.
+    global isort:function (isort.end_func - isort)
 isort:
     lea r10, [r8+16]                 ; next entry to insert
 .next:
@@ -2498,9 +2793,11 @@ isort:
     jmp .next
 .done:
     ret
+isort.end_func:
 
 ; merge: left run [r8, r9) and right run [r10, r11) -> ascending at rbp.
 ; Clobbers rax, rcx, rdx, rsi, rdi, r8, r10, rbp, xmm0, xmm1.
+    global merge:function (merge.end_func - merge)
 merge:
 .cmp:
     cmp r8, r9
@@ -2545,12 +2842,14 @@ merge:
     mov rdi, rbp
     rep movsb
     ret
+merge.end_func:
 
 ; sort_table: sort the rcx entries at r15 by name, bytewise. Up to SORT_RUN
 ; entries (nearly every directory) go through insertion sort; above that,
 ; insertion-sorted runs are merged bottom-up through a temporary buffer in
 ; scratch that is released again before returning. O(n log n), and mostly
 ; integer compares of cached keys. Preserves rbx, r12-r14; clobbers the rest.
+    global sort_table:function (sort_table.end_func - sort_table)
 sort_table:
     cmp rcx, 2
     jb .quick
@@ -2652,6 +2951,7 @@ sort_table:
     pop rbx
 .quick:
     ret
+sort_table.end_func:
 
 ; print_entry: rdi = path length, rsi = is dir. Appends "path[/]SEP" straight
 ; into the current record's last block (a new block when the line does not fit)
@@ -2662,6 +2962,7 @@ sort_table:
 ; are a frame: a u16 little-endian payload length followed by the payload
 ; "path[/]SEP". Frames are internal to the block; BLK_USED counts framed bytes,
 ; a frame never spans blocks, and it is published only after the whole frame.
+    global print_entry:function (print_entry.end_func - print_entry)
 print_entry:
     push rbx
     push r12
@@ -2738,10 +3039,12 @@ print_entry:
     pop r12
     pop rbx
     ret
+print_entry.end_func:
 
 ; append_item: rdi = owning group, rsi = item, edx = 1 for a GRP, 0 for a REC.
 ; Publishes one link at the end of the group's item list.  The item's NEXT is
 ; cleared before the link becomes visible.
+    global append_item:function (append_item.end_func - append_item)
 append_item:
     mov r8, rsi
     or r8, rdx                       ; tagged item
@@ -2769,8 +3072,10 @@ append_item:
 .last:
     mov [rdi+GRP_LAST], r8
     jmp notify_ev
+append_item.end_func:
 
 ; new_text_record: the walking thread starts a record for its own lines
+    global new_text_record:function (new_text_record.end_func - new_text_record)
 new_text_record:
     push rbx
     mov rdi, REC_SZ
@@ -2786,8 +3091,10 @@ new_text_record:
     mov qword [r14+cur_blk], 0
     pop rbx
     ret
+new_text_record.end_func:
 
 
+    global die:function (die.end_func - die)
 die:                                 ; rsi, rdx = message; exits 1
     cmp qword [err_path], 0
     je .write
@@ -2846,6 +3153,7 @@ die:                                 ; rsi, rdx = message; exits 1
     mov rax, 231                     ; exit_group: the workers die with us
     mov rdi, 1
     syscall
+die.end_func:
 
 wfail:
     lea rsi, [e_write]
@@ -2993,6 +3301,7 @@ scratch_full:
 ; number of path components, "/**" at the end spans everything below.
 ; Case flags (--case-sensitive / --case-insensitive) apply only to the search pattern;
 ; .gitignore pattern matching is always exact (case-sensitive).
+    global globmatch:function (globmatch.end_func - globmatch)
 globmatch:
     push rbx
     push r12
@@ -3089,11 +3398,13 @@ globmatch:
     pop r12
     pop rbx
     ret
+globmatch.end_func:
 
 ; ig_ignored: rdi = entry name, rsi = entry path, rdx = is dir -> al
 ; ig_chain links one immutable node per directory that has rules, innermost
 ; last. Ancestors are applied before the node itself, so the deepest matching
 ; rule still wins - the order the single-threaded walk appended them in.
+    global ig_ignored:function (ig_ignored.end_func - ig_ignored)
 ig_ignored:
     push rbx
     push rbp
@@ -3113,8 +3424,10 @@ ig_ignored:
     pop rbp
     pop rbx
     ret
+ig_ignored.end_func:
 
 ; ig_levels: apply r15's rules, then its ancestors'
+    global ig_levels:function (ig_levels.end_func - ig_levels)
 ig_levels:
     mov rax, [r15+NODE_PARENT]
     test rax, rax
@@ -3168,10 +3481,12 @@ ig_levels:
     jmp .rule
 .ret:
     ret
+ig_levels.end_func:
 
 ; ig_add_line: rdi = one .gitignore line, NUL-terminated; appends a rule to
 ; this thread's scratch array. rbx (the containing directory's path length)
 ; is used for the prefix.
+    global ig_add_line:function (ig_add_line.end_func - ig_add_line)
 ig_add_line:
     mov al, [rdi]
     test al, al
@@ -3268,11 +3583,13 @@ ig_add_line:
     inc qword [r14+ig_nrules]
 .ret:
     ret
+ig_add_line.end_func:
 
 ; load_ignore: read this directory's .gitignore (if this is a repo) into
 ; igbuf and append its rules; rbx = directory path length.
 ; If it added any, publish a chain node holding a copy of the whole active
 ; rule stack, so child groups created below it keep their ancestors' rules.
+    global load_ignore:function (load_ignore.end_func - load_ignore)
 load_ignore:
     push rbx
     push r12
@@ -3399,6 +3716,7 @@ load_ignore:
     pop r12
     pop rbx
     ret
+load_ignore.end_func:
 
 ; arena_put: append [d_type][matched][name,0] with a three-byte header, using
 ; packed metadata in rdi.
@@ -3407,6 +3725,7 @@ load_ignore:
 ; avoided by allocating d_reclen, but that wastes ~27 bytes per entry (~80 MB on
 ; /nix/store). Clobbers rax, rcx, rdx, rsi, rdi - not r8-r11/r14/r15, which the
 ; directory loop is holding.
+    global arena_put:function (arena_put.end_func - arena_put)
 arena_put:
     push rbx
     push r12
@@ -3442,9 +3761,11 @@ arena_put:
     pop r12
     pop rbx
     ret
+arena_put.end_func:
 
 ; grow_table: double the current directory's pointer table into fresh scratch.
 ; The old copy is garbage until walk_dir's frame ends and gives all of it back.
+    global grow_table:function (grow_table.end_func - grow_table)
 grow_table:
     push rbx
     mov rbx, [r14+TSTATE.tab_ptr]
@@ -3468,6 +3789,7 @@ grow_table:
     rep movsb
     pop rbx
     ret
+grow_table.end_func:
 
 ; try_range_split: rdi = sorted {key,name} table, rsi = N.  If the directory is
 ; large enough, copy contiguous slices of the table and its name records into
@@ -3475,6 +3797,7 @@ grow_table:
 ; slab and no refcount.  All ranges are pushed first, then linked in order, so
 ; the first range can be claimed by the owner while workers take the rest.
 ; Returns eax=1 after publishing the groups.
+    global try_range_split:function (try_range_split.end_func - try_range_split)
 try_range_split:
     push rbx
     push rbp
@@ -3634,6 +3957,7 @@ try_range_split:
     pop rbp
     pop rbx
     ret
+try_range_split.end_func:
 
 ; walk_wide: rdi = sorted table, rsi = N.  Prepass resolves types and filters,
 ; creating and pushing a group for every non-ignored directory before any of
@@ -3641,6 +3965,7 @@ try_range_split:
 ; lines and links each child; a child still NEW is claimed and executed inline.
 ; Because every sibling is already on the work stack, that inline execution
 ; cannot serialise the level and cannot deadlock the writer.
+    global walk_wide:function (walk_wide.end_func - walk_wide)
 walk_wide:
     push rbx
     push rbp
@@ -3806,6 +4131,7 @@ walk_wide:
     pop rbp
     pop rbx
     ret
+walk_wide.end_func:
 
 ; walk_dir: search the directory at path_buf[0..path_len) (empty = cwd).
 ; Entries are collected first, sorted by name, then printed and recursed in
@@ -3816,6 +4142,7 @@ walk_wide:
 ; directory. Sorting is never skipped, whatever the directory size.
 ; Everything the frame allocates in scratch (names, table, and rules) is
 ; released when it returns: [rsp+48] holds the mark.
+    global walk_dir:function (walk_dir.end_func - walk_dir)
 walk_dir:
     push rbx
     push rbp
@@ -4242,10 +4569,12 @@ walk_dir:
     pop rbp
     pop rbx
     ret
+walk_dir.end_func:
 
 ; walk_range: execute a range group.  The group owns a sorted copy of its
 ; slice's table and names.  Directories are walked inline, in range order, so
 ; the range output stays contiguous and cannot depend on another worker.
+    global walk_range:function (walk_range.end_func - walk_range)
 walk_range:
     push rbx
     push rbp
@@ -4355,3 +4684,4 @@ walk_range:
     pop rbp
     pop rbx
     ret
+walk_range.end_func:
