@@ -1,206 +1,344 @@
 # zfind
 
-`zfind` searches file and directory names under the current directory. It searches recursively and in parallel.
+A high-performance, parallel recursive file search utility for Linux.
+
+`zfind` traverses directory trees concurrently and matches filenames using literal substring queries. Designed with deterministic depth-first ordering, smart-case sensitivity, and script-friendly output formats, it provides a fast and predictable foundation for interactive shell usage and automated pipelines.
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Installation](#installation)
+  - [Pre-built Binaries](#pre-built-binaries)
+  - [Building from Source](#building-from-source)
+- [Usage](#usage)
+  - [Syntax](#syntax)
+  - [Common Recipes](#common-recipes)
+- [Options Reference](#options-reference)
+- [Search & Matching Mechanics](#search--matching-mechanics)
+  - [Pattern Matching & Smart Case](#pattern-matching--smart-case)
+  - [Hidden Files & Directories](#hidden-files--directories)
+  - [Symlinks & Type Filtering](#symlinks--type-filtering)
+  - [Output Format & Separators](#output-format--separators)
+  - [Result Limiting](#result-limiting)
+- [Gitignore Support](#gitignore-support)
+- [Configuration](#configuration)
+  - [File Resolution](#file-resolution)
+  - [Format & Syntax](#format--syntax)
+  - [Precedence & Merging](#precedence--merging)
+- [Release Workflow](#release-workflow)
+
+---
+
+## Features
+
+- **Blazing Fast & Parallel:** Concurrent recursive traversal optimized for modern multi-core x86-64 processors.
+- **Deterministic Output:** Results are sorted lexicographically by name within each directory and emitted in depth-first order.
+- **Smart Case by Default:** Case-insensitive search if the query is all-lowercase; automatically switches to case-sensitive when an uppercase ASCII character is present.
+- **Safe Pipeline Integration:** Built-in support for NUL (`\0`) and custom delimiters makes piping to `xargs -0` robust and injection-safe.
+- **Exact Literal Matching:** Never worry about unexpected globbing or regex syntax quirks—queries match raw substring bytes directly.
+- **Flexible Exclusions:** Fast exact basename pruning (`--exclude-name`) and nested `.gitignore` parsing.
+- **Persistent Configuration:** Configure project or user defaults via XDG-compliant config files with full CLI override support.
+
+---
+
+## Quick Start
+
+```sh
+# Search for any file or directory containing "config"
+zfind config
+
+# Search files only, excluding node_modules and .git
+zfind --type f --exclude-name=node_modules --exclude-name=.git cargo
+
+# Respect .gitignore rules and limit output to 10 entries
+zfind --gitignore --limit 10 main
+
+# Safely delete all temporary cache directories
+zfind --type d --separator='\0' .cache | xargs -0 rm -rf
+```
+
+---
+
+## Installation
+
+### Pre-built Binaries
+
+Pre-compiled standalone binaries are published for each version on the GitHub Releases page:
+
+1. Download `zfind-linux-x86_64-v3` from the latest release.
+2. Make the binary executable:
+   ```sh
+   chmod +x zfind-linux-x86_64-v3
+   sudo mv zfind-linux-x86_64-v3 /usr/local/bin/zfind
+   ```
+
+> [!NOTE]
+> The binary requires an **x86-64-v3** compatible processor (supporting AVX, AVX2, BMI1, BMI2, and MOVBE; generally Intel Haswell / AMD Excavator or newer).
+
+### Building from Source
+
+The repository includes a Nix flake for reproducible builds.
+
+1. **Enter the Nix development environment:**
+   ```sh
+   nix develop
+   ```
+
+2. **Build the binary:**
+   ```sh
+   make
+   ```
+   The compiled binary will be placed in `build/x86_64/zfind`.
+
+3. **Targeting other architectures:**
+   Sources are structured per architecture under `src/<ARCH>/`. To build for an alternative supported target:
+   ```sh
+   make ARCH=x86_64
+   ```
+
+---
 
 ## Usage
 
-```sh
+### Syntax
+
+```text
 zfind [OPTIONS] [--] [PATTERN]
 ```
 
-`PATTERN` is optional. When provided, zfind finds entries whose names contain that literal text. Regex and glob patterns are not supported. Without a pattern, it lists every entry unless `--type` restricts the result types.
+- **`PATTERN`** is optional. When omitted, `zfind` lists every traversed entry (subject to `--type` and exclusion filters). When provided, it performs a literal substring search on entry names. Regex and glob expansions are not supported.
+- **Options** must precede `PATTERN`.
+- **`--`** explicitly terminates option parsing. Any subsequent token is treated as `PATTERN`, which is necessary when searching for names beginning with a hyphen (e.g., `zfind -- -draft`).
+- **`--help`** can be passed anywhere before `--` (including where an option value or pattern would otherwise appear). It immediately prints help text and exits.
 
-Options must appear before `PATTERN`. `--` ends option parsing; any argument following `--` is treated as `PATTERN`.
+---
 
+### Common Recipes
+
+#### Basic & Case-Sensitive Searching
 ```sh
-zfind config                    # Find names containing "config"
-zfind --case-sensitive foo      # Case-sensitive search for "foo"
-zfind --case-insensitive FOO    # Case-insensitive search for "FOO"
-zfind --hidden TODO             # Find names containing "TODO", hidden entries included
-zfind --no-hidden TODO          # Find names containing "TODO" and skip hidden entries
-zfind --gitignore Cargo         # Find names containing "Cargo" and apply supported .gitignore rules
-zfind --no-gitignore Cargo      # Search without applying .gitignore rules (the default)
-zfind --exclude-name=.git --exclude-name=node_modules config
-zfind --exclude-name='a*b' config   # literal a*b, not a glob
-zfind --separator='\0' --limit 100 .conf  # Print up to 100 matches, NUL-separated
-zfind --separator='\t' config   # Print matches separated by tabs
-zfind --type f                  # List regular files, traversing directories as usual
-zfind --type f --type d         # List regular files and directories
-zfind --config ./zfind.conf foo # Read settings from this file instead of the default config
-zfind --no-config foo           # Ignore the config file for this run
+zfind test                  # Smart case: matches "test", "Test", "TEST"
+zfind Test                  # Smart case: matches only "Test", "Testing", etc.
+zfind --case-sensitive foo  # Force exact case-sensitive byte comparison
+zfind --case-insensitive FOO # Force case-insensitive match for "foo", "Foo", etc.
 ```
 
-## Matching and output
+#### Traversal & File Types
+```sh
+zfind --type f              # List all regular files
+zfind --type d              # List all directories (output ends with /)
+zfind --type f --type d     # List both regular files and directories (excludes symlinks)
+```
 
-- By default, matching ignores case unless the pattern contains an uppercase ASCII letter (`A`–`Z`, smart case).
-- `--case-sensitive` forces case-sensitive byte comparison.
-- `--case-insensitive` forces ASCII case-insensitive comparison, regardless of whether the pattern contains uppercase letters.
-- Combining `--case-sensitive` and `--case-insensitive` is a usage error.
-- Case folding is ASCII-only (`A`–`Z`). Non-ASCII bytes are compared unchanged in all modes.
-- Case flags affect only `PATTERN` matching; `.gitignore` and `--exclude-name` matching are unaffected.
-- Hidden entries, including `.git/`, are searched by default. `--hidden`
-  states that explicitly; on its own it changes no results. `--no-hidden`
-  skips them and their contents; combining the two is a usage error.
-- Results are sorted by name within each directory. Output follows depth-first order.
-- Paths are relative to the current directory. Directory results end with `/`.
-- Each result is terminated by the selected separator, including the last one. Newline is the default. A run with no results writes nothing.
-- zfind does not follow symlinked directories. Explicit `--type f` and
-  `--type d` filters exclude symlinks, including symlinks to files and directories.
+#### Filtering & Ignoring
+```sh
+zfind --no-hidden TODO      # Skip dotfiles/hidden directories like .git/ or .env
+zfind --gitignore Cargo     # Apply .gitignore rules (requires .git in current directory)
+zfind --exclude-name=target --exclude-name=dist bundle
+zfind --exclude-name='a*b'  # Matches the literal name "a*b", not a glob
+```
 
-## Options
+#### Pipelines & Tool Integration
+```sh
+# Process matched files safely with xargs (handles spaces and newlines)
+zfind --type f --separator='\0' log | xargs -0 grep -H "ERROR"
 
-- `--help` Show help and exit. A pre-scan recognizes `--help` anywhere before `--`, including after the pattern or where an option value would normally go.
-- `--separator STR`, `--separator=STR` Terminate each result with `STR` instead of newline. The decoded value must be 1–64 bytes. Recognized escapes are `\n`, `\t`, `\r`, `\0`, and `\\`; unknown backslash escapes are rejected, and other bytes, including real control characters, are literal. `--separator` consumes the next token greedily as its value, even if it starts with `-`; repeated uses are last-wins. Pass the escape text literally, for example `--separator='\t'`. Do not use bash `$'\0'` for NUL: bash truncates the argument at the NUL byte and makes zfind see an empty value; use `--separator='\0'`. Only NUL guarantees unambiguous parsing, because a filename cannot contain NUL; a custom separator can appear in a filename or be formed across adjacent output bytes.
-- `--case-sensitive` Match pattern case-sensitively. Must appear before `PATTERN`.
-- `--case-insensitive` Match pattern case-insensitively (ASCII `A`–`Z`). Must appear before `PATTERN`.
-- `--gitignore` Apply supported `.gitignore` rules and skip the `.git`
-  entry itself. Conflicts with `--no-gitignore`. See
-  [Gitignore support](#gitignore-support).
-- `--no-gitignore` Do not apply `.gitignore` rules; this is the default. The
-  `.git` entry is not pruned. Conflicts with `--gitignore`.
-- `--hidden` Search hidden entries (the default). On its own this changes no
-  results; combining it with `--no-hidden` is a usage error.
-- `--no-hidden` Skip names that begin with `.`, including hidden directories and everything inside them.
-- `--exclude-name NAME`, `--exclude-name=NAME` Skip every entry whose basename
-  is exactly `NAME`. Repeatable; repeating a name has no additional effect.
-  Matching is bytewise and case-sensitive regardless of
-  `--case-sensitive`/`--case-insensitive`; it does not interpret glob or regex
-  syntax, decode backslash escapes, or normalize Unicode. `NAME` must be
-  non-empty and cannot contain `/`. A matching directory is neither printed nor
-  descended. Explicit exclusions always apply, including over `.gitignore`
-  negations. Options must appear before `PATTERN`.
-- `--limit N`, `--limit=N` Print at most `N` results. `0` prints nothing. The limit counts results exactly for every separator, and limited output is the same byte prefix as an unlimited run. Use `--separator='\0'` when a consumer must split the output unambiguously. `--limit` consumes the next token greedily as its value.
-- `--type f|d` Print regular files (`f`) and/or directories (`d`). Repeat the
-  option to select both types; repeated values have no extra effect. Explicit
-  type filters exclude symlinks and special entries. `--type f` still traverses
-  directories so matching files below them can be found. `--type` consumes the next token greedily as its value.
-- `--config PATH`, `--config=PATH` Read settings from `PATH` instead of the
-  default config file. The file must exist. Command-line only; see
-  [Configuration](#configuration). `--config` consumes the next token greedily
-  as its value; a repeated `--config` is last-wins. Conflicts with `--no-config`.
-- `--no-config` Read no config file for this run. Conflicts with `--config`.
-- `--` End option parsing. Put it before a pattern that starts with `-`, as in `zfind -- -draft` to search for the name substring `-draft`. Any following argument is treated as positional (the pattern).
+# Tab-separated output for awk or tabular tools
+zfind --separator='\t' --limit 50 config
 
-## Gitignore support
+# Interactive fuzzy filtering with fzf
+zfind --type f | fzf
+```
 
-By default, zfind does not apply `.gitignore` rules and does not prune `.git`. `--no-gitignore` states this default explicitly. The two gitignore flags cannot be combined. `--gitignore` works only when the current directory contains `.git`; zfind does not search parent directories for a repository. It reads `.gitignore` files as it walks the tree. Rules in deeper directories take precedence over inherited rules. With `--gitignore`, the `.git` entry is never listed, walked, or counted: git never tracks anything under it.
+---
 
-Explicit `--exclude-name` exclusions are independent of `.gitignore` and
-override its rules, including `!` negations. Excluding `.gitignore` itself
-hides the file but does not disable its rules; excluding a directory prevents
-its nested `.gitignore` from being read because the directory is never
-traversed.
+## Options Reference
 
-Supported syntax includes negation (`!`), `*`, `?`, anchored patterns, directory-only patterns ending in `/`, `**/`, and patterns ending in `/**`. This is not full Git compatibility.
+| Option | Value / Argument | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--help` | — | — | Print help text and exit immediately. |
+| `--case-sensitive` | — | Off | Force exact case-sensitive byte matching on `PATTERN`. |
+| `--case-insensitive`| — | Off | Force ASCII case-insensitive matching on `PATTERN`. |
+| `--hidden` | — | Enabled | Search hidden files and directories (names starting with `.`). |
+| `--no-hidden` | — | Off | Prune all hidden files and directories from traversal. |
+| `--gitignore` | — | Off | Parse and apply `.gitignore` rules (skips `.git/`). |
+| `--no-gitignore` | — | Enabled | Do not apply `.gitignore` rules; walk all non-pruned trees. |
+| `--type` | `f` \| `d` | All types | Filter output by regular files (`f`) or directories (`d`). Repeatable. |
+| `--exclude-name` | `NAME` | None | Prune entries whose exact basename matches `NAME`. Repeatable (up to 64). |
+| `--separator` | `STR` (escaped) | `\n` | Terminate each result with `STR` (1–64 bytes). Supports escapes like `\0`, `\t`. |
+| `--limit` | `N` (integer) | Unlimited | Print at most `N` results (`0` prints nothing). |
+| `--config` | `PATH` | System paths | Load persistent configuration from `PATH`. |
+| `--no-config` | — | Off | Bypass all configuration files for this run. |
+| `--` | — | — | Cease option processing; remaining argument is taken as `PATTERN`. |
 
-- zfind does not read parent-directory or global Git ignore rules. It also ignores `.ignore` files.
-- Character classes (`[]`) and backslash escapes are not supported.
-- Other hidden entries are not ignored automatically. The `.git` entry is
-  the exception: `--gitignore` skips it even with `--hidden`, because git
-  never tracks anything under it. Use `--no-hidden` to skip all
-  dot-prefixed entries.
-- Each `.gitignore` file is limited to 65,535 bytes. zfind keeps at most 1,024 rules per directory.
+---
+
+## Search & Matching Mechanics
+
+### Pattern Matching & Smart Case
+
+- **Literal Substrings:** `PATTERN` is checked directly against directory and file basenames. Glob patterns (`*`, `?`) and regular expressions are treated as raw literal bytes.
+- **Smart Case (Default):** Matching is ASCII case-insensitive unless the query string contains at least one uppercase ASCII character (`A`–`Z`), in which case matching becomes case-sensitive.
+- **Explicit Flags:**
+  - `--case-sensitive` overrides default behavior to require exact byte matches.
+  - `--case-insensitive` forces ASCII case folding regardless of whether uppercase characters are present.
+  - Specifying both `--case-sensitive` and `--case-insensitive` in the same invocation triggers a usage error.
+- **Encoding:** Case folding is strictly ASCII-based (`A`–`Z` $\leftrightarrow$ `a`–`z`). Non-ASCII bytes (e.g., UTF-8 multibyte characters) are compared verbatim without normalization.
+- **Scope:** Case flags affect only the search `PATTERN`. `--exclude-name` and `.gitignore` matches are completely unaffected by them.
+
+### Hidden Files & Directories
+
+- By default, hidden entries (names starting with a dot `.`, including `.git/`) are visited and searched.
+- `--hidden` explicitly documents this default behavior and has no additional effect on its own.
+- `--no-hidden` prunes any file or directory starting with `.`. Pruned directories are never traversed.
+- Combining `--hidden` and `--no-hidden` is an error.
+
+### Symlinks & Type Filtering
+
+- `zfind` **never descends into symlinked directories**.
+- By default, all entry types (files, directories, symlinks, special files) are output.
+- `--type f` restricts output to regular files. Directory traversal continues unaffected so child files can be found.
+- `--type d` restricts output to directories. Output paths for directories always end with a trailing slash (`/`).
+- Repeating `--type` (e.g., `--type f --type d`) allows both regular files and directories.
+- Explicit `--type` filters **exclude all symlinks**, even if the target is a regular file or directory.
+
+### Output Format & Separators
+
+- **Ordering:** Output is deterministic. Within any given directory, entries are sorted lexicographically by name. Directories are output in depth-first traversal order.
+- **Relative Paths:** All output paths are relative to the current directory (e.g. `src/main.c`, `build/`).
+- **Separators:** Every match, including the last one, is followed by the chosen separator. If no matches are found, `zfind` writes zero bytes.
+- Custom delimiters can be specified via `--separator STR` or `--separator=STR`:
+  - Decoded length must be between 1 and 64 bytes.
+  - Recognized escape sequences: `\n`, `\t`, `\r`, `\0`, and `\\`.
+  - All other characters (including unescaped control characters) are treated literally. Unrecognized backslash sequences are rejected.
+  - `--separator` greedily takes the next argument token, even if it begins with a hyphen (`-`).
+
+> [!WARNING]
+> In shells such as Bash, passing `--separator=$'\0'` will cause the shell to truncate the argument at the NUL byte, passing an empty string to `zfind`. Always pass escape sequences literally:
+> ```sh
+> zfind --separator='\0' pattern
+> ```
+> Using NUL (`\0`) is the only way to guarantee unambiguous stream parsing, as NUL is the only byte that cannot appear in a POSIX filesystem path.
+
+### Result Limiting
+
+- `--limit N` (or `--limit=N`) halts output after emitting at most `N` results.
+- Setting `--limit 0` writes nothing and exits immediately.
+- The output with `--limit N` is an exact byte-for-byte prefix of an unlimited search run.
+- `--limit` consumes the next token greedily as its numeric value.
+
+### Basename Exclusions (`--exclude-name`)
+
+- `--exclude-name NAME` rejects any entry whose basename equals `NAME` exactly.
+- Matches are case-sensitive and bytewise; they are not affected by `--case-sensitive` or `--case-insensitive`.
+- Globs, regexes, Unicode normalization, and backslash escape sequences are **not** interpreted.
+- `NAME` must be non-empty and must not contain `/`.
+- If a directory matches `NAME`, it is neither printed nor traversed.
+- Exclusions override `.gitignore` negation patterns (`!`).
+- You can specify up to 64 unique `--exclude-name` arguments across the configuration file and command line.
+
+---
+
+## Gitignore Support
+
+By default, `.gitignore` files are ignored, and `.git/` is traversed like any normal directory.
+
+Passing `--gitignore` activates Git-style ignore filtering with the following rules:
+
+1. **Repository Root Requirement:** `--gitignore` only activates if the **current working directory** contains a `.git` entry. `zfind` does not search parent directories for a repository root.
+2. **The `.git` Directory:** When `--gitignore` is enabled, `.git` is never listed, traversed, or counted, even if `--hidden` is passed.
+3. **Hierarchical Traversal:** `.gitignore` files are read dynamically as the directory tree is walked. Rules encountered deeper in the filesystem hierarchy override inherited parent rules.
+4. **Limits:**
+   - Maximum `.gitignore` file size: **65,535 bytes**.
+   - Maximum number of active rules kept per directory: **1,024 rules**.
+5. **Supported Patterns:**
+   - Negation prefixes (`!`)
+   - Wildcards: `*` and `?`
+   - Anchored paths: `/pattern`
+   - Directory-only patterns: `pattern/`
+   - Leading and trailing glob stars: `**/foo` and `foo/**`
+6. **Unsupported Features:**
+   - Character classes (e.g. `[a-z]`)
+   - Backslash escape sequences (e.g. `\#` or `\*`)
+   - Global ignore files (`~/.config/git/ignore`), repo-level `.git/info/exclude`, or `.ignore` files
+
+> [!NOTE]
+> `--exclude-name` takes absolute precedence over `.gitignore`. If a directory is excluded via `--exclude-name`, any `.gitignore` file inside it is never read.
+
+---
 
 ## Configuration
 
-zfind can read persistent defaults from one config file. Command-line options
-override them for a single run.
+`zfind` can load persistent default flags from a configuration file. Command-line options automatically take precedence over configured settings.
 
-Which file is read:
+### File Resolution
 
-1. The file given with `--config PATH` (relative paths are relative to the
-   current directory). It must exist.
-2. Otherwise `$XDG_CONFIG_HOME/zfind/config`, when `XDG_CONFIG_HOME` is a
-   non-empty absolute path.
-3. Otherwise `$HOME/.config/zfind/config`, when `HOME` is set and non-empty.
+`zfind` selects at most one configuration file, evaluated in the following priority:
 
-If neither default location can be resolved, or the default file does not
-exist, zfind runs with its built-in defaults. A file that exists but cannot be
-read, is larger than 65,536 bytes, or contains an error stops zfind before any
-search, with a message that names the file and the line:
+1. `--config PATH` (relative paths resolve against the current working directory). The file must exist.
+2. `$XDG_CONFIG_HOME/zfind/config` (if `XDG_CONFIG_HOME` is set to a non-empty absolute path).
+3. `$HOME/.config/zfind/config` (if `HOME` is set and non-empty).
 
-```
-zfind: /home/me/.config/zfind/config:3: unknown option
-```
+If neither environment variable is set or the default file does not exist, `zfind` starts with internal defaults.
 
-zfind does not search the current or parent directories for a config and does
-not support includes. `--no-config` skips the file; `--help` never reads it.
-`--config` and `--no-config` are command-line options only and must appear
-before `PATTERN`.
+- `--no-config` forces `zfind` to ignore all configuration files.
+- `--help` never parses configuration files.
+- `zfind` will exit with an error before searching if a configuration file exceeds 65,536 bytes, cannot be read, or contains invalid syntax:
+  ```text
+  zfind: /home/user/.config/zfind/config:3: unknown option
+  ```
 
-### Format
+### Format & Syntax
 
-One option per line, using the same names and the same value rules as the
-command line:
+The configuration file uses a line-oriented format matching command-line option syntax:
 
-```
-# Personal zfind defaults
+```ini
+# ~/.config/zfind/config
+
+# Matching & Traversal
 --case-insensitive
 --no-hidden
 --gitignore
+
+# Default Exclusions
 --exclude-name=node_modules
---exclude-name='build output'
---separator='\t'
---limit 200
+--exclude-name=.venv
+--exclude-name="build output"
+
+# Formatting
+--separator='\n'
+--limit 500
 ```
 
-- Blank lines are ignored. A line whose first non-blank character is `#` is a
-  comment. Inline comments are not supported: a `#` elsewhere is part of the value.
-- A line is `--name`, `--name=value` or `--name value`. Leading and trailing
-  spaces, tabs and `\r` are ignored. Text after a flag (for example a second
-  option) is an error; after an option that takes a value, the rest of the line
-  is that value. Write `--type f`, not `--type=f`, exactly
-  as on the command line.
-- A value may be wrapped in matching single or double quotes, which are
-  removed; this lets it start or end with a space. The same quote cannot appear
-  inside the value. Quotes elsewhere in a value are literal.
-- Backslashes are not processed by the config parser; the option itself
-  decides what they mean, so `--separator='\t'` is a tab, as on the command line.
-- Nothing is expanded: no shell variables, `~`, globs or command substitution.
-- Short options, `PATTERN`, `--`, `--help`, `--config` and `--no-config` are
-  not allowed in the file. Unknown or malformed lines are errors, never ignored.
+- **Lines:** Each non-blank line represents one option: `--name`, `--name=value`, or `--name value`.
+- **Comments:** Lines starting with `#` (ignoring leading whitespace) are comments. Inline comments are not supported (`#` elsewhere is treated as part of the value).
+- **Quoting:** Values may be enclosed in single (`'...'`) or double (`"..."`) quotes to preserve leading or trailing whitespace. The enclosing quote character cannot appear inside the string.
+- **Escapes & Expansions:** Shell variables (`$VAR`), tilde (`~`), globs, and command substitutions are not expanded. Backslashes are passed directly to the corresponding option handler (e.g. `--separator='\t'`).
+- **Disallowed Options:** Short options, `PATTERN`, `--`, `--help`, `--config`, and `--no-config` are forbidden inside the configuration file.
 
-Every behavior option the command line accepts is accepted in the file, with
-the same validation.
+### Precedence & Merging
 
-### Precedence
+Evaluation flows from **Built-in Defaults** $\rightarrow$ **Config File** $\rightarrow$ **Command Line**.
 
-Built-in defaults, then the config file, then the command line.
+| Option Class | Behavior | Override Rule |
+| :--- | :--- | :--- |
+| **Modes**<br>`--case-sensitive` / `--case-insensitive`<br>`--hidden` / `--no-hidden`<br>`--gitignore` / `--no-gitignore` | CLI overrides config. | Conflicting flags within the same source produce an error. Setting a mode on the CLI replaces the config mode. Note: If a config file specifies a case flag, there is no flag to revert back to smart case from the CLI. |
+| **Scalars**<br>`--separator`, `--limit` | Last-write wins. | CLI overwrites config file values. A later `--limit N` replaces an earlier limit. `--limit 0` prints nothing; limits cannot be completely unset once declared. |
+| **Lists**<br>`--type`, `--exclude-name` | Cumulative set union. | Command-line values append to config file entries. Duplicate items are deduplicated. The total combined unique `--exclude-name` entries must not exceed 64. Use `--no-config` to discard configured list entries. |
 
-- **Modes** (`--case-sensitive`/`--case-insensitive`, `--hidden`/`--no-hidden`,
-  `--gitignore`/`--no-gitignore`): a mode given on the command line replaces the
-  file's. Opposing modes within one source are an error, so a file cannot rely
-  on line order. A file's `--case-sensitive` can be overridden with
-  `--case-insensitive`, and vice versa; there is no way to ask for smart case
-  again from the command line.
-- **Scalars** (`--separator`, `--limit`): the command line overwrites the file,
-  and the last value within one source wins. A later `--limit N` replaces a
-  configured limit, but nothing cancels one yet: `--limit 0` prints nothing.
-- **Lists** (`--type`, `--exclude-name`): the command line adds to the file's
-  entries; repeating a value has no extra effect. Together they still count
-  toward the 64 unique `--exclude-name` values. To ignore the file's lists, use
-  `--no-config`.
+---
 
-## Build
+## Release Workflow
 
-```sh
-make            # Build into build/x86_64/
-```
+To create a new release:
 
-Sources live per architecture under `src/x86_64/`; the build is driven by a
-single `ARCH` variable, so `make ARCH=...` selects another port once one
-exists. For the toolchain, use `nix develop` as configured in `flake.nix`.
-
-The resulting binary requires an x86-64-v3-compatible CPU.
-
-## Release
-
-After a commit is on `main` and its CI run passes, create and push a version tag:
-
-```sh
-git tag -a v1.0.0 -m "v1.0.0"
-git push origin v1.0.0
-```
-
-The tag workflow runs the tests, builds the binary, and publishes a GitHub
-Release with the `zfind-linux-x86_64-v3` asset.
+1. Ensure all changes are merged to `main` and all CI tests pass.
+2. Create and push an annotated git tag:
+   ```sh
+   git tag -a v1.0.0 -m "v1.0.0"
+   git push origin v1.0.0
+   ```
+3. The automated CI tag workflow will build the project, run the test suite, and generate a GitHub Release containing the `zfind-linux-x86_64-v3` artifact.
