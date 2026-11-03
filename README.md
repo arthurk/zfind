@@ -29,6 +29,7 @@ A high-performance, parallel recursive file search utility for Linux.
   - [Format & Syntax](#format--syntax)
   - [Precedence & Merging](#precedence--merging)
 - [Release Workflow](#release-workflow)
+- [Disclaimer](#disclaimer)
 
 ---
 
@@ -347,3 +348,7 @@ To create a new release:
    git push origin v1.0.0
    ```
 3. The automated CI tag workflow will build the project, run the test suite, and generate a GitHub Release containing the `zfind-linux-x86_64-v3` artifact.
+
+## Disclaimer
+
+This project makes heavy use of LLM-based coding agents. A human set the ideas, goals, architecture, and review criteria; AI agents did the bulk of the implementation and experimentation. All contributions are reviewed by a human before merge.
