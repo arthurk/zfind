@@ -31,7 +31,7 @@ else
 endif
 
 # ---------- targets ----------
-.PHONY: all run clean testdata test release
+.PHONY: all run clean testdata test test-quiet release
 
 all: $(BIN)
 
@@ -96,9 +96,18 @@ ZFIND_TESTDATA ?= /tmp/zfind-testdata
 testdata:
 	ZFIND_TESTDATA=$(ZFIND_TESTDATA) python3 tests/mktrees.py --preset $(PRESET)
 
+# Extra pytest arguments; test-quiet sets them.
+PYTEST_ARGS ?=
+
 # Build parallel, serial and DT_UNKNOWN-hook binaries, then compare them in
 # the test suite.
 test: $(BIN) $(SERIAL_BIN) $(UNKNOWN_BIN) $(RANGE_BIN)
 	ZFIND=$(abspath $(BIN)) ZFIND_SERIAL=$(abspath $(SERIAL_BIN)) \
 	ZFIND_UNKNOWN=$(abspath $(UNKNOWN_BIN)) \
-	ZFIND_RANGE=$(abspath $(RANGE_BIN)) pytest
+	ZFIND_RANGE=$(abspath $(RANGE_BIN)) pytest $(PYTEST_ARGS)
+
+# Quiet run for agents: only failures and a one-line summary. pytest.ini sets
+# -vv; `-o addopts=` clears it, so the strict flags are repeated here. -s also
+# hides the build and recipe echo.
+test-quiet:
+	@$(MAKE) --no-print-directory -s test PYTEST_ARGS='-o addopts= -q --no-header --tb=short -rfE --strict-markers --strict-config'
