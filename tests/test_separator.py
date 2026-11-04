@@ -10,7 +10,7 @@ from typing import NamedTuple
 import pytest
 from helpers import Result, ZfindRunner, joined, run_in
 
-BLK_DATA = 16384 - 32  # src/x86_64/zfind.asm: BLK_SZ - BLK_HDR
+BLK_DATA = 49152 - 32  # src/x86_64/zfind.asm: BLK_SZ - BLK_HDR
 TINY = [word.encode() for word in "a b ca cb dir/ dir/c dir/d e".split()]
 WEIRD = [
     b"--limit", b"-0", b"-h", b"-t", b"a*b", b"back\\slash", b"c?d",
@@ -452,33 +452,33 @@ class TestSeparatorRangeGroups:
 
 @pytest.fixture(scope="module")
 def block_one_byte_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """5000 five-byte files plus one directory inserted at the block boundary.
+    """6200 five-byte files plus one directory inserted at the block boundary.
 
     With a one-byte separator each file frame is 2 + 5 + 1 = 8 bytes, so the
-    first 2044 frames exactly fill BLK_DATA (16352). f2043d sorts between
-    f2043 and f2044 and is a directory, so its 10-byte frame starts the next
-    block (2 + 6 + 1 + 1).
+    first 6140 frames exactly fill BLK_DATA (49120). f6139d sorts between
+    f6139 and f6140 and is a directory, so its 10-byte frame starts the next
+    block (2 + 7 + 1).
     """
     tree = tmp_path_factory.mktemp("block-one-byte")
-    for i in range(5000):
+    for i in range(6200):
         (tree / f"f{i:04d}").write_bytes(b"")
-    (tree / "f2043d").mkdir()
+    (tree / "f6139d").mkdir()
     return tree
 
 
 @pytest.fixture(scope="module")
 def block_multibyte_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """1808 files, 8 directories, then the boundary directory, then 100 files.
+    """5440 files, 16 directories, then the boundary directory, then 100 files.
 
     With separator XY, file frames are 2 + 5 + 2 = 9 bytes and directory
-    frames are 2 + 5 + 1 + 2 = 10. The first 1808 files and 8 directories
-    total 1808 * 9 + 8 * 10 = 16352 bytes, so the next directory line starts
+    frames are 2 + 5 + 1 + 2 = 10. The first 5440 files and 16 directories
+    total 5440 * 9 + 16 * 10 = 49120 bytes, so the next directory line starts
     exactly at the second block.
     """
     tree = tmp_path_factory.mktemp("block-multibyte")
-    for i in range(1808):
+    for i in range(5440):
         (tree / f"a{i:04d}").write_bytes(b"")
-    for i in range(8):
+    for i in range(16):
         (tree / f"b{i:04d}").mkdir()
     (tree / "c0000").mkdir()
     for i in range(100):
@@ -491,13 +491,13 @@ class TestSeparatorBlockBoundaries:
         self, zfind_path: Path, serial_zfind_path: Path, serial_binary_path: Path,
         block_one_byte_tree: Path
     ):
-        files = [f"f{i:04d}".encode() for i in range(5000)]
-        listing = files[:2044] + [b"f2043d/"] + files[2044:]
+        files = [f"f{i:04d}".encode() for i in range(6200)]
+        listing = files[:6140] + [b"f6139d/"] + files[6140:]
         sep = b"\t"
         assert 2 + len(b"f0000") + len(sep) == 8
-        assert 2 + len(b"f2043d/") + len(sep) == 10
-        assert 2044 * 8 == BLK_DATA
-        assert listing[2044] == b"f2043d/"
+        assert 2 + len(b"f6139d/") + len(sep) == 10
+        assert 6140 * 8 == BLK_DATA
+        assert listing[6140] == b"f6139d/"
         same = same_binary(zfind_path, serial_binary_path)
 
         full = run_in(zfind_path, block_one_byte_tree, "--separator=\\t")
@@ -512,10 +512,10 @@ class TestSeparatorBlockBoundaries:
             assert full.err == full_serial.err == b""
             assert full.out == full_serial.out
 
-        for n in (2043, 2044, 2045, 2046, 4090, len(listing) - 1, len(listing),
+        for n in (6139, 6140, 6141, 6142, 12280, len(listing) - 1, len(listing),
                   len(listing) + 1):
             args = ("--separator=\\t", "--limit", str(n))
-            if n in (2044, 2045):
+            if n in (6140, 6141):
                 res = run_repeated(zfind_path, block_one_byte_tree, *args)
             else:
                 res = run_in(zfind_path, block_one_byte_tree, *args)
@@ -542,17 +542,17 @@ class TestSeparatorBlockBoundaries:
         block_multibyte_tree: Path
     ):
         listing = (
-            [f"a{i:04d}".encode() for i in range(1808)]
-            + [f"b{i:04d}/".encode() for i in range(8)]
+            [f"a{i:04d}".encode() for i in range(5440)]
+            + [f"b{i:04d}/".encode() for i in range(16)]
             + [b"c0000/"]
             + [f"d{i:04d}".encode() for i in range(100)]
         )
         sep = b"XY"
         assert 2 + len(b"a0000") + len(sep) == 9
         assert 2 + len(b"b0000/") + len(sep) == 10
-        assert 1808 * 9 + 8 * 10 == BLK_DATA
-        assert listing[1815] == b"b0007/"
-        assert listing[1816] == b"c0000/"
+        assert 5440 * 9 + 16 * 10 == BLK_DATA
+        assert listing[5455] == b"b0015/"
+        assert listing[5456] == b"c0000/"
         same = same_binary(zfind_path, serial_binary_path)
 
         full = run_in(zfind_path, block_multibyte_tree, "--separator=XY")
@@ -567,10 +567,10 @@ class TestSeparatorBlockBoundaries:
             assert full.err == full_serial.err == b""
             assert full.out == full_serial.out
 
-        for n in (1815, 1816, 1817, 1818, len(listing) - 1, len(listing),
+        for n in (5455, 5456, 5457, 5458, len(listing) - 1, len(listing),
                   len(listing) + 1):
             args = ("--separator=XY", "--limit", str(n))
-            if n in (1816, 1817):
+            if n in (5456, 5457):
                 res = run_repeated(zfind_path, block_multibyte_tree, *args)
             else:
                 res = run_in(zfind_path, block_multibyte_tree, *args)
