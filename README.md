@@ -293,12 +293,12 @@ zfind: /home/user/.config/zfind/config:3: --color always is not allowed in the c
 
 ## Gitignore Support
 
-By default, `.gitignore` files are ignored, and `.git/` is traversed like any normal directory.
+By default, `.gitignore` files are ignored, and `.git/` and `.jj/` are traversed like normal directories.
 
-Passing `--gitignore` activates Git-style ignore filtering with the following rules:
+Passing `--gitignore` activates Git-style ignore filtering in Git and Jujutsu repositories with the following rules:
 
-1. **Repository Root Requirement:** `--gitignore` only activates if the **current working directory** contains a `.git` entry. `zfind` does not search parent directories for a repository root.
-2. **The `.git` Directory:** When `--gitignore` is enabled, `.git` is never listed, traversed, or counted, even if `--hidden` is passed.
+1. **Repository Root Requirement:** `--gitignore` activates if the **current working directory** contains a `.git` or `.jj` entry. If both are present, ignore processing is enabled once. `zfind` does not search parent directories for a repository root.
+2. **Metadata Directories:** When `--gitignore` is enabled for a recognized repository, `.git` and `.jj` are never listed, traversed, or counted, even if `--hidden` is passed.
 3. **Hierarchical Traversal:** `.gitignore` files are read dynamically as the directory tree is walked. Rules encountered deeper in the filesystem hierarchy override inherited parent rules.
 4. **Limits:**
    - Maximum `.gitignore` file size: **65,535 bytes**.

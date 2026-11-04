@@ -9,15 +9,15 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
 ; Every entry is searched, including hidden names and dot-directories like
-; .git. --hidden states the default explicitly; --no-hidden skips them. The
-; two options conflict. --no-gitignore states the default (no .gitignore
-; rules, .git not pruned) explicitly; --gitignore applies .gitignore rules
-; when cwd contains .git and prunes .git. The two options conflict.
-; .gitignore rules apply only when --gitignore is given and cwd contains
-; .git (the existing shortcut; no ancestor walk); with the flag, the .git
-; entry itself is pruned - never printed, never walked - because git never
-; tracks anything under it. --no-gitignore leaves .git as an ordinary hidden
-; entry. The pattern is matched against the name only.
+; .git and .jj. --hidden states the default explicitly; --no-hidden skips
+; them. The two options conflict. --no-gitignore states the default (no
+; .gitignore rules, .git and .jj not pruned) explicitly; --gitignore applies
+; .gitignore rules when cwd contains .git or .jj and prunes both metadata dirs.
+; The two options conflict. .gitignore rules apply only when --gitignore is
+; given and cwd contains .git or .jj (the existing shortcut; no ancestor walk);
+; with the flag, .git and .jj entries are pruned - never printed, never walked -
+; because neither git nor jujutsu tracks anything under them. --no-gitignore
+; leaves them as ordinary hidden entries. The pattern is matched against the name only.
 ; --exclude-name NAME is repeatable. It removes entries by exact basename,
 ; bytewise and case-sensitively, before the type/pattern prefilter and
 ; arena_put; a matching directory is pruned. Explicit exclusions override
@@ -259,6 +259,7 @@ endstruc
 section .rodata
     dot         db '.', 0
     gitname     db '.git', 0
+    jjname      db '.jj', 0
     igname      db '.gitignore', 0
     e_arg       db "zfind: unexpected argument", 10
     e_arg_e:
@@ -379,22 +380,21 @@ section .rodata
                db "~/.config/zfind/config: one option per line, # starts a comment line.", 10
                db "Command-line options override the file, except --type and --exclude-name,", 10
                db "which add to it. --config and --no-config are command-line only.", 10, 10
-               db "Hidden entries are searched like any other, .git included; --no-hidden", 10
+               db "Hidden entries are searched like any other, .git and .jj included; --no-hidden", 10
                db "skips entries whose name starts with . and everything inside them.", 10
                db "--hidden states the default explicitly; combining the two is an error.", 10
-               db "Without either gitignore flag, rules are off and .git is not pruned.", 10
+               db "Without either gitignore flag, rules are off and .git/.jj not pruned.", 10
                db "--no-gitignore states this default explicitly. --gitignore applies", 10
-               db "rules when the current directory contains .git and skips .git itself.", 10
-               db "Combining the two gitignore flags is an error. Git does not track anything", 10
-               db "under .git. Entries are sorted by name within each directory; output", 10
-               db "follows depth-first order.", 10, 10
+               db "rules when cwd contains .git or .jj and skips both metadata dirs.", 10
+               db "Combining the two gitignore flags is an error. Entries are sorted by", 10
+               db "name within each directory; output follows depth-first order.", 10, 10
                db "  --help              show this help and exit", 10
                db "  --separator STR     terminate results with STR, 1-64 bytes", 10
                db "                      (also --separator=STR); decodes \n \t \r \0 \\", 10
                db "                      default: newline", 10
                db "  --case-sensitive    match pattern case-sensitively", 10
                db "  --case-insensitive  match pattern case-insensitively (ASCII A-Z)", 10
-               db "  --gitignore         respect .gitignore rules when cwd contains .git; skip .git", 10
+               db "  --gitignore         respect .gitignore rules in .git/.jj repos; skip both", 10
                db "  --no-gitignore      do not apply .gitignore rules (the default)", 10
                db "  --hidden            search hidden entries (the default)", 10
                db "  --no-hidden         skip entries whose name starts with .", 10
@@ -688,8 +688,8 @@ _start:
 
     ; .gitignore applies only inside a repository, and only when
     ; --gitignore was given (res_ig == 1). State 0 (default) and state 2
-    ; (--no-gitignore) both skip .git detection, rule loading and the .git
-    ; prune: git_repo stays 0 and every gate downstream reads 0.
+    ; (--no-gitignore) both skip repository detection, rule loading and the
+    ; metadata prune: git_repo stays 0 and every gate downstream reads 0.
     cmp qword [res_ig], 1
     jne .norepo
     mov rax, 262                     ; newfstatat
@@ -699,7 +699,16 @@ _start:
     xor r10d, r10d
     syscall
     test rax, rax
+    jns .found_repo
+    mov rax, 262                     ; newfstatat
+    mov rdi, AT_FDCWD
+    lea rsi, [jjname]
+    lea rdx, [statbuf0]
+    xor r10d, r10d
+    syscall
+    test rax, rax
     js .norepo
+.found_repo:
     mov qword [git_repo], 1
 .norepo:
     xor edi, edi                     ; arena: one big mmap instead of a static
@@ -4712,7 +4721,7 @@ walk_dir:
     ; [rsp+24]=sort table [rsp+32]=split [rsp+40]=dir fd (-1: none/closed)
     ; [rsp+48]=scratch mark
     ; [rsp+56]=while parsing: this directory lists a .gitignore (as git_repo:
-    ;          so 0 unless --gitignore was given and cwd contains .git); while iterating:
+    ;          so 0 unless --gitignore was given and cwd contains .git or .jj); while iterating:
     ;          the current entry's resolved type
     mov rax, [r14+ig_nrules]
     mov [rsp], rax
@@ -4815,32 +4824,25 @@ walk_dir:
     mov rax, [git_repo]              ; record git_repo (1 only if --gitignore AND repo):
     mov [rsp+56], rax                ;   0 suppresses load_ignore with no branch added
 .gate:
-    ; .git itself, in a repo cwd under --gitignore: pruned by name. Git
-    ; never tracks anything under it: its walk drops the exact .git name
-    ; silently, its path checks reject the lookalike spellings outright
-    ; (git add .Git -> "error: invalid path"), no ignore rule reaches it
-    ; and no ! rule brings it back, so the prune behaves like a rule that
-    ; always matches, applied before the rules are even loaded. Any
-    ; d_type: directories, submodule marker files, dot-symlinks. Exact
-    ; ".git" only — no fold, unlike the .gitignore probe above: nothing
-    ; is being opened here, and a case-spelling is distinct filesystem
-    ; content that must stay searched (git's own path checks reject those
-    ; spellings too — recorded narrowness: the prune models only the
-    ; exact name git itself writes). The loads stay
-    ; inside the dirent record for every name: a reclen is a multiple of 8
-    ; and always carries room for a 4-character name plus its terminator
-    ; past the 19-byte fixed prefix (24 minimum), so the 4-byte compare and
-    ; the NUL probe — 5 bytes, not 8 — never leave the record, let alone
-    ; the buffer; no guarded read is needed and no sibling storage can be
-    ; read, unlike the unguarded 8-byte probe above.
+    ; .git and .jj, in a repo cwd under --gitignore: pruned by name.
+    ; Neither git nor jujutsu tracks anything under their metadata directories.
+    ; Any d_type: directories, submodule marker files, dot-symlinks. Exact
+    ; ".git" and ".jj" only — no fold, unlike the .gitignore probe above.
+    ; The loads stay inside the dirent record for every name:
+    ; reclen is at least 24 bytes (19 prefix + name), so 5 bytes at r15 never
+    ; leave the record.
+    ;   ".git" is 4 chars + NUL (dword '.git' + byte 0)
+    ;   ".jj"  is 3 chars + NUL (dword '.jj\0' = 0x006a6a2e)
     cmp qword [git_repo], 0
     je .gate_hid
     cmp dword [r15], '.git'          ; 4 chars, packed little-endian
-    jne .gate_hid
+    jne .gate_jj
     cmp byte [r15+4], 0
-    jne .gate_hid
-    jmp .pskip                       ; untracked by construction: never
+    je .pskip                        ; untracked by construction: never
                                      ;   collected, never descended into
+.gate_jj:
+    cmp dword [r15], '.jj'           ; '.jj\0' packed little-endian (4 bytes)
+    je .pskip
 .gate_hid:
     cmp byte [hid_mode], 2
     je .pskip                        ; --no-hidden: hidden entries stay hidden
