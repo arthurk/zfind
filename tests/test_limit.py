@@ -13,6 +13,7 @@ DEV_FULL = Path("/dev/full")
 UINT64_MAX = (1 << 64) - 1
 UINT64_OVERFLOW = UINT64_MAX + 1
 BUFFER_SIZE_64_KIB = 64 * 1024
+INVALID_LIMIT = b"zfind: invalid limit (expected a whole number or none)\n"
 TINY = [word.encode() for word in "a b ca cb dir/ dir/c dir/d e".split()]
 WEIRD = [
     b"--limit", b"-0", b"-h", b"-t", b"a*b", b"back\\slash", b"c?d",
@@ -141,16 +142,30 @@ class TestLimit:
         pytest.param(["--limit"], id="missing-arg"),
         pytest.param(["--limit", "x"], id="non-numeric"),
         pytest.param(["--limit", "-1"], id="negative"),
+        pytest.param(["--limit=-1"], id="negative-equals"),
+        pytest.param(["--limit", "+5"], id="explicit-plus"),
+        pytest.param(["--limit", "1.5"], id="decimal-point"),
+        pytest.param(["--limit", " 5"], id="leading-space"),
         pytest.param(["--limit", "1x"], id="trailing-alphanumeric"),
         pytest.param(["--limit="], id="empty-assignment"),
         pytest.param(["--limit", "123456789012345678901234567890"], id="large-overflow"),
         pytest.param(["--limit", str(UINT64_OVERFLOW)], id="uint64-plus-one"),
         pytest.param(["--limit", "--type"], id="subsequent-flag-as-value"),
+        pytest.param(["--limit", "--no-config"], id="config-flag-as-value"),
+        # "none" is the exact lowercase word: a misspelling is not "unlimited".
+        pytest.param(["--limit", "None"], id="none-capitalized"),
+        pytest.param(["--limit", "NONE"], id="none-uppercase"),
+        pytest.param(["--limit=None"], id="none-capitalized-equals"),
+        pytest.param(["--limit", "unlimited"], id="unlimited"),
+        pytest.param(["--limit", "no"], id="no"),
+        pytest.param(["--limit", "non"], id="non"),
+        pytest.param(["--limit", "nonee"], id="nonee"),
+        pytest.param(["--limit", "none "], id="trailing-space"),
     ])
     def test_invalid_limit_values_fail(self, zfind: ZfindRunner, args: list[str]):
         res = zfind("tiny", *args)
         assert res.status == 1, f"Expected clean exit code 1: {res}"
-        assert res.err == b"zfind: invalid limit\n"
+        assert res.err == INVALID_LIMIT
         assert res.out == b""
 
     @pytest.mark.parametrize("tree", ["camera", "tree2"])
@@ -366,8 +381,105 @@ class TestLimit:
         assert res.out == b""
 
 
+# -----------------------------------------------------------------------------
+# Flag: --limit none
+# -----------------------------------------------------------------------------
+
+class TestLimitNone:
+    @pytest.mark.parametrize("args", [
+        pytest.param(["--limit", "none"], id="separate-value"),
+        pytest.param(["--limit=none"], id="equals-syntax"),
+    ])
+    def test_none_is_byte_identical_to_no_limit(
+        self, zfind: ZfindRunner, args: list[str]
+    ):
+        full = zfind("tree2")
+        assert full.status == 0, f"Baseline failed: {full}"
+        res = zfind("tree2", *args)
+        assert res == full
+
+    @pytest.mark.parametrize(("args", "expected"), [
+        pytest.param(["--limit", "2", "--limit", "none"], TINY, id="number-then-none"),
+        pytest.param(["--limit", "none", "--limit", "2"], TINY[:2], id="none-then-number"),
+        pytest.param(["--limit", "0", "--limit", "none"], TINY, id="zero-then-none"),
+        pytest.param(["--limit", "none", "--limit", "0"], [], id="none-then-zero"),
+    ])
+    def test_none_and_numbers_follow_last_wins(
+        self, zfind: ZfindRunner, args: list[str], expected: list[bytes]
+    ):
+        res = zfind("tiny", *args)
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == expected
+
+    def test_none_combines_with_pattern_and_type(self, zfind: ZfindRunner):
+        res = zfind("tiny", "--type", "f", "--limit", "none", "c")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"ca", b"cb", b"dir/c"]
+
+    def test_none_with_no_match_writes_nothing_and_exits_zero(
+        self, zfind: ZfindRunner
+    ):
+        res = zfind("tiny", "--limit", "none", "no_such_name")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert res.out == b""
+
+    def test_none_with_separator_equals_unlimited_output(
+        self, zfind_path: Path, exact_limit_tree: Path
+    ):
+        full = run_in(zfind_path, exact_limit_tree, "--separator=XY")
+        assert full.status == 0, f"Baseline failed: {full}"
+        assert full.out == joined(TINY, b"XY")
+        res = run_in(zfind_path, exact_limit_tree, "--separator=XY", "--limit=none")
+        assert res == full
 
 
+LIMIT_BUILDS = {
+    "parallel": "zfind_path",
+    "serial": "serial_zfind_path",
+    "unknown": "unknown_zfind_path",
+    "range": "range_zfind_path",
+}
+
+
+@pytest.fixture(params=list(LIMIT_BUILDS))
+def limit_binary(request: pytest.FixtureRequest) -> Path:
+    return request.getfixturevalue(LIMIT_BUILDS[request.param])
+
+
+class TestLimitNoneAcrossBuilds:
+    """`--limit none` and `--limit 0` in every build, hook builds included."""
+
+    def test_none_matches_unlimited_and_zero_writes_nothing(
+        self, limit_binary: Path, tmp_path: Path
+    ):
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        for i in range(1, 51):
+            (tree / f"f{i:02d}").write_bytes(b"")
+
+        full = run_in(limit_binary, tree)
+        assert full.status == 0, f"Baseline failed: {full}"
+        assert full.err == b""
+        assert entries(full.out) == [f"f{i:02d}".encode() for i in range(1, 51)]
+
+        capped = run_in(limit_binary, tree, "--limit", "3")
+        assert capped.status == 0, f"Command failed: {capped}"
+        assert capped.err == b""
+        assert capped.out == joined(entries(full.out)[:3], b"\n")
+
+        assert run_in(limit_binary, tree, "--limit", "none") == full
+        assert run_in(limit_binary, tree, "--limit=none") == full
+
+        zero = run_in(limit_binary, tree, "--limit", "0")
+        assert zero.status == 0, f"Command failed: {zero}"
+        assert zero.err == b""
+        assert zero.out == b""
+
+        cancelled = run_in(limit_binary, tree, "--limit", "3", "--limit", "none")
+        assert cancelled == full
 
 
 # -----------------------------------------------------------------------------

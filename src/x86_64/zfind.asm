@@ -3,7 +3,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; zfind, "simple search" use case only:
 ;   zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
-;         [--exclude-name NAME] [--limit N] [--type f|d|l]
+;         [--exclude-name NAME] [--limit N|none] [--type f|d|l]
 ;         [--color auto|always|never]
 ;         [--config PATH | --no-config] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
@@ -77,7 +77,8 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ;   5 ms for new lines) but an unfinished record further ahead is not written
 ;   until it is the current one, which is what keeps the order exact.
 ;
-; --limit N is enforced by the writer alone. While a limit is active,
+; --limit N is enforced by the writer alone; with no limit (the default, or
+; --limit none) none of the machinery below runs. While a limit is active,
 ; print_entry frames each result with a two-byte payload length inside its
 ; output block; a frame never spans blocks and BLK_USED is published only after
 ; a whole frame. out_put strips the headers, copies exactly N payloads to
@@ -263,7 +264,7 @@ section .rodata
     igname      db '.gitignore', 0
     e_arg       db "zfind: unexpected argument", 10
     e_arg_e:
-    e_limit     db "zfind: invalid limit", 10
+    e_limit     db "zfind: invalid limit (expected a whole number or none)", 10
     e_limit_e:
     e_type      db "zfind: expected f, d or l after --type", 10
     e_type_e:
@@ -345,6 +346,7 @@ section .rodata
     val_auto    db "auto", 0
     val_always  db "always", 0
     val_never   db "never", 0
+    v_none      db "none", 0
     env_no_color db "NO_COLOR=", 0   ; 9 bytes of prefix
     env_term    db "TERM=", 0        ; 5 bytes of prefix
     seq_cyan    db 27, '[', '3', '6', 'm'   ; 5 bytes
@@ -360,7 +362,7 @@ section .rodata
     cfg_sfx_home_e:
     help_msg    db "usage: zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
-               db "             [--exclude-name NAME]... [--limit N] [--type f|d|l]", 10
+               db "             [--exclude-name NAME]... [--limit N|none] [--type f|d|l]", 10
                db "             [--color auto|always|never]", 10
                db "             [--config PATH | --no-config] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
@@ -401,7 +403,8 @@ section .rodata
                db "  --exclude-name NAME repeatable; skip entries whose basename is exactly NAME", 10
                db "                      case-sensitive; no glob or '/'", 10
                db "                      also --exclude-name=NAME; matching dirs are pruned", 10
-               db "  --limit N           print at most N results, then stop (0 = none)", 10
+               db "  --limit N|none      print at most N results (0 prints nothing)", 10
+               db "                      none: no limit, the default; also --limit=N|none", 10
                db "  --type f|d|l        repeatable; print regular files, directories, symlinks", 10
                db "                      also --type=V", 10
                db "  --color WHEN        color results: auto, always or never (default: auto)", 10
@@ -446,7 +449,7 @@ section .bss
     sep_buf:    resb SEP_MAX          ; decoded --separator bytes (may contain NUL)
     sep_len:    resq 1                ; decoded separator length, 1..SEP_MAX
     lim_left:    resq 1               ; writer-only remaining results; -1 = no limit or UINT64_MAX
-    limit_given: resq 1               ; read-only after parsing: 1 = --limit was supplied
+    limit_given: resq 1               ; read-only after parsing: 1 = a numeric --limit is in force
     limit_mode:  resq 1               ; read-only after startup: 1 = frame results
     res_ig:     resq 1                ; 0 = default, 1 = --gitignore, 2 = --no-gitignore
     hid_mode:   resb 1                ; 0 = default, 1 = --hidden, 2 = --no-hidden
@@ -677,7 +680,7 @@ _start:
     lea rax, [pat_buf]
     mov [pat_ptr], rax
 .pat_padded:
-    ; Decide limit_mode from whether --limit was supplied, not from lim_left:
+    ; Decide limit_mode from whether a numeric --limit is in force, not lim_left:
     ; UINT64_MAX stores the same -1 as the no-limit sentinel but is still framed.
     cmp qword [limit_given], 0
     je .no_limit_mode
@@ -1080,20 +1083,24 @@ parse_args:
     cmp r12, rbx
     jae bad_limit
     mov rdi, [rbp+r12*8]
-    call parse_u64
-    jc bad_limit
-    mov [lim_left], rax
-    mov qword [limit_given], 1
-    inc r12
-    jmp .args_loop
+    jmp .opt_limit_value
 
 .opt_limit_eq:
     mov rdi, [rbp+r12*8]
     add rdi, 8                         ; len("--limit=")
+.opt_limit_value:                      ; rdi = the value: a whole number or "none"
+    lea rsi, [v_none]
+    call streq                         ; streq keeps rdi and rsi
+    je .limit_none
     call parse_u64
-    jc bad_limit
-    mov [lim_left], rax
+    jc bad_limit                       ; never turns a bad value into "no limit"
+    mov [lim_left], rax                ; 0 is a real limit: print nothing
     mov qword [limit_given], 1
+    jmp .limit_set
+.limit_none:
+    mov qword [lim_left], -1           ; no limit; also overwrites a configured one
+    mov qword [limit_given], 0
+.limit_set:
     inc r12
     jmp .args_loop
 

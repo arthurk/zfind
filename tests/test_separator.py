@@ -89,6 +89,15 @@ class TestSeparatorParsing:
         assert res.err == expected_err
         assert res.out == b""
 
+    def test_separator_consumes_a_following_limit_flag_as_its_value(
+        self, zfind: ZfindRunner
+    ):
+        # The greedy value rule is unchanged: the separator is the text --limit.
+        res = zfind("tiny", "--separator", "--limit", "--limit", "1")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert res.out == TINY[0] + b"--limit"
+
     def test_64_decoded_bytes_accepted(self, zfind: ZfindRunner):
         sep = b"x" * 64
         res = zfind("tiny", "--separator=" + sep.decode())

@@ -158,6 +158,9 @@ zfind --type f --separator='\0' log | xargs -0 grep -H "ERROR"
 # Tab-separated output for awk or tabular tools
 zfind --separator='\t' --limit 50 config
 
+# No limit (the default); also cancels a configured limit
+zfind --limit=none config
+
 # Interactive fuzzy filtering with fzf
 zfind --type f | fzf
 ```
@@ -186,7 +189,7 @@ Scripts need no flag: piped output is plain by default. Add `--color=never` only
 | `--type` | `f` \| `d` \| `l` | All types | Filter output by regular files (`f`), directories (`d`) or symlinks (`l`). Repeatable. Also accepted as `--type=VALUE`. |
 | `--exclude-name` | `NAME` | None | Prune entries whose exact basename matches `NAME`. Repeatable (up to 64). |
 | `--separator` | `STR` (escaped) | `\n` | Terminate each result with `STR` (1–64 bytes). Supports escapes like `\0`, `\t`. |
-| `--limit` | `N` (integer) | Unlimited | Print at most `N` results (`0` prints nothing). |
+| `--limit` | `N` \| `none` | Unlimited | Print at most `N` results; `0` prints nothing. `none` means no limit: it is the default, and it also cancels a limit set in the config file. |
 | `--color` | `auto` \| `always` \| `never` | `auto` | Style results for terminals. `auto` colors only a tty with `NO_COLOR` unset/empty and `TERM` set and not `dumb`; `always` forces ANSI even into pipes; `never` disables it. Also accepted as `--color=WHEN`. |
 | `--config` | `PATH` | System paths | Load persistent configuration from `PATH`. |
 | `--no-config` | — | Off | Bypass all configuration files for this run. |
@@ -275,9 +278,12 @@ zfind: /home/user/.config/zfind/config:3: --color always is not allowed in the c
 ### Result Limiting
 
 - `--limit N` (or `--limit=N`) halts output after emitting at most `N` results.
+- `--limit none` (or `--limit=none`) means no limit: it is the default, and it
+  also cancels a limit set in the config file. `N` is a whole number up to
+  18446744073709551615, and `none` is lowercase.
 - Setting `--limit 0` writes nothing and exits immediately.
 - The output with `--limit N` is an exact byte-for-byte prefix of an unlimited search run.
-- `--limit` consumes the next token greedily as its numeric value.
+- `--limit` consumes the next token greedily as its value.
 
 ### Basename Exclusions (`--exclude-name`)
 
@@ -376,7 +382,7 @@ Evaluation flows from **Built-in Defaults** $\rightarrow$ **Config File** $\righ
 | Option Class | Behavior | Override Rule |
 | :--- | :--- | :--- |
 | **Modes**<br>`--case-sensitive` / `--case-insensitive`<br>`--hidden` / `--no-hidden`<br>`--gitignore` / `--no-gitignore` | CLI overrides config. | Conflicting flags within the same source produce an error. Setting a mode on the CLI replaces the config mode. Note: If a config file specifies a case flag, there is no flag to revert back to smart case from the CLI. |
-| **Scalars**<br>`--separator`, `--limit`, `--color` | Last-write wins. | CLI overwrites config file values. A later `--limit N` replaces an earlier limit. `--limit 0` prints nothing; limits cannot be completely unset once declared. The config file allows only `--color auto` and `--color never`; `always` there is an error. |
+| **Scalars**<br>`--separator`, `--limit`, `--color` | Last-write wins. | CLI overwrites config file values. A later `--limit N` replaces an earlier limit, and `--limit none` cancels a configured one (for example `--limit none` over `--limit 200` in the file). `--limit 0` prints nothing. The config file allows only `--color auto` and `--color never`; `always` there is an error. |
 | **Lists**<br>`--type`, `--exclude-name` | Cumulative set union. | Command-line values append to config file entries. Duplicate items are deduplicated. The total combined unique `--exclude-name` entries must not exceed 64. Use `--no-config` to discard configured list entries. |
 
 ---

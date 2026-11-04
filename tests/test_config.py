@@ -273,7 +273,8 @@ class TestConfigSelection:
             (("--exclude-name", "--no-config", "config"), listing([b".git/config"])),
             (("--exclude-name", "--config", "config"), listing([b".git/config"])),
             (("--separator", "--config=x", "config"), Result(b".git/config--config=x", b"", 0)),
-            (("--limit", "--no-config"), failure(b"zfind: invalid limit\n")),
+            (("--limit", "--no-config"), failure(b"zfind: invalid limit (expected a whole number or none)\n")),
+            (("--limit", "--config", "/nonexistent"), failure(b"zfind: invalid limit (expected a whole number or none)\n")),
             (("--type", "--no-config"), failure(b"zfind: expected f, d or l after --type\n")),
         ],
     )
@@ -449,10 +450,12 @@ class TestConfigErrors:
             pytest.param("--bogus\n", 1, "unknown option", id="unknown-option"),
             pytest.param("--hidden=foo\n", 1, "unknown option", id="value-on-a-flag"),
             pytest.param("--HIDDEN\n", 1, "unknown option", id="case-matters"),
-            pytest.param("--limit\n", 1, "invalid limit", id="limit-without-value"),
-            pytest.param("--limit=abc\n", 1, "invalid limit", id="limit-not-a-number"),
-            pytest.param("--limit -1\n", 1, "invalid limit", id="limit-negative"),
-            pytest.param("--limit=\n", 1, "invalid limit", id="limit-empty"),
+            pytest.param("--limit\n", 1, "invalid limit (expected a whole number or none)", id="limit-without-value"),
+            pytest.param("--limit=abc\n", 1, "invalid limit (expected a whole number or none)", id="limit-not-a-number"),
+            pytest.param("--limit -1\n", 1, "invalid limit (expected a whole number or none)", id="limit-negative"),
+            pytest.param("--limit=\n", 1, "invalid limit (expected a whole number or none)", id="limit-empty"),
+            pytest.param("--limit=None\n", 1, "invalid limit (expected a whole number or none)", id="limit-none-capitalized"),
+            pytest.param("--limit nonee\n", 1, "invalid limit (expected a whole number or none)", id="limit-none-misspelled"),
             pytest.param("--separator\n", 1, "missing value for --separator", id="separator-without-value"),
             pytest.param("--separator=\n", 1, "empty separator", id="separator-empty"),
             pytest.param("--separator=\\q\n", 1, "unknown escape sequence in separator", id="separator-bad-escape"),
@@ -491,14 +494,14 @@ class TestConfigErrors:
             pytest.param("--hidden --bogus\n", 1, "unexpected argument", id="flag-then-unknown-option"),
             pytest.param("--bogus value\n", 1, "unknown option", id="unknown-name-with-value"),
             pytest.param("--limt 5\n", 1, "unknown option", id="misspelled-name-with-value"),
-            pytest.param("--limit 5 --hidden\n", 1, "invalid limit", id="value-is-the-rest-of-the-line"),
+            pytest.param("--limit 5 --hidden\n", 1, "invalid limit (expected a whole number or none)", id="value-is-the-rest-of-the-line"),
             pytest.param("--\n", 1, "option not allowed in a config file", id="double-dash"),
             pytest.param("-- --limit 1\n", 1, "option not allowed in a config file", id="double-dash-with-value"),
             pytest.param("--help\n", 1, "option not allowed in a config file", id="help"),
             pytest.param("--config=x\n", 1, "option not allowed in a config file", id="config-equals"),
             pytest.param("--config x\n", 1, "option not allowed in a config file", id="config-blank"),
             pytest.param("--no-config\n", 1, "option not allowed in a config file", id="no-config"),
-            pytest.param("\n\n# c\n  --limit  \n", 4, "invalid limit", id="line-counting"),
+            pytest.param("\n\n# c\n  --limit  \n", 4, "invalid limit (expected a whole number or none)", id="line-counting"),
             pytest.param("--no-hidden\n--wat 1\n--also-bad\n", 2, "unknown option", id="first-error-is-reported"),
         ],
     )
@@ -529,7 +532,9 @@ class TestConfigErrors:
 
     def test_command_line_errors_carry_no_file_prefix(self, cfg: ConfigRunner):
         cfg.write("--no-hidden\n")
-        assert cfg("--limit", "abc") == failure(b"zfind: invalid limit\n")
+        assert cfg("--limit", "abc") == failure(
+            b"zfind: invalid limit (expected a whole number or none)\n"
+        )
         assert cfg("--bogus", "config") == failure(b"zfind: unknown option\n")
         assert cfg("config", "extra") == failure(b"zfind: unexpected argument\n")
 
@@ -581,10 +586,19 @@ class TestConfigPrecedence:
             ("--limit 1\n", ("--limit", "2", "config"), CONFIG_HITS[:2]),
             ("--limit 1\n", ("--limit=3", "config"), CONFIG_HITS[:3]),
             ("--limit 5\n--limit 1\n", ("config",), CONFIG_HITS[:1]),  # last in a source wins
-            # 0 prints nothing for now; the command line can still replace it
+            # 0 prints nothing; the command line can still replace it
             ("--limit=0\n", ("config",), []),
             ("--limit=0\n", ("--limit", "2", "config"), CONFIG_HITS[:2]),
             ("--limit 1\n", ("--limit", "0", "config"), []),
+            # none is the default and cancels a configured limit
+            ("--limit none\n", ("config",), CONFIG_HITS),
+            ("--limit=none\n", ("config",), CONFIG_HITS),
+            ("--limit 'none'\n", ("config",), CONFIG_HITS),
+            ("--limit 3\n--limit none\n", ("config",), CONFIG_HITS),
+            ("--limit 3\n", ("--limit", "none", "config"), CONFIG_HITS),
+            ("--limit 3\n", ("--limit=none", "config"), CONFIG_HITS),
+            ("--limit=0\n", ("--limit", "none", "config"), CONFIG_HITS),
+            ("--limit none\n", ("--limit", "2", "config"), CONFIG_HITS[:2]),
         ],
     )
     def test_limit_is_overwritten_by_the_command_line(
