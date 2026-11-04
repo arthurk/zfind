@@ -22,6 +22,7 @@ A high-performance, parallel recursive file search utility for Linux.
   - [Hidden Files & Directories](#hidden-files--directories)
   - [Symlinks & Type Filtering](#symlinks--type-filtering)
   - [Output Format & Separators](#output-format--separators)
+  - [Color Output](#color-output)
   - [Result Limiting](#result-limiting)
 - [Gitignore Support](#gitignore-support)
 - [Configuration](#configuration)
@@ -39,6 +40,7 @@ A high-performance, parallel recursive file search utility for Linux.
 - **Deterministic Output:** Results are sorted lexicographically by name within each directory and emitted in depth-first order.
 - **Smart Case by Default:** Case-insensitive search if the query is all-lowercase; automatically switches to case-sensitive when an uppercase ASCII character is present.
 - **Safe Pipeline Integration:** Built-in support for NUL (`\0`) and custom delimiters makes piping to `xargs -0` robust and injection-safe.
+- **Adaptive Color:** Cyan directory components and bold/reverse match highlights on a terminal; piped output stays plain unless `--color=always` is given.
 - **Exact Literal Matching:** Never worry about unexpected globbing or regex syntax quirks—queries match raw substring bytes directly.
 - **Flexible Exclusions:** Fast exact basename pruning (`--exclude-name`) and nested `.gitignore` parsing.
 - **Persistent Configuration:** Configure project or user defaults via XDG-compliant config files with full CLI override support.
@@ -59,6 +61,9 @@ zfind --gitignore --limit 10 main
 
 # Safely delete all temporary cache directories
 zfind --type d --separator='\0' .cache | xargs -0 rm -rf
+
+# Colorized results through a pager
+zfind --color=always config | less -R
 ```
 
 ---
@@ -157,6 +162,14 @@ zfind --separator='\t' --limit 50 config
 zfind --type f | fzf
 ```
 
+#### Color & Paging
+```sh
+zfind --color=always foo | less -R   # keep color through the pager
+zfind foo | less -R                  # plain: auto sees a pipe
+```
+
+Scripts need no flag: piped output is plain by default. Add `--color=never` only when a wrapper or alias forces color. If you want color in every pager invocation, pass `--color=always` explicitly (or alias it), knowing that pipes will then be colored too.
+
 ---
 
 ## Options Reference
@@ -174,6 +187,7 @@ zfind --type f | fzf
 | `--exclude-name` | `NAME` | None | Prune entries whose exact basename matches `NAME`. Repeatable (up to 64). |
 | `--separator` | `STR` (escaped) | `\n` | Terminate each result with `STR` (1–64 bytes). Supports escapes like `\0`, `\t`. |
 | `--limit` | `N` (integer) | Unlimited | Print at most `N` results (`0` prints nothing). |
+| `--color` | `auto` \| `always` \| `never` | `auto` | Style results for terminals. `auto` colors only a tty with `NO_COLOR` unset/empty and `TERM` set and not `dumb`; `always` forces ANSI even into pipes; `never` disables it. Also accepted as `--color=WHEN`. |
 | `--config` | `PATH` | System paths | Load persistent configuration from `PATH`. |
 | `--no-config` | — | Off | Bypass all configuration files for this run. |
 | `--` | — | — | Cease option processing; remaining argument is taken as `PATTERN`. |
@@ -228,6 +242,35 @@ zfind --type f | fzf
 > zfind --separator='\0' pattern
 > ```
 > Using NUL (`\0`) is the only way to guarantee unambiguous stream parsing, as NUL is the only byte that cannot appear in a POSIX filesystem path.
+
+### Color Output
+
+`--color WHEN` (also `--color=WHEN`) styles results for human reading:
+
+| Element | ANSI style |
+| :--- | :--- |
+| Directory components | Cyan (`ESC[36m`) |
+| Matching basename text | Bold + reverse video (`ESC[1;7m`) |
+| Everything else | Terminal default |
+
+- Only the basename is highlighted; directory components are never matched. Matching uses the same smart-case and ASCII folding rules as the search itself, adjacent matches merge into one run, and the original bytes and casing are preserved.
+- Directory results are cyan, including the trailing `/`, except where a pattern highlights part of the directory basename (those bytes are bold + reverse). Symlinks are rendered like files, so they never gain a trailing slash.
+- `auto` (the default) emits color only when all of these hold: stdout is a terminal, `NO_COLOR` is unset or empty, and `TERM` is set and not `dumb`. An unset `TERM` means plain output.
+- `always` emits color even into a pipe or a file. `never` emits exactly the plain output.
+- Precedence is command line, then config file, then `auto`. The environment and terminal checks apply only to `auto`, so an explicit `--color=always` overrides `NO_COLOR` and `TERM=dumb`.
+- The mode is resolved once at startup, before the first result.
+
+The config file accepts `--color auto` and `--color never`, but not `always`: a silent global default must not put escape codes into every pipe and break path-consuming scripts. `always` in the config file is a startup error. A missing or invalid value reports:
+
+```text
+zfind: expected auto, always or never after --color
+```
+
+A config error carries the usual location prefix:
+
+```text
+zfind: /home/user/.config/zfind/config:3: --color always is not allowed in the config file (use auto or never)
+```
 
 ### Result Limiting
 
@@ -317,13 +360,14 @@ The configuration file uses a line-oriented format matching command-line option 
 # Formatting
 --separator='\n'
 --limit 500
+--color auto
 ```
 
 - **Lines:** Each non-blank line represents one option: `--name`, `--name=value`, or `--name value`.
 - **Comments:** Lines starting with `#` (ignoring leading whitespace) are comments. Inline comments are not supported (`#` elsewhere is treated as part of the value).
 - **Quoting:** Values may be enclosed in single (`'...'`) or double (`"..."`) quotes to preserve leading or trailing whitespace. The enclosing quote character cannot appear inside the string.
 - **Escapes & Expansions:** Shell variables (`$VAR`), tilde (`~`), globs, and command substitutions are not expanded. Backslashes are passed directly to the corresponding option handler (e.g. `--separator='\t'`).
-- **Disallowed Options:** Short options, `PATTERN`, `--`, `--help`, `--config`, and `--no-config` are forbidden inside the configuration file.
+- **Disallowed Options:** Short options, `PATTERN`, `--`, `--help`, `--config`, and `--no-config` are forbidden inside the configuration file. `--color always` is also rejected (use `auto` or `never`).
 
 ### Precedence & Merging
 
@@ -332,7 +376,7 @@ Evaluation flows from **Built-in Defaults** $\rightarrow$ **Config File** $\righ
 | Option Class | Behavior | Override Rule |
 | :--- | :--- | :--- |
 | **Modes**<br>`--case-sensitive` / `--case-insensitive`<br>`--hidden` / `--no-hidden`<br>`--gitignore` / `--no-gitignore` | CLI overrides config. | Conflicting flags within the same source produce an error. Setting a mode on the CLI replaces the config mode. Note: If a config file specifies a case flag, there is no flag to revert back to smart case from the CLI. |
-| **Scalars**<br>`--separator`, `--limit` | Last-write wins. | CLI overwrites config file values. A later `--limit N` replaces an earlier limit. `--limit 0` prints nothing; limits cannot be completely unset once declared. |
+| **Scalars**<br>`--separator`, `--limit`, `--color` | Last-write wins. | CLI overwrites config file values. A later `--limit N` replaces an earlier limit. `--limit 0` prints nothing; limits cannot be completely unset once declared. The config file allows only `--color auto` and `--color never`; `always` there is an error. |
 | **Lists**<br>`--type`, `--exclude-name` | Cumulative set union. | Command-line values append to config file entries. Duplicate items are deduplicated. The total combined unique `--exclude-name` entries must not exceed 64. Use `--no-config` to discard configured list entries. |
 
 ---
