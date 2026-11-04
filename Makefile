@@ -109,5 +109,7 @@ test: $(BIN) $(SERIAL_BIN) $(UNKNOWN_BIN) $(RANGE_BIN)
 # Quiet run for agents: only failures and a one-line summary. pytest.ini sets
 # -vv; `-o addopts=` clears it, so the strict flags are repeated here. -s also
 # hides the build and recipe echo.
+T ?=
+
 test-quiet:
-	@$(MAKE) --no-print-directory -s test PYTEST_ARGS='-o addopts= -q --no-header --tb=short -rfE --strict-markers --strict-config'
+	@$(MAKE) --no-print-directory -s test PYTEST_ARGS='-o addopts= -q --no-header --tb=short -rfE --strict-markers --strict-config $(T)'
