@@ -4,6 +4,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ;   zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
 ;         [--exclude-name NAME] [--limit N] [--type f|d|l]
+;         [--color auto|always|never]
 ;         [--config PATH | --no-config] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
@@ -35,6 +36,12 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; Opposing modes within one source are an error. A missing default file is
 ; normal; anything else wrong with the file stops zfind before the walk, and
 ; the error names the file and line.
+; --color auto|always|never controls ANSI styling of results: directories are
+; cyan, matching basename bytes are bold+reverse, everything else is default.
+; auto (the default) colors only a terminal with NO_COLOR unset or empty and
+; TERM set and not "dumb"; the mode is resolved once before the walk. The
+; config file may say auto or never, never always: a silent global default
+; must not put escapes into every pipe.
 ; shortcut: no path arguments, no regex/glob, and none of the
 ;   ignore sources beyond .gitignore in the walked tree itself (no parent
 ;   dirs, no global gitignore, no .ignore, no [] or \ in patterns);
@@ -126,17 +133,25 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define STACK_SZ    (1 << 20)        ; one worker stack
 %define MAX_THREADS 16
 %ifndef BLK_SZ
-%define BLK_SZ      16384            ; one output block, header included
+%define BLK_SZ      49152            ; one output block, header included; a
+                                     ;   colored result can be ~45 KiB
 %endif
 %ifndef BLK_LIMIT
-%define BLK_LIMIT   14336            ; blocks in flight before producers wait
+%define BLK_LIMIT   4608             ; blocks in flight before producers wait
+                                     ;   (~216 MiB, the old memory budget)
 %endif
 %define BLK_HDR     32
 %define FD_KEEP_MAX  64               ; directories one thread keeps open while recursing
 %define SORT_RUN    16               ; insertion-sort runs this long, merge above
 %define BLK_DATA    (BLK_SZ - BLK_HDR)
-%if 2 + PATH_MAX + 1 + SEP_MAX > BLK_DATA
-    %error "a result frame (2 + path + '/' + separator) must fit in one block"
+; Worst case: every path byte is its own match run (ESC[1;7m + byte +
+; ESC[0m = 11 bytes), plus a trailing '/' and the separator. The u16 frame
+; header used by --limit is the +2. A frame never spans blocks.
+%if 11 * (PATH_MAX + 1) + SEP_MAX + 2 > BLK_DATA
+    %error "a colored result frame must fit in one block"
+%endif
+%if 11 * (PATH_MAX + 1) + SEP_MAX + 2 > 0xffff
+    %error "a colored result frame must fit the u16 --limit header"
 %endif
 %define BLK_NEXT    0                ; next block of the record / free-list link
 %define BLK_USED    8                ; bytes of data written so far
@@ -301,6 +316,10 @@ section .rodata
     e_cfg_quote_e:
     e_cfg_path  db "zfind: config path too long", 10
     e_cfg_path_e:
+    e_color     db "zfind: expected auto, always or never after --color", 10
+    e_color_e:
+    e_color_cfg db "zfind: --color always is not allowed in the config file (use auto or never)", 10
+    e_color_cfg_e:
     e_pfx       db "zfind: "          ; 7 bytes: every message starts with it
     h_long      db "--help", 0
     cs_long     db "--case-sensitive", 0
@@ -320,6 +339,17 @@ section .rodata
     cfg_long    db "--config", 0
     cfg_eq      db "--config=", 0    ; 9 bytes of prefix
     nocfg_long  db "--no-config", 0
+    color_long  db "--color", 0
+    color_eq    db "--color=", 0     ; 8 bytes of prefix
+    val_auto    db "auto", 0
+    val_always  db "always", 0
+    val_never   db "never", 0
+    env_no_color db "NO_COLOR=", 0   ; 9 bytes of prefix
+    env_term    db "TERM=", 0        ; 5 bytes of prefix
+    seq_cyan    db 27, '[', '3', '6', 'm'   ; 5 bytes
+    seq_match   db 27, '[', '1', ';', '7', 'm' ; 6 bytes
+    seq_reset   db 27, '[', '0', 'm'        ; 4 bytes
+    slash       db '/'
     dd_long     db "--", 0
     env_xdg     db "XDG_CONFIG_HOME=", 0   ; 16 bytes of prefix
     env_home    db "HOME=", 0              ; 5 bytes of prefix
@@ -330,6 +360,7 @@ section .rodata
     help_msg    db "usage: zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
                db "             [--exclude-name NAME]... [--limit N] [--type f|d|l]", 10
+               db "             [--color auto|always|never]", 10
                db "             [--config PATH | --no-config] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
@@ -373,6 +404,10 @@ section .rodata
                db "  --limit N           print at most N results, then stop (0 = none)", 10
                db "  --type f|d|l        repeatable; print regular files, directories, symlinks", 10
                db "                      also --type=V", 10
+               db "  --color WHEN        color results: auto, always or never (default: auto)", 10
+               db "                      also --color=WHEN; auto colors a terminal unless", 10
+               db "                      NO_COLOR or TERM=dumb; an unset TERM is plain", 10
+               db "                      the config file allows auto and never", 10
                db "  --config PATH       read settings from PATH instead of the default file", 10
                db "                      (also --config=PATH); the file must exist", 10
                db "  --no-config         read no config file", 10
@@ -416,6 +451,10 @@ section .bss
     res_ig:     resq 1                ; 0 = default, 1 = --gitignore, 2 = --no-gitignore
     hid_mode:   resb 1                ; 0 = default, 1 = --hidden, 2 = --no-hidden
     case_mode:  resb 1                ; 0 = smart (default), 1 = forced sensitive, 2 = forced insensitive
+    color_mode: resb 1                ; 0 = not set, 1 = auto, 2 = always, 3 = never
+    cfg_color:  resb 1                ; the config file's color mode, parked while
+                                      ;   the command line is parsed (0 = not set)
+    color_on:   resb 1                ; resolved once at startup: 1 = emit ANSI
     res_type:   resb 32                ; d_type bitset: DT_DIR=4, DT_REG=8
     type_seen:  resb 1
     git_repo:   resq 1
@@ -452,7 +491,7 @@ section .bss
     blk_out:    resq 1                ; blocks handed out and not yet written
     emit_cur:   resq 1                ; record the writer is on (never throttled)
     out_len:    resq 1
-    statbuf0:   resb 144              ; only _start's .git check, before any thread
+    statbuf0:   resb 144              ; _start's .git check and the color tty probe, before any thread
     cfg_pathbuf: resb PATH_MAX        ; default config location
     cfg_buf:    resb CFG_MAX + 2      ; whole config file; excl_names points into it
     err_buf:    resb PATH_MAX + 512   ; "zfind: PATH:LINE: message"
@@ -514,6 +553,9 @@ _start:
     mov rax, [res_ig]
     mov [cfg_ig], rax
     mov qword [res_ig], 0
+    mov al, [color_mode]
+    mov [cfg_color], al
+    mov byte [color_mode], 0
     mov rdi, rbp
     mov rsi, rbx
     call parse_args
@@ -529,10 +571,16 @@ _start:
     mov [hid_mode], al
 .merge_ig:
     cmp qword [res_ig], 0
-    jne .have_args
+    jne .merge_color
     mov rax, [cfg_ig]
     mov [res_ig], rax
+.merge_color:
+    cmp byte [color_mode], 0
+    jne .have_args
+    mov al, [cfg_color]
+    mov [color_mode], al
 .have_args:
+    call resolve_color               ; once, before any result
     test r13, r13
     jz .no_pat
     mov [pat_ptr], r13
@@ -843,6 +891,14 @@ parse_args:
     call startswith
     je .opt_type_eq
     mov rdi, [rbp+r12*8]
+    lea rsi, [color_long]
+    call streq
+    je .opt_color_next
+    mov rdi, [rbp+r12*8]
+    lea rsi, [color_eq]
+    call startswith
+    je .opt_color_eq
+    mov rdi, [rbp+r12*8]
     lea rsi, [l_eq]
     call startswith
     je .opt_limit_eq
@@ -943,6 +999,42 @@ parse_args:
     bts qword [res_type], 8            ; DT_REG
 .type_set:
     mov byte [type_seen], 1
+    inc r12
+    jmp .args_loop
+
+.opt_color_next:
+    inc r12
+    cmp r12, rbx
+    jae bad_color
+    mov rdi, [rbp+r12*8]
+    jmp .opt_color_value
+.opt_color_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 8                         ; len("--color=")
+.opt_color_value:                      ; rdi = the value: auto, always or never
+    lea rsi, [val_auto]
+    call streq
+    je .color_auto
+    lea rsi, [val_always]
+    call streq
+    je .color_always
+    lea rsi, [val_never]
+    call streq
+    je .color_never
+    jmp bad_color
+.color_auto:
+    mov al, 1
+    jmp .color_set
+.color_always:
+    ; A config file must not force color: it would silently color every pipe.
+    cmp qword [err_path], 0
+    jne bad_color_cfg
+    mov al, 2
+    jmp .color_set
+.color_never:
+    mov al, 3
+.color_set:
+    mov [color_mode], al
     inc r12
     jmp .args_loop
 
@@ -1134,6 +1226,10 @@ find_config:
     je .skip
     mov rdi, [rbp+r12*8]
     lea rsi, [excl_long]
+    call streq
+    je .skip
+    mov rdi, [rbp+r12*8]
+    lea rsi, [color_long]
     call streq
     je .skip
     jmp .next
@@ -1347,7 +1443,7 @@ load_config.end_func:
 ; "--name", "--name=value" or "--name value" (surrounding blanks and \r are
 ; ignored; the value may be wrapped in matching quotes, which are removed).
 ; It is run through parse_args as a one-entry argv, or a two-entry one when the
-; option takes a value (--limit, --type, --separator, --exclude-name): text after
+; option takes a value (--limit, --type, --separator, --exclude-name, --color): text after
 ; a flag is an error, so a line can never carry a second option. The line is
 ; edited in place and the buffer lives for the whole run: excl_names points into
 ; it. --help, --config, --no-config and "--" are command-line only.
@@ -1439,6 +1535,9 @@ cfg_line:
     call streq
     je .split
     lea rsi, [excl_long]
+    call streq
+    je .split
+    lea rsi, [color_long]
     call streq
     je .split
     ; A flag with text after it. Parse the name alone first, so that an unknown
@@ -1655,6 +1754,91 @@ startswith:
     or eax, 1                          ; ZF=0
     ret
 startswith.end_func:
+
+; env_find: rdi = "NAME=" (NUL-terminated) -> rax = the value after '=', or 0.
+; The first variable with that exact name wins, as with getenv.
+    global env_find:function (env_find.end_func - env_find)
+env_find:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi                     ; the prefix
+    call strlen
+    mov r12, rax                     ; prefix length
+    mov r13, [envp_ptr]
+.loop:
+    mov rdi, [r13]
+    test rdi, rdi
+    jz .none
+    mov rsi, rbx
+    call startswith
+    je .found
+    add r13, 8
+    jmp .loop
+.found:
+    mov rax, [r13]
+    add rax, r12
+    jmp .ret
+.none:
+    xor eax, eax
+.ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+env_find.end_func:
+
+; resolve_color: turn color_mode (0/1 auto, 2 always, 3 never) into color_on.
+; The environment and the terminal check apply only to auto. NO_COLOR counts
+; only when set to a non-empty string (no-color.org); an unset TERM means plain
+; (ripgrep/anstyle-query) and TERM=dumb means plain. Runs once, before the walk.
+    global resolve_color:function (resolve_color.end_func - resolve_color)
+resolve_color:
+    push rbx
+    movzx eax, byte [color_mode]
+    cmp eax, 2
+    je .on                           ; always
+    cmp eax, 3
+    je .off                          ; never
+    ; auto (or unset: the built-in default)
+    lea rdi, [env_no_color]
+    call env_find
+    test rax, rax
+    jz .term
+    cmp byte [rax], 0
+    jne .off                         ; NO_COLOR=<non-empty>
+.term:
+    lea rdi, [env_term]
+    call env_find
+    test rax, rax
+    jz .off                          ; TERM unset
+    cmp byte [rax], 'd'
+    jne .tty
+    cmp byte [rax+1], 'u'
+    jne .tty
+    cmp byte [rax+2], 'm'
+    jne .tty
+    cmp byte [rax+3], 'b'
+    jne .tty
+    cmp byte [rax+4], 0
+    je .off                          ; TERM=dumb
+.tty:
+    mov eax, 16                      ; ioctl
+    mov edi, 1                       ; stdout
+    mov esi, 0x5401                  ; TCGETS
+    lea rdx, [statbuf0]
+    syscall
+    test rax, rax
+    js .off                          ; not a terminal
+.on:
+    mov byte [color_on], 1
+    jmp .ret
+.off:
+    mov byte [color_on], 0
+.ret:
+    pop rbx
+    ret
+resolve_color.end_func:
 
 ; cpu_count -> rax = walking thread count, 2..MAX_THREADS (the main thread
 ; writes and is not counted). -DFORCE_THREADS=n pins it for stress tests.
@@ -2972,6 +3156,321 @@ sort_table:
     ret
 sort_table.end_func:
 
+; -----------------------------------------------------------------------------
+; Color rendering
+;
+; The search filter is untouched: spans are found only here, at render time,
+; and only for entries about to be printed with color on. match_next uses the
+; same pat_ci/smart-case decision as name_match, so highlighting cannot
+; disagree with filtering.
+; -----------------------------------------------------------------------------
+
+%define RS_DEST   0                 ; write cursor, 0 while measuring
+%define RS_TOTAL  8                 ; bytes the line will occupy
+%define RS_CUR    16                ; dword: -1 none, 0 default, 1 cyan, 2 match
+%define RS_POS    24                ; next basename offset to scan
+%define RS_BASE   32                ; basename start in path_buf
+%define RS_MSTART 40                ; current match start
+%define RS_MEND   48                ; current match end (exclusive)
+%define RS_SZ     64
+
+; match_next: rdi = name, rsi = name length, rdx = start offset ->
+; rax = start of the next non-overlapping match, rcx = its end, or rax = -1.
+; Scans left to right and resumes after a match, so adjacent occurrences merge
+; in the renderer. Uses pat_ptr/pat_len/pat_ci exactly like name_match. A
+; match whose first or last byte is a UTF-8 continuation byte is skipped: it
+; could only come from a non-UTF-8 pattern, and highlighting it would split a
+; multibyte sequence. The entry is still printed, just not highlighted there.
+    global match_next:function (match_next.end_func - match_next)
+match_next:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r15
+    mov rbx, rdi                     ; name
+    mov r12, rsi                     ; name length
+    mov r13, rdx                     ; candidate start
+    mov rbp, [pat_len]
+    test rbp, rbp
+    jz .none
+    cmp rbp, r12
+    ja .none
+    mov r15, r12
+    sub r15, rbp                     ; highest start that can match
+    mov rsi, [pat_ptr]
+.loop:
+    cmp r13, r15
+    ja .none
+    lea rdi, [rbx+r13]
+    mov rdx, rsi
+    mov rcx, rbp
+.cmp:
+    mov al, [rdi]
+    mov r8b, [rdx]
+    cmp qword [pat_ci], 0
+    je .raw
+    TOLOWER al
+    TOLOWER r8b
+.raw:
+    cmp al, r8b
+    jne .next
+    inc rdi
+    inc rdx
+    dec rcx
+    jnz .cmp
+    mov rax, r13
+    lea rcx, [r13+rbp]
+    ; A continuation byte (10xxxxxx) at either edge means the match starts or
+    ; ends inside a UTF-8 sequence. Skip it rather than split the sequence.
+    movzx r8d, byte [rbx+rax]
+    and r8d, 0xc0
+    cmp r8d, 0x80
+    je .next
+    cmp rcx, r12
+    jae .ret
+    movzx r8d, byte [rbx+rcx]
+    and r8d, 0xc0
+    cmp r8d, 0x80
+    je .next
+    jmp .ret
+.next:
+    inc r13
+    jmp .loop
+.none:
+    mov rax, -1
+.ret:
+    pop r15
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+match_next.end_func:
+
+; style_emit: rdi = state, rsi = source, rcx = length, eax = style
+; (0 default, 1 cyan, 2 match). Runs are self-contained: when the style
+; changes, the previous styled run is closed with ESC[0m and the new one opens
+; with its own sequence. With state->dest = 0 it only accumulates the length.
+; Neighboring regions with the same style merge because no sequence is emitted.
+    global style_emit:function (style_emit.end_func - style_emit)
+style_emit:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi                     ; state
+    mov r12, rsi                     ; source
+    mov r13, rcx                     ; length
+    mov r8d, eax                     ; new style
+    cmp r8d, [rbx+RS_CUR]
+    je .copy
+    mov ecx, [rbx+RS_CUR]
+    test ecx, ecx
+    jle .open
+    add qword [rbx+RS_TOTAL], 4
+    mov rdi, [rbx+RS_DEST]
+    test rdi, rdi
+    jz .open
+    lea rsi, [seq_reset]
+    mov ecx, 4
+    rep movsb
+    mov [rbx+RS_DEST], rdi
+.open:
+    test r8d, r8d
+    jz .set
+    cmp r8d, 1
+    jne .open_match
+    lea rsi, [seq_cyan]
+    mov ecx, 5
+    jmp .open_do
+.open_match:
+    lea rsi, [seq_match]
+    mov ecx, 6
+.open_do:
+    add [rbx+RS_TOTAL], rcx
+    mov rdi, [rbx+RS_DEST]
+    test rdi, rdi
+    jz .set
+    rep movsb
+    mov [rbx+RS_DEST], rdi
+.set:
+    mov [rbx+RS_CUR], r8d
+.copy:
+    test r13, r13
+    jz .done
+    add [rbx+RS_TOTAL], r13
+    mov rdi, [rbx+RS_DEST]
+    test rdi, rdi
+    jz .done
+    mov rsi, r12
+    mov rcx, r13
+    rep movsb
+    mov [rbx+RS_DEST], rdi
+.done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+style_emit.end_func:
+
+; style_close: rdi = state. Close an open styled run, if any.
+    global style_close:function (style_close.end_func - style_close)
+style_close:
+    mov eax, [rdi+RS_CUR]
+    test eax, eax
+    jle .done
+    add qword [rdi+RS_TOTAL], 4
+    mov r8, rdi
+    mov rdi, [r8+RS_DEST]
+    test rdi, rdi
+    jz .set
+    lea rsi, [seq_reset]
+    mov ecx, 4
+    rep movsb
+    mov [r8+RS_DEST], rdi
+.set:
+    mov dword [r8+RS_CUR], 0
+.done:
+    ret
+style_close.end_func:
+
+; render_entry: rdi = path length, rsi = is dir, rdx = destination (0 = measure)
+; -> rax = payload length. Splits path_buf into the directory prefix and the
+; basename, emits cyan prefix, highlights basename match spans, makes the whole
+; directory name (trailing '/') cyan, and ends with the separator. Writes the
+; original path bytes; no second copy of the path is built.
+    global render_entry:function (render_entry.end_func - render_entry)
+render_entry:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r15
+    sub rsp, RS_SZ
+    mov r15, rsp                     ; state
+    mov [r15+RS_DEST], rdx
+    mov qword [r15+RS_TOTAL], 0
+    mov dword [r15+RS_CUR], -1
+    mov rbx, rdi                     ; path length
+    mov r12, rsi                     ; is dir
+
+    ; basename starts after the last '/'
+    xor eax, eax
+    xor ecx, ecx
+    lea rdx, [r14+path_buf]
+.scan:
+    cmp rcx, rbx
+    jae .scanned
+    cmp byte [rdx+rcx], '/'
+    jne .scan_next
+    lea rax, [rcx+1]
+.scan_next:
+    inc rcx
+    jmp .scan
+.scanned:
+    mov [r15+RS_BASE], rax
+
+    ; the directory prefix, if any, is one cyan run
+    test rax, rax
+    jz .name
+    mov rdi, r15
+    lea rsi, [r14+path_buf]
+    mov rcx, rax
+    mov eax, 1
+    call style_emit
+
+.name:
+    mov qword [r15+RS_POS], 0
+.name_loop:
+    lea rdi, [r14+path_buf]
+    add rdi, [r15+RS_BASE]
+    mov rsi, rbx
+    sub rsi, [r15+RS_BASE]
+    mov rdx, [r15+RS_POS]
+    call match_next
+    cmp rax, -1
+    je .no_more
+    mov [r15+RS_MSTART], rax
+    mov [r15+RS_MEND], rcx
+
+    ; default/cyan bytes before the match
+    mov rdx, [r15+RS_POS]
+    cmp rax, rdx
+    jbe .emit_match
+    mov rcx, rax
+    sub rcx, rdx
+    lea rsi, [r14+path_buf]
+    add rsi, [r15+RS_BASE]
+    add rsi, rdx
+    mov eax, 0
+    test r12, r12
+    jz .pre_style
+    mov eax, 1
+.pre_style:
+    mov rdi, r15
+    call style_emit
+
+.emit_match:
+    mov r8, [r15+RS_MSTART]
+    mov r9, [r15+RS_MEND]
+    mov rcx, r9
+    sub rcx, r8
+    lea rsi, [r14+path_buf]
+    add rsi, [r15+RS_BASE]
+    add rsi, r8
+    mov [r15+RS_POS], r9             ; before the call: r9 is caller-saved
+    mov rdi, r15
+    mov eax, 2
+    call style_emit
+    jmp .name_loop
+
+.no_more:
+    ; the rest of the basename
+    mov rdx, [r15+RS_POS]
+    mov rcx, rbx
+    sub rcx, [r15+RS_BASE]
+    cmp rdx, rcx
+    jae .after_name
+    sub rcx, rdx
+    lea rsi, [r14+path_buf]
+    add rsi, [r15+RS_BASE]
+    add rsi, rdx
+    mov eax, 0
+    test r12, r12
+    jz .rest_style
+    mov eax, 1
+.rest_style:
+    mov rdi, r15
+    call style_emit
+
+.after_name:
+    ; directory results carry the trailing '/' in the cyan run
+    test r12, r12
+    jz .separator
+    lea rsi, [slash]
+    mov rdi, r15
+    mov ecx, 1
+    mov eax, 1
+    call style_emit
+
+.separator:
+    mov rdi, r15
+    lea rsi, [sep_buf]
+    mov rcx, [sep_len]
+    xor eax, eax
+    call style_emit
+    mov rdi, r15
+    call style_close
+    mov rax, [r15+RS_TOTAL]
+    add rsp, RS_SZ
+    pop r15
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+render_entry.end_func:
+
 ; print_entry: rdi = path length, rsi = is dir. Appends "path[/]SEP" straight
 ; into the current record's last block (a new block when the line does not fit)
 ; and publishes it by bumping BLK_USED; the writer may be reading that block now.
@@ -2981,15 +3480,28 @@ sort_table.end_func:
 ; are a frame: a u16 little-endian payload length followed by the payload
 ; "path[/]SEP". Frames are internal to the block; BLK_USED counts framed bytes,
 ; a frame never spans blocks, and it is published only after the whole frame.
+; With color_on, the payload is rendered by render_entry instead: the plain
+; length is measured first so the block-room decision stays exact.
     global print_entry:function (print_entry.end_func - print_entry)
 print_entry:
     push rbx
+    push rbp
     push r12
     push r13
     mov rbx, rdi                     ; path length
     mov r13, rsi                     ; is_dir
+    cmp byte [color_on], 0
+    jne .color_len
     lea r12, [rdi+rsi]               ; payload length: path + '/' + separator
     add r12, [sep_len]
+    jmp .len_ready
+.color_len:
+    mov rdi, rbx
+    mov rsi, r13
+    xor edx, edx                     ; measure only
+    call render_entry
+    mov r12, rax
+.len_ready:
     cmp qword [r14+cur_task], 0
     jne .rec
     call new_text_record
@@ -3019,6 +3531,7 @@ print_entry:
     mov [r14+cur_blk], rax
     mov rdx, rax
 .room:
+    mov rbp, rdx                     ; the block that receives the frame
     mov rdi, [rdx+BLK_USED]
     lea rdi, [rdx+rdi+BLK_HDR]       ; where the line goes
     cmp qword [limit_mode], 0
@@ -3029,6 +3542,8 @@ print_entry:
     mov [rdi+1], al
     add rdi, 2
 .payload:
+    cmp byte [color_on], 0
+    jne .colored
     lea rsi, [r14+path_buf]
     mov rcx, rbx
     rep movsb
@@ -3036,6 +3551,13 @@ print_entry:
     jz .sep
     mov byte [rdi], '/'
     inc rdi
+    jmp .sep
+.colored:
+    mov rdx, rdi                     ; write at the payload position
+    mov rdi, rbx
+    mov rsi, r13
+    call render_entry
+    jmp .publish
 .sep:
     mov rax, [sep_len]
     cmp rax, 1
@@ -3053,9 +3575,10 @@ print_entry:
     je .publish_plain
     add rcx, 2
 .publish_plain:
-    add [rdx+BLK_USED], rcx          ; publish only after the complete frame
+    add [rbp+BLK_USED], rcx          ; publish only after the complete frame
     pop r13
     pop r12
+    pop rbp
     pop rbx
     ret
 print_entry.end_func:
@@ -3237,6 +3760,16 @@ bad_excl_full:
 bad_type:
     lea rsi, [e_type]
     mov rdx, e_type_e - e_type
+    jmp die
+
+bad_color:
+    lea rsi, [e_color]
+    mov rdx, e_color_e - e_color
+    jmp die
+
+bad_color_cfg:
+    lea rsi, [e_color_cfg]
+    mov rdx, e_color_cfg_e - e_color_cfg
     jmp die
 
 bad_flag:
