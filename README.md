@@ -128,8 +128,9 @@ zfind [OPTIONS] [--] [PATTERN]
 ```sh
 zfind test                  # Smart case: matches "test", "Test", "TEST"
 zfind Test                  # Smart case: matches only "Test", "Testing", etc.
-zfind --case-sensitive foo  # Force exact case-sensitive byte comparison
-zfind --case-insensitive FOO # Force case-insensitive match for "foo", "Foo", etc.
+zfind --case=sensitive foo  # Force exact case-sensitive byte comparison
+zfind --case=insensitive FOO # Force case-insensitive match for "foo", "Foo", etc.
+zfind --case=smart foo      # Smart case (the default); also undoes a configured --case
 ```
 
 #### Traversal & File Types
@@ -180,8 +181,7 @@ Scripts need no flag: piped output is plain by default. Add `--color=never` only
 | Option | Value / Argument | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `--help` | — | — | Print help text and exit immediately. |
-| `--case-sensitive` | — | Off | Force exact case-sensitive byte matching on `PATTERN`. |
-| `--case-insensitive`| — | Off | Force ASCII case-insensitive matching on `PATTERN`. |
+| `--case` | `smart` \| `sensitive` \| `insensitive` | `smart` | Match `PATTERN` with smart case, exact case-sensitive bytes, or ASCII case-insensitive folding. Also accepted as `--case=MODE`; repeated uses are last-wins. |
 | `--hidden` | — | Enabled | Search hidden files and directories (names starting with `.`). |
 | `--no-hidden` | — | Off | Prune all hidden files and directories from traversal. |
 | `--gitignore` | — | Off | Parse and apply `.gitignore` rules (skips `.git/`). |
@@ -203,12 +203,13 @@ Scripts need no flag: piped output is plain by default. Add `--color=never` only
 
 - **Literal Substrings:** `PATTERN` is checked directly against directory and file basenames. Glob patterns (`*`, `?`) and regular expressions are treated as raw literal bytes.
 - **Smart Case (Default):** Matching is ASCII case-insensitive unless the query string contains at least one uppercase ASCII character (`A`–`Z`), in which case matching becomes case-sensitive.
-- **Explicit Flags:**
-  - `--case-sensitive` overrides default behavior to require exact byte matches.
-  - `--case-insensitive` forces ASCII case folding regardless of whether uppercase characters are present.
-  - Specifying both `--case-sensitive` and `--case-insensitive` in the same invocation triggers a usage error.
+- **Explicit Modes:**
+  - `--case=smart` (the default) applies smart case as described above.
+  - `--case=sensitive` forces exact byte matching.
+  - `--case=insensitive` forces ASCII case folding regardless of whether uppercase characters are present.
+  - `--case` is a single setting; when it is given more than once, the last value wins.
 - **Encoding:** Case folding is strictly ASCII-based (`A`–`Z` $\leftrightarrow$ `a`–`z`). Non-ASCII bytes (e.g., UTF-8 multibyte characters) are compared verbatim without normalization.
-- **Scope:** Case flags affect only the search `PATTERN`. `--exclude-name` and `.gitignore` matches are completely unaffected by them.
+- **Scope:** `--case` affects only the search `PATTERN`. `--exclude-name` and `.gitignore` matches are completely unaffected by it.
 
 ### Hidden Files & Directories
 
@@ -288,7 +289,7 @@ zfind: /home/user/.config/zfind/config:3: --color always is not allowed in the c
 ### Basename Exclusions (`--exclude-name`)
 
 - `--exclude-name NAME` rejects any entry whose basename equals `NAME` exactly.
-- Matches are case-sensitive and bytewise; they are not affected by `--case-sensitive` or `--case-insensitive`.
+- Matches are case-sensitive and bytewise; they are not affected by `--case`.
 - Globs, regexes, Unicode normalization, and backslash escape sequences are **not** interpreted.
 - `NAME` must be non-empty and must not contain `/`.
 - If a directory matches `NAME`, it is neither printed nor traversed.
@@ -354,7 +355,7 @@ The configuration file uses a line-oriented format matching command-line option 
 # ~/.config/zfind/config
 
 # Matching & Traversal
---case-insensitive
+--case=insensitive
 --no-hidden
 --gitignore
 
@@ -381,8 +382,8 @@ Evaluation flows from **Built-in Defaults** $\rightarrow$ **Config File** $\righ
 
 | Option Class | Behavior | Override Rule |
 | :--- | :--- | :--- |
-| **Modes**<br>`--case-sensitive` / `--case-insensitive`<br>`--hidden` / `--no-hidden`<br>`--gitignore` / `--no-gitignore` | CLI overrides config. | Conflicting flags within the same source produce an error. Setting a mode on the CLI replaces the config mode. Note: If a config file specifies a case flag, there is no flag to revert back to smart case from the CLI. |
-| **Scalars**<br>`--separator`, `--limit`, `--color` | Last-write wins. | CLI overwrites config file values. A later `--limit N` replaces an earlier limit, and `--limit none` cancels a configured one (for example `--limit none` over `--limit 200` in the file). `--limit 0` prints nothing. The config file allows only `--color auto` and `--color never`; `always` there is an error. |
+| **Modes**<br>`--hidden` / `--no-hidden`<br>`--gitignore` / `--no-gitignore` | CLI overrides config. | Conflicting flags within the same source produce an error. Setting a mode on the CLI replaces the config mode. |
+| **Scalars**<br>`--separator`, `--limit`, `--case`, `--color` | Last-write wins. | CLI overwrites config file values. Each default can be spelled out, so the CLI can undo a configured value: for example `--case=smart` over a configured `--case=sensitive`, or `--limit none` over `--limit 200`. `--limit 0` prints nothing. The config file allows only `--color auto` and `--color never`; `always` there is an error. |
 | **Type filter**<br>`--type` | Command-line set replaces the file's. | If the command line gives any `--type`, the file's `--type` values are ignored for that run; otherwise the file's apply. Repeated values within one source accumulate, so `--type f --type d` selects both. |
 | **Exclusions**<br>`--exclude-name` | Cumulative set union. | Command-line values append to config file entries. Duplicate items are deduplicated. The total combined unique `--exclude-name` entries must not exceed 64. Use `--no-config` to discard configured exclusions. |
 
