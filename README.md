@@ -383,7 +383,8 @@ Evaluation flows from **Built-in Defaults** $\rightarrow$ **Config File** $\righ
 | :--- | :--- | :--- |
 | **Modes**<br>`--case-sensitive` / `--case-insensitive`<br>`--hidden` / `--no-hidden`<br>`--gitignore` / `--no-gitignore` | CLI overrides config. | Conflicting flags within the same source produce an error. Setting a mode on the CLI replaces the config mode. Note: If a config file specifies a case flag, there is no flag to revert back to smart case from the CLI. |
 | **Scalars**<br>`--separator`, `--limit`, `--color` | Last-write wins. | CLI overwrites config file values. A later `--limit N` replaces an earlier limit, and `--limit none` cancels a configured one (for example `--limit none` over `--limit 200` in the file). `--limit 0` prints nothing. The config file allows only `--color auto` and `--color never`; `always` there is an error. |
-| **Lists**<br>`--type`, `--exclude-name` | Cumulative set union. | Command-line values append to config file entries. Duplicate items are deduplicated. The total combined unique `--exclude-name` entries must not exceed 64. Use `--no-config` to discard configured list entries. |
+| **Type filter**<br>`--type` | Command-line set replaces the file's. | If the command line gives any `--type`, the file's `--type` values are ignored for that run; otherwise the file's apply. Repeated values within one source accumulate, so `--type f --type d` selects both. |
+| **Exclusions**<br>`--exclude-name` | Cumulative set union. | Command-line values append to config file entries. Duplicate items are deduplicated. The total combined unique `--exclude-name` entries must not exceed 64. Use `--no-config` to discard configured exclusions. |
 
 ---
 
