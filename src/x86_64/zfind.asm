@@ -32,7 +32,8 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; (parse_args), so each line is checked exactly like its flag. The layers are
 ; the built-in defaults, then the file, then the command line: a mode
 ; (case, hidden, gitignore) set on the command line replaces the file's, a scalar
-; (--separator, --limit) is overwritten, and --type / --exclude-name accumulate.
+; (--separator, --limit) is overwritten, a command-line --type replaces the
+; file's whole set, and --exclude-name accumulates.
 ; Opposing modes within one source are an error. A missing default file is
 ; normal; anything else wrong with the file stops zfind before the walk, and
 ; the error names the file and line.
@@ -380,8 +381,9 @@ section .rodata
                db "value is expected.", 10, 10
                db "Settings are also read from $XDG_CONFIG_HOME/zfind/config, else", 10
                db "~/.config/zfind/config: one option per line, # starts a comment line.", 10
-               db "Command-line options override the file, except --type and --exclude-name,", 10
-               db "which add to it. --config and --no-config are command-line only.", 10, 10
+               db "Command-line options override the file, except --exclude-name, which adds", 10
+               db "to it; a command-line --type replaces the file's --type values.", 10
+               db "--config and --no-config are command-line only.", 10, 10
                db "Hidden entries are searched like any other, .git and .jj included; --no-hidden", 10
                db "skips entries whose name starts with . and everything inside them.", 10
                db "--hidden states the default explicitly; combining the two is an error.", 10
@@ -466,6 +468,7 @@ section .bss
     cfg_hid:    resb 1                ;   command line is parsed (0 = not set)
     alignb 8
     cfg_ig:     resq 1
+    cfg_type:   resq 1                ; the config file's --type bits (first qword of res_type)
     cfg_path:   resq 1                ; file to read (argv string or cfg_pathbuf)
     envp_ptr:   resq 1
     err_path:   resq 1                ; nonzero while the config file is being read:
@@ -540,9 +543,10 @@ _start:
     ; file, then the command line. One parser (parse_args) reads both the file
     ; and argv. Modes (case, hidden, gitignore) use 0 = "not set by this layer",
     ; so the file's choice is parked while the command line is parsed and
-    ; restored for any mode the command line left alone. Scalars are plain
-    ; last-wins overwrites and the lists (--type, --exclude-name) accumulate, so
-    ; neither needs a merge step. All of this finishes before the first mmap.
+    ; restored for any mode the command line left alone. --type is parked the
+    ; same way, as a whole set: a command-line --type drops the file's. Scalars
+    ; are plain last-wins overwrites and --exclude-name accumulates, so neither
+    ; needs a merge step. All of this finishes before the first mmap.
     lea rax, [rbp+rbx*8+8]           ; envp follows argv's NULL terminator
     mov [envp_ptr], rax
     call find_config                 ; --config / --no-config (rbx, rbp kept)
@@ -556,6 +560,10 @@ _start:
     mov rax, [res_ig]
     mov [cfg_ig], rax
     mov qword [res_ig], 0
+    mov rax, [res_type]              ; --type is a filter, so the command line
+    mov [cfg_type], rax              ;   replaces the file's set as a whole
+    mov qword [res_type], 0          ;   (only d_type values below 64 are ever stored)
+    mov byte [type_seen], 0
     mov al, [color_mode]
     mov [cfg_color], al
     mov byte [color_mode], 0
@@ -574,9 +582,16 @@ _start:
     mov [hid_mode], al
 .merge_ig:
     cmp qword [res_ig], 0
-    jne .merge_color
+    jne .merge_type
     mov rax, [cfg_ig]
     mov [res_ig], rax
+.merge_type:
+    cmp byte [type_seen], 0
+    jne .merge_color                ; command line chose types: the file's are dropped
+    mov rax, [cfg_type]
+    mov [res_type], rax
+    test rax, rax
+    setnz byte [type_seen]
 .merge_color:
     cmp byte [color_mode], 0
     jne .have_args
