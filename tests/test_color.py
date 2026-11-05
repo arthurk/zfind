@@ -512,7 +512,7 @@ class TestRenderExamples:
         upper = run_env(zfind_path, tree, "--color=always", "Foo", env=base_env(home))
         assert upper == Result(out=b"", err=b"", status=0)
 
-    def test_case_flags_control_highlighting(
+    def test_case_options_control_highlighting(
         self, zfind_path: Path, tmp_path: Path, home: Path
     ):
         tree = tmp_path / "tree"
@@ -520,7 +520,7 @@ class TestRenderExamples:
         (tree / "Foo.txt").write_bytes(b"")
 
         insensitive = run_env(
-            zfind_path, tree, "--color=always", "--case-insensitive", "FOO",
+            zfind_path, tree, "--color=always", "--case=insensitive", "FOO",
             env=base_env(home),
         )
         assert insensitive == Result(
@@ -528,7 +528,7 @@ class TestRenderExamples:
         )
 
         sensitive = run_env(
-            zfind_path, tree, "--color=always", "--case-sensitive", "foo",
+            zfind_path, tree, "--color=always", "--case=sensitive", "foo",
             env=base_env(home),
         )
         assert sensitive == Result(out=b"", err=b"", status=0)

@@ -518,7 +518,12 @@ class TestConfigErrors:
             pytest.param("--exclude-name 'a\n", 1, "malformed quotes in config value", id="blank-form-quote-never-closed"),
             pytest.param("--hidden\n--no-hidden\n", 2, "cannot combine --hidden and --no-hidden", id="conflict-hidden"),
             pytest.param("--no-hidden\n--hidden\n", 2, "cannot combine --hidden and --no-hidden", id="conflict-hidden-reversed"),
-            pytest.param("--case-sensitive\n--case-insensitive\n", 2, "cannot combine --case-sensitive and --case-insensitive", id="conflict-case"),
+            pytest.param("--case=bogus\n", 1, "expected smart, sensitive or insensitive after --case", id="case-bad-value"),
+            pytest.param("--case\n", 1, "expected smart, sensitive or insensitive after --case", id="case-without-value"),
+            pytest.param("--case=\n", 1, "expected smart, sensitive or insensitive after --case", id="case-equals-without-value"),
+            pytest.param("--case=Smart\n", 1, "expected smart, sensitive or insensitive after --case", id="case-capitalized-value"),
+            pytest.param("--case=s\n", 1, "expected smart, sensitive or insensitive after --case", id="case-abbreviation"),
+            pytest.param("--no-hidden\n--case=bogus\n", 2, "expected smart, sensitive or insensitive after --case", id="case-error-names-line-two"),
             pytest.param("--gitignore\n--no-gitignore\n", 2, "cannot combine --gitignore and --no-gitignore", id="conflict-gitignore"),
             pytest.param("--hidden\n--hidden\n--no-hidden\n", 3, "cannot combine --hidden and --no-hidden", id="conflict-names-the-later-line"),
             pytest.param("config\n", 1, "config lines must be long options", id="positional-pattern"),
@@ -597,12 +602,22 @@ class TestConfigPrecedence:
     @pytest.mark.parametrize(
         ("text", "args", "expected"),
         [
-            # case: an explicit command-line choice replaces the file's
-            ("--case-insensitive\n", ("Config",), CONFIG_HITS),
-            ("--case-insensitive\n", ("--case-sensitive", "Config"), [b"Config.md"]),
-            ("--case-sensitive\n", ("config",), SENSITIVE_HITS),
-            ("--case-sensitive\n", ("--case-insensitive", "config"), CONFIG_HITS),
-            ("--case-sensitive\n", ("--case-sensitive", "config"), SENSITIVE_HITS),
+            # case: a scalar, so the command line and the last value win
+            ("--case=insensitive\n", ("Config",), CONFIG_HITS),
+            ("--case=insensitive\n", ("--case=sensitive", "Config"), [b"Config.md"]),
+            ("--case=insensitive\n", ("--case", "sensitive", "Config"), [b"Config.md"]),
+            ("--case=sensitive\n", ("config",), SENSITIVE_HITS),
+            ("--case=sensitive\n", ("--case=insensitive", "config"), CONFIG_HITS),
+            ("--case=sensitive\n", ("--case=sensitive", "config"), SENSITIVE_HITS),
+            ("--case=sensitive\n", ("--case=smart", "config"), CONFIG_HITS),
+            ("--case=insensitive\n", ("--case=smart", "Config"), [b"Config.md"]),
+            # the last value wins within one source
+            ("--case=sensitive\n--case=smart\n", ("config",), CONFIG_HITS),
+            ("--case=smart\n--case=sensitive\n", ("config",), SENSITIVE_HITS),
+            # the space and quoted forms are accepted in the file
+            ("--case sensitive\n", ("config",), SENSITIVE_HITS),
+            ("--case='sensitive'\n", ("config",), SENSITIVE_HITS),
+            ('--case "sensitive"\n', ("config",), SENSITIVE_HITS),
             # hidden
             ("--no-hidden\n", ("config",), VISIBLE_HITS),
             ("--no-hidden\n", ("--hidden", "config"), CONFIG_HITS),
@@ -615,10 +630,10 @@ class TestConfigPrecedence:
             ("--no-gitignore\n", ("a.txt",), [b"a.txt"]),
             ("--no-gitignore\n", ("--gitignore", "a.txt"), []),
             # one layer overriding several modes at once
-            ("--gitignore\n--no-hidden\n--case-sensitive\n",
-             ("--no-gitignore", "--hidden", "--case-insensitive", "config"), CONFIG_HITS),
+            ("--gitignore\n--no-hidden\n--case=sensitive\n",
+             ("--no-gitignore", "--hidden", "--case=insensitive", "config"), CONFIG_HITS),
             # modes the command line leaves alone keep the file's choice
-            ("--no-hidden\n--case-sensitive\n", ("--no-gitignore", "config"),
+            ("--no-hidden\n--case=sensitive\n", ("--no-gitignore", "config"),
              [hit for hit in SENSITIVE_HITS if hit != b".git/config"]),
         ],
     )
@@ -627,6 +642,22 @@ class TestConfigPrecedence:
     ):
         cfg.write(text)
         assert cfg(*args) == listing(expected)
+
+    @pytest.mark.parametrize(
+        ("text", "args", "expected"),
+        [
+            ("--case=sensitive\n", ("config",), SENSITIVE_HITS),
+            ("--case=sensitive\n", ("--case=smart", "config"), CONFIG_HITS),
+            ("--case=sensitive\n", ("--case=insensitive", "config"), CONFIG_HITS),
+            ("--case=smart\n--case=sensitive\n", ("config",), SENSITIVE_HITS),
+        ],
+    )
+    def test_case_precedence_across_builds(
+        self, build_cfg: ConfigRunner, text: str, args: tuple[str, ...],
+        expected: list[bytes],
+    ):
+        build_cfg.write(text)
+        assert build_cfg(*args) == listing(expected)
 
     @pytest.mark.parametrize(
         ("text", "args", "expected"),
@@ -787,8 +818,8 @@ class TestNoConfigIsInert:
         ("--separator", ";", "config"),
         ("--exclude-name", "node_modules", "config"),
         ("--gitignore", "a.txt"),
-        ("--case-sensitive", "Config"),
-        ("--case-insensitive", "CONFIG"),
+        ("--case=sensitive", "Config"),
+        ("--case=insensitive", "CONFIG"),
         ("--", "-x"),
         ("--help",),
         ("--bogus",),
@@ -801,7 +832,7 @@ class TestNoConfigIsInert:
     def test_no_config_matches_a_run_with_no_config_at_all(
         self, cfg: ConfigRunner, args: tuple[str, ...]
     ):
-        cfg.write("--no-hidden\n--limit 1\n--case-sensitive\n--exclude-name=d\n--type f\n")
+        cfg.write("--no-hidden\n--limit 1\n--case=sensitive\n--exclude-name=d\n--type f\n")
         baseline = cfg(*args, home=False)  # no HOME, no XDG: nothing to read
         assert cfg("--no-config", *args) == baseline
 

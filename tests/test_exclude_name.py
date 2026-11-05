@@ -122,11 +122,11 @@ class TestExcludeNameMatching:
         for name in ("a*b", "c?d", "[ab]", "Foo", "foo", "dir/a*b"):
             (tree / name).write_bytes(b"")
 
-        res = run_in(zfind_path, tree, "--case-insensitive", "--exclude-name=a*b")
+        res = run_in(zfind_path, tree, "--case=insensitive", "--exclude-name=a*b")
         assert res.status == 0 and res.err == b""
         assert entries(res.out) == [b"Foo", b"[ab]", b"c?d", b"dir/", b"foo"]
 
-        case = run_in(zfind_path, tree, "--case-insensitive", "--exclude-name=Foo")
+        case = run_in(zfind_path, tree, "--case=insensitive", "--exclude-name=Foo")
         assert b"Foo\n" not in case.out and b"foo\n" in case.out
 
         pruned = run_in(zfind_path, tree, "--exclude-name=dir", "--type", "f")

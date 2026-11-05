@@ -13,10 +13,9 @@ from helpers import ZfindRunner, entries, run_in
 # -----------------------------------------------------------------------------
 
 CURRENT_HELP_OPTIONS = [
-    b"--separator", b"--case-sensitive", b"--case-insensitive",
-    b"--gitignore", b"--no-gitignore", b"--hidden", b"--no-hidden",
-    b"--exclude-name", b"--limit", b"--type", b"--color", b"--config",
-    b"--no-config", b"--help",
+    b"--separator", b"--case", b"--gitignore", b"--no-gitignore", b"--hidden",
+    b"--no-hidden", b"--exclude-name", b"--limit", b"--type", b"--color",
+    b"--config", b"--no-config", b"--help",
 ]
 
 
@@ -88,6 +87,8 @@ class TestCliBasics:
     @pytest.mark.parametrize("arg", [
         pytest.param("--ignore-case", id="old-case-spelling"),
         pytest.param("--ignore-case=foo", id="old-case-spelling-with-value"),
+        pytest.param("--case-sensitive", id="removed-case-sensitive"),
+        pytest.param("--case-insensitive", id="removed-case-insensitive"),
         pytest.param("-h", id="removed-short-help"),
         pytest.param("-0", id="removed-short-null"),
     ])
@@ -102,6 +103,8 @@ class TestCliBasics:
         for option in CURRENT_HELP_OPTIONS:
             assert option in out
         assert b"--ignore-case" not in out
+        assert b"--case-sensitive" not in out
+        assert b"--case-insensitive" not in out
         assert b"--null" not in out
         assert all(len(line) <= 80 for line in out.splitlines())
 
@@ -176,16 +179,6 @@ class TestParserEdges:
 
 class TestConflictingFlags:
     @pytest.mark.parametrize("flags, expected_err", [
-        pytest.param(
-            ["--case-sensitive", "--case-insensitive"],
-            b"zfind: cannot combine --case-sensitive and --case-insensitive\n",
-            id="case-conflict-sensitive-first",
-        ),
-        pytest.param(
-            ["--case-insensitive", "--case-sensitive"],
-            b"zfind: cannot combine --case-sensitive and --case-insensitive\n",
-            id="case-conflict-insensitive-first",
-        ),
         pytest.param(
             ["--hidden", "--no-hidden"],
             b"zfind: cannot combine --hidden and --no-hidden\n",

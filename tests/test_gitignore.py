@@ -76,7 +76,7 @@ class TestGitignore:
         for name in ("foo", "FOO", "Foo"):
             (tree / name).write_bytes(b"")
 
-        res = run_in(zfind_path, tree, "--gitignore", "--case-insensitive", "foo")
+        res = run_in(zfind_path, tree, "--gitignore", "--case=insensitive", "foo")
         assert res.status == 0, f"Command failed: {res}"
         assert res.err == b""
         assert entries(res.out) == [b"FOO", b"Foo"]
