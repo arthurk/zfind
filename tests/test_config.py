@@ -23,6 +23,36 @@ CONFIG_HITS = [
 VISIBLE_HITS = CONFIG_HITS[1:]  # --no-hidden drops .git/config
 SENSITIVE_HITS = [hit for hit in CONFIG_HITS if hit != b"Config.md"]
 
+# Everything in the shared tree, in output order, and the same split by type.
+TREE_ALL = [
+    b"$HOME",
+    b"*",
+    b".git/",
+    b".git/config",
+    b".gitignore",
+    b".hidden",
+    b"Config.md",
+    b"a#b",
+    b"a.txt",
+    b"d/",
+    b"d/config.x",
+    b"my dir/",
+    b"my dir/config.y",
+    b"node_modules/",
+    b"node_modules/x/",
+    b"node_modules/x/config",
+]
+TREE_FILES = [name for name in TREE_ALL if not name.endswith(b"/")]
+TREE_DIRS = [name for name in TREE_ALL if name.endswith(b"/")]
+
+# Every walker build: parallel, serial, DT_UNKNOWN and range.
+BUILDS = {
+    "parallel": "zfind_path",
+    "serial": "serial_zfind_path",
+    "unknown": "unknown_zfind_path",
+    "range": "range_zfind_path",
+}
+
 
 def listing(names: list[bytes]) -> Result:
     """A successful run that printed exactly these newline-terminated names."""
@@ -116,6 +146,18 @@ def home(tmp_path: Path) -> Path:
 @pytest.fixture
 def cfg(zfind_path: Path, tree: Path, home: Path) -> ConfigRunner:
     return ConfigRunner(zfind_path, tree, home)
+
+
+@pytest.fixture(params=list(BUILDS))
+def binary(request: pytest.FixtureRequest) -> Path:
+    """Each walker build in turn; tests using it cover all four."""
+    return request.getfixturevalue(BUILDS[request.param])
+
+
+@pytest.fixture
+def build_cfg(binary: Path, tree: Path, home: Path) -> ConfigRunner:
+    """The shared tree and config home, run by the parametrized build."""
+    return ConfigRunner(binary, tree, home)
 
 
 @pytest.fixture
@@ -511,6 +553,13 @@ class TestConfigErrors:
         cfg.write(text)
         assert cfg("config") == failure(cfg.error(line, message))
 
+    def test_a_bad_type_in_the_file_stops_the_run_even_when_the_command_line_sets_types(
+        self, cfg: ConfigRunner
+    ):
+        cfg.write("--type f\n--type q\n")
+        res = cfg("--type", "d")
+        assert res == failure(cfg.error(2, "expected f, d or l after --type"))
+
     def test_nul_byte_is_an_error_not_a_truncated_line(self, cfg: ConfigRunner):
         cfg.write(b"--hidden\n--no\x00hidden\n")
         assert cfg("config") == failure(cfg.error(2, "NUL byte in config file"))
@@ -622,23 +671,25 @@ class TestConfigPrecedence:
         assert cfg("--exclude-name", "d", "config") == listing(both)
         assert cfg("--exclude-name=node_modules", "--exclude-name=d", "config") == listing(both)
 
-    def test_types_accumulate_across_layers(self, cfg: ConfigRunner):
+    def test_command_line_type_replaces_the_file_type_set(self, cfg: ConfigRunner):
         cfg.write("--type f\n")
-        files = entries(cfg().out)
-        assert b"a.txt" in files and b"d/" not in files
-        both = entries(cfg("--type", "d").out)
-        assert b"a.txt" in both and b"d/" in both
-        assert cfg("--type", "f").out == cfg().out  # a repeated value changes nothing
+        assert cfg() == listing(TREE_FILES)
+        assert cfg("--type", "d") == listing(TREE_DIRS)
+        assert cfg("--type", "f") == listing(TREE_FILES)  # a repeated value changes nothing
 
     def test_l_selects_symlinks_in_the_file_in_either_form(self, links_cfg: ConfigRunner):
         for line in ("--type l\n", "--type=l\n"):
             links_cfg.write(line)
             assert links_cfg() == listing([b"dlnk", b"lnk"]), line
 
-    def test_types_accumulate_with_l_across_layers(self, links_cfg: ConfigRunner):
+    def test_command_line_type_replaces_a_configured_l(self, links_cfg: ConfigRunner):
         links_cfg.write("--type=l\n")
-        assert links_cfg("--type=f") == listing([b"dir/inner", b"dlnk", b"file", b"lnk"])
-        assert links_cfg("--type", "d") == listing([b"dir/", b"dlnk", b"lnk"])
+        assert links_cfg("--type=f") == listing([b"dir/inner", b"file"])
+        assert links_cfg("--type", "d") == listing([b"dir/"])
+
+    def test_command_line_l_replaces_a_configured_type(self, links_cfg: ConfigRunner):
+        links_cfg.write("--type f\n")
+        assert links_cfg("--type=l") == listing([b"dlnk", b"lnk"])
 
     def test_exclude_name_table_is_shared_between_layers(self, cfg: ConfigRunner):
         cfg.write("".join(f"--exclude-name=n{i}\n" for i in range(64)))
@@ -651,6 +702,74 @@ class TestConfigPrecedence:
         cfg.write("--limit 2\n")
         assert cfg("Config") == listing([b"Config.md"])  # smart case still applies
         assert cfg("config") == listing(CONFIG_HITS[:2])  # hidden entries still searched
+
+
+class TestTypeFilterAcrossBuilds:
+    @pytest.mark.parametrize(
+        ("text", "args", "expected"),
+        [
+            # no command-line --type: the file's set applies
+            ("--type f\n", (), TREE_FILES),
+            ("--type f\n--type d\n", (), TREE_ALL),
+            ("--type=f\n", (), TREE_FILES),
+            # any command-line --type drops the file's whole set
+            ("--type f\n", ("--type", "d"), TREE_DIRS),
+            ("--type f\n--type d\n", ("--type", "d"), TREE_DIRS),
+            ("--type f\n--type d\n", ("--type", "f"), TREE_FILES),
+            ("--type d\n", ("--type", "f"), TREE_FILES),
+            # repeats within the command line still accumulate
+            ("--type f\n", ("--type", "d", "--type", "d"), TREE_DIRS),
+            ("--type f\n", ("--type", "d", "--type=f"), TREE_ALL),
+        ],
+    )
+    def test_type_precedence(
+        self,
+        build_cfg: ConfigRunner,
+        text: str,
+        args: tuple[str, ...],
+        expected: list[bytes],
+    ):
+        build_cfg.write(text)
+        assert build_cfg(*args) == listing(expected)
+
+    def test_empty_config_keeps_all_types(self, build_cfg: ConfigRunner):
+        build_cfg.write("# no options\n")
+        assert build_cfg() == build_cfg(home=False)
+        assert entries(build_cfg().out) == TREE_ALL
+
+    def test_no_config_with_a_command_line_type(self, build_cfg: ConfigRunner):
+        build_cfg.write("--type d\n")
+        assert build_cfg("--no-config", "--type", "f") == listing(TREE_FILES)
+
+    def test_xdg_config_type_is_replaced(self, build_cfg: ConfigRunner, xdg: Path):
+        (xdg / "zfind" / "config").write_bytes(b"--type f\n")
+        res = build_cfg("--type", "d", env={"XDG_CONFIG_HOME": str(xdg)})
+        assert res == listing(TREE_DIRS)
+
+    def test_l_type_is_replaced_across_builds(
+        self, binary: Path, tmp_path: Path, home: Path
+    ):
+        root = tmp_path / "links"
+        (root / "dir").mkdir(parents=True)
+        (root / "dir" / "inner").write_bytes(b"")
+        (root / "file").write_bytes(b"")
+        (root / "lnk").symlink_to("file")
+        (root / "dlnk").symlink_to("dir")
+        links_cfg = ConfigRunner(binary, root, home)
+        links_cfg.write("--type f\n")
+        assert links_cfg("--type=l") == listing([b"dlnk", b"lnk"])
+        links_cfg.write("--type=l\n")
+        assert links_cfg("--type", "f") == listing([b"dir/inner", b"file"])
+
+    def test_exclusions_still_accumulate_across_layers(self, build_cfg: ConfigRunner):
+        build_cfg.write("--exclude-name=node_modules\n")
+        expected = [
+            name
+            for name in TREE_FILES
+            if not name.startswith(b"node_modules/") and not name.startswith(b"d/")
+        ]
+        res = build_cfg("--exclude-name", "d", "--type", "f")
+        assert res == listing(expected)
 
 
 class TestNoConfigIsInert:
