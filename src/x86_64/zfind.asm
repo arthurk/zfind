@@ -1,7 +1,7 @@
 default rel                     ; x86-64: address labels RIP-relative, not via implicit ABS
 
 ; zfind, "simple search" use case only:
-;   zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]
+;   zfind [--help] [--separator STR] [--case smart|sensitive|insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
 ;         [--exclude-name NAME] [--limit N|none] [--type f|d|l]
 ;         [--color auto|always|never]
@@ -31,10 +31,10 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; around a value) and is read by the same parser as the command line
 ; (parse_args), so each line is checked exactly like its flag. The layers are
 ; the built-in defaults, then the file, then the command line: a mode
-; (case, hidden, gitignore) set on the command line replaces the file's, a scalar
-; (--separator, --limit) is overwritten, a command-line --type replaces the
-; file's whole set, and --exclude-name accumulates.
-; Opposing modes within one source are an error. A missing default file is
+; (hidden, gitignore) set on the command line replaces the file's, a scalar
+; (--separator, --limit, --case) is overwritten, a command-line --type replaces
+; the file's whole set, and --exclude-name accumulates. Opposing hidden or
+; gitignore modes within one source are an error. A missing default file is
 ; normal; anything else wrong with the file stops zfind before the walk, and
 ; the error names the file and line.
 ; --color auto|always|never controls ANSI styling of results: directories are
@@ -277,7 +277,7 @@ section .rodata
     e_big_e:
     e_scratch   db "zfind: directory too large", 10
     e_scratch_e:
-    e_case      db "zfind: cannot combine --case-sensitive and --case-insensitive", 10
+    e_case      db "zfind: expected smart, sensitive or insensitive after --case", 10
     e_case_e:
     e_hid       db "zfind: cannot combine --hidden and --no-hidden", 10
     e_hid_e:
@@ -325,8 +325,11 @@ section .rodata
     e_color_cfg_e:
     e_pfx       db "zfind: "          ; 7 bytes: every message starts with it
     h_long      db "--help", 0
-    cs_long     db "--case-sensitive", 0
-    ci_long     db "--case-insensitive", 0
+    case_long   db "--case", 0
+    case_eq     db "--case=", 0      ; 7 bytes of prefix
+    v_smart     db "smart", 0
+    v_sens      db "sensitive", 0
+    v_insens    db "insensitive", 0
     l_long      db "--limit", 0
     l_eq        db "--limit=", 0     ; 8 bytes of prefix
     sep_long    db "--separator", 0
@@ -361,7 +364,7 @@ section .rodata
     cfg_sfx_xdg_e:
     cfg_sfx_home db "/.config/zfind/config", 0
     cfg_sfx_home_e:
-    help_msg    db "usage: zfind [--help] [--separator STR] [--case-sensitive | --case-insensitive]", 10
+    help_msg    db "usage: zfind [--help] [--separator STR] [--case smart|sensitive|insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
                db "             [--exclude-name NAME]... [--limit N|none] [--type f|d|l]", 10
                db "             [--color auto|always|never]", 10
@@ -369,12 +372,12 @@ section .rodata
                db "Search the current directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
                db "is case-insensitive unless PATTERN contains an uppercase ASCII letter", 10
-               db "(smart case). Use --case-sensitive or --case-insensitive to override this;", 10
-               db "combining both is an error. Case folding affects only PATTERN (ASCII", 10
+               db "(--case smart, the default). --case sensitive and --case insensitive force", 10
+               db "one mode; the last --case wins. Case folding affects only PATTERN (ASCII", 10
                db "only); it does not apply to .gitignore rules or --exclude-name matching.", 10
                db "Without a pattern every", 10
                db "entry is listed unless --type restricts the result types.", 10, 10
-               db "Options must appear before PATTERN. --limit, --type and --separator", 10
+               db "Options must appear before PATTERN. --limit, --type, --case and --separator", 10
                db "consume the next token greedily as their value. -- ends options; any", 10
                db "following argument is treated as PATTERN. --help prints this help and", 10
                db "exits 0 anywhere before --, including after PATTERN or where an option", 10
@@ -396,8 +399,8 @@ section .rodata
                db "  --separator STR     terminate results with STR, 1-64 bytes", 10
                db "                      (also --separator=STR); decodes \n \t \r \0 \\", 10
                db "                      default: newline", 10
-               db "  --case-sensitive    match pattern case-sensitively", 10
-               db "  --case-insensitive  match pattern case-insensitively (ASCII A-Z)", 10
+               db "  --case MODE         smart (default), sensitive or insensitive; --case=MODE", 10
+               db "                      smart ignores case unless PATTERN contains A-Z", 10
                db "  --gitignore         respect .gitignore rules in .git/.jj repos; skip both", 10
                db "  --no-gitignore      do not apply .gitignore rules (the default)", 10
                db "  --hidden            search hidden entries (the default)", 10
@@ -455,7 +458,7 @@ section .bss
     limit_mode:  resq 1               ; read-only after startup: 1 = frame results
     res_ig:     resq 1                ; 0 = default, 1 = --gitignore, 2 = --no-gitignore
     hid_mode:   resb 1                ; 0 = default, 1 = --hidden, 2 = --no-hidden
-    case_mode:  resb 1                ; 0 = smart (default), 1 = forced sensitive, 2 = forced insensitive
+    case_mode:  resb 1                ; --case: 0 = smart (default), 1 = sensitive, 2 = insensitive
     color_mode: resb 1                ; 0 = not set, 1 = auto, 2 = always, 3 = never
     cfg_color:  resb 1                ; the config file's color mode, parked while
                                       ;   the command line is parsed (0 = not set)
@@ -464,8 +467,8 @@ section .bss
     type_seen:  resb 1
     git_repo:   resq 1
     cfg_mode:   resb 1                ; 0 = default location, 1 = --config, 2 = --no-config
-    cfg_case:   resb 1                ; the config file's modes, parked while the
-    cfg_hid:    resb 1                ;   command line is parsed (0 = not set)
+    cfg_hid:    resb 1                ; the config file's modes, parked while the
+                                      ;   command line is parsed (0 = not set)
     alignb 8
     cfg_ig:     resq 1
     cfg_type:   resq 1                ; the config file's --type bits (first qword of res_type)
@@ -541,19 +544,17 @@ _start:
 
     ; Settings come from layers, lowest first: the defaults above, the config
     ; file, then the command line. One parser (parse_args) reads both the file
-    ; and argv. Modes (case, hidden, gitignore) use 0 = "not set by this layer",
+    ; and argv. Modes (hidden, gitignore) use 0 = "not set by this layer",
     ; so the file's choice is parked while the command line is parsed and
     ; restored for any mode the command line left alone. --type is parked the
     ; same way, as a whole set: a command-line --type drops the file's. Scalars
-    ; are plain last-wins overwrites and --exclude-name accumulates, so neither
-    ; needs a merge step. All of this finishes before the first mmap.
+    ; (--separator, --limit, --case) are plain last-wins overwrites and
+    ; --exclude-name accumulates, so neither needs a merge step. All of this
+    ; finishes before the first mmap.
     lea rax, [rbp+rbx*8+8]           ; envp follows argv's NULL terminator
     mov [envp_ptr], rax
     call find_config                 ; --config / --no-config (rbx, rbp kept)
     call load_config                 ; the file's settings, if one is selected
-    mov al, [case_mode]
-    mov [cfg_case], al
-    mov byte [case_mode], 0
     mov al, [hid_mode]
     mov [cfg_hid], al
     mov byte [hid_mode], 0
@@ -571,10 +572,6 @@ _start:
     mov rsi, rbx
     call parse_args
     mov r13, rax                     ; PATTERN or 0
-    cmp byte [case_mode], 0
-    jne .merge_hid
-    mov al, [cfg_case]
-    mov [case_mode], al
 .merge_hid:
     cmp byte [hid_mode], 0
     jne .merge_ig
@@ -623,7 +620,7 @@ _start:
     xor edi, edi
     mov eax, 231                     ; exit_group
     syscall
-.pat_ready:
+.pat_ready:                            ; case_mode 0 (smart) falls through to the scan
     cmp byte [case_mode], 1
     je .forced_sensitive
     cmp byte [case_mode], 2
@@ -898,13 +895,13 @@ parse_args:
     je .arg_pattern                    ; "-" alone
 
     mov rdi, [rbp+r12*8]
-    lea rsi, [cs_long]
+    lea rsi, [case_long]
     call streq
-    je .opt_case_sens
+    je .opt_case
     mov rdi, [rbp+r12*8]
-    lea rsi, [ci_long]
-    call streq
-    je .opt_case_insens
+    lea rsi, [case_eq]
+    call startswith
+    je .opt_case_eq
     mov rdi, [rbp+r12*8]
     lea rsi, [l_long]
     call streq
@@ -982,17 +979,33 @@ parse_args:
     je .arg_end_opts                   ; "--"
     jmp bad_flag                       ; unknown long flag
 
-.opt_case_sens:
-    cmp byte [case_mode], 2
-    je bad_case_comb
-    mov byte [case_mode], 1
+.opt_case:
     inc r12
-    jmp .args_loop
-
-.opt_case_insens:
-    cmp byte [case_mode], 1
-    je bad_case_comb
-    mov byte [case_mode], 2
+    cmp r12, rbx
+    jae bad_case
+    mov rdi, [rbp+r12*8]
+    jmp .opt_case_value
+.opt_case_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 7                         ; len("--case=")
+.opt_case_value:                       ; rdi = the value; a scalar, so the last one wins
+    lea rsi, [v_smart]
+    call streq                         ; streq keeps rdi and rsi
+    je .case_smart
+    lea rsi, [v_sens]
+    call streq
+    je .case_sens
+    lea rsi, [v_insens]
+    call streq
+    jne bad_case
+    mov byte [case_mode], 2            ; insensitive
+    jmp .case_set
+.case_sens:
+    mov byte [case_mode], 1
+    jmp .case_set
+.case_smart:
+    mov byte [case_mode], 0            ; the default, spelled out
+.case_set:
     inc r12
     jmp .args_loop
 
@@ -1252,6 +1265,10 @@ find_config:
     call streq
     je .skip
     mov rdi, [rbp+r12*8]
+    lea rsi, [case_long]
+    call streq
+    je .skip
+    mov rdi, [rbp+r12*8]
     lea rsi, [sep_long]
     call streq
     je .skip
@@ -1474,10 +1491,11 @@ load_config.end_func:
 ; "--name", "--name=value" or "--name value" (surrounding blanks and \r are
 ; ignored; the value may be wrapped in matching quotes, which are removed).
 ; It is run through parse_args as a one-entry argv, or a two-entry one when the
-; option takes a value (--limit, --type, --separator, --exclude-name, --color): text after
-; a flag is an error, so a line can never carry a second option. The line is
-; edited in place and the buffer lives for the whole run: excl_names points into
-; it. --help, --config, --no-config and "--" are command-line only.
+; option takes a value (--limit, --type, --case, --separator, --exclude-name,
+; --color): text after a flag is an error, so a line can never carry a second
+; option. The line is edited in place and the buffer lives for the whole run:
+; excl_names points into it. --help, --config, --no-config and "--" are
+; command-line only.
     global cfg_line:function (cfg_line.end_func - cfg_line)
 cfg_line:
 .lead:                               ; skip leading blanks and \r
@@ -1560,6 +1578,9 @@ cfg_line:
     call streq
     je .split
     lea rsi, [t_long]
+    call streq
+    je .split
+    lea rsi, [case_long]
     call streq
     je .split
     lea rsi, [sep_long]
@@ -3808,7 +3829,7 @@ bad_flag:
     mov rdx, e_flag_e - e_flag
     jmp die
 
-bad_case_comb:
+bad_case:
     lea rsi, [e_case]
     mov rdx, e_case_e - e_case
     jmp die
@@ -3882,7 +3903,7 @@ scratch_full:
 ; globmatch: rdi = pattern, rsi = string (both NUL-terminated) -> al = 1 on a
 ; whole-string match. gitignore syntax: '*' stops at '/', "**/" spans any
 ; number of path components, "/**" at the end spans everything below.
-; Case flags (--case-sensitive / --case-insensitive) apply only to the search pattern;
+; --case (smart, sensitive, insensitive) applies only to the search pattern;
 ; .gitignore pattern matching is always exact (case-sensitive).
     global globmatch:function (globmatch.end_func - globmatch)
 globmatch:
