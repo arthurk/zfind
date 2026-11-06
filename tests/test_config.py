@@ -708,6 +708,20 @@ class TestConfigPrecedence:
         links_cfg.write("--type f\n")
         assert links_cfg("--type=l") == listing([b"dlnk", b"lnk"])
 
+    def test_a_configured_combination_is_target_aware(self, links_cfg: ConfigRunner):
+        # The rule applies to the final set, whatever source supplied each
+        # value: links to the target's type, not to their own.
+        links_cfg.write("--type f\n--type l\n")
+        assert links_cfg() == listing([b"dir/inner", b"file", b"lnk"])
+        links_cfg.write("--type d\n--type l\n")
+        assert links_cfg() == listing([b"dir/", b"dlnk"])
+
+    def test_a_command_line_combination_is_target_aware(self, links_cfg: ConfigRunner):
+        assert links_cfg("--type", "f", "--type", "l") == listing(
+            [b"dir/inner", b"file", b"lnk"]
+        )
+        assert links_cfg("--type=d", "--type=l") == listing([b"dir/", b"dlnk"])
+
     def test_exclude_name_table_is_shared_between_layers(self, cfg: ConfigRunner):
         cfg.write("".join(f"--exclude-name=n{i}\n" for i in range(64)))
         assert cfg("config") == listing(CONFIG_HITS)
