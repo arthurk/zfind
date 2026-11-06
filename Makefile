@@ -31,7 +31,7 @@ else
 endif
 
 # ---------- targets ----------
-.PHONY: all run clean testdata test test-quiet release
+.PHONY: all run map clean testdata test test-quiet release
 
 all: $(BIN)
 
@@ -112,4 +112,4 @@ test: $(BIN) $(SERIAL_BIN) $(UNKNOWN_BIN) $(RANGE_BIN)
 T ?=
 
 test-quiet:
-	@$(MAKE) --no-print-directory -s test PYTEST_ARGS='-o addopts= -q --no-header --tb=short -rfE --strict-markers --strict-config $(T)'
+	@$(MAKE) --no-print-directory -s test PYTEST_ARGS="-o addopts= -q --no-header --tb=short -rfE --strict-markers --strict-config $$T"
