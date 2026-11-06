@@ -35,6 +35,8 @@ read a small window: set the `limit` of a read to 80 lines or less.
   10 lines around the hit.
 - If an issue includes a verified diff, apply it and let the tests verify; do
   not re-derive what it already states.
+- `res_type` is indexed by `d_type`; use `TYPE_*` for masks and `DT_*` for
+  values.
 
 ## Tests
 
