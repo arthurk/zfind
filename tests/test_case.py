@@ -145,3 +145,67 @@ class TestCaseValueErrors:
         res = run_in(zfind_path, tree, "--separator", "--case=smart", "a.txt")
         assert res.status == 0, f"Command failed: {res}"
         assert res.out == b"a.txt--case=smart"
+
+
+class TestPatternWindowBoundaries:
+    """Explicit checks for 16-byte SIMD window boundary conditions."""
+
+    @pytest.fixture
+    def boundary_tree(self, tmp_path: Path) -> Path:
+        tree = tmp_path / "boundary-tree"
+        tree.mkdir()
+        files = [
+            "len14_abcdefgh",
+            "len15_abcdefghi",
+            "len16_abcdefghij",
+            "len17_abcdefghijk",
+            "0123456789abcdef",
+            "0123456789abcdef0123456789abcdef",
+            "prefix13bytes_MATCH_tail",
+            "prefix12bytes_MATCH_tail",
+            "prefix13byte_MATCH",
+            "prefix14byte_MATCH",
+            "prefix15byte_MATCH",
+            "prefix16bytes_MATCH",
+            "xxxxxxxxxxxxxxxn_rest",
+        ]
+        for name in files:
+            (tree / name).write_bytes(b"")
+        return tree
+
+    @pytest.mark.parametrize(("pattern", "expected"), [
+        pytest.param(
+            "j", words("len16_abcdefghij len17_abcdefghijk"), id="1char-match"
+        ),
+        pytest.param(
+            "0123456789abcdef",
+            words("0123456789abcdef 0123456789abcdef0123456789abcdef"),
+            id="16char-match",
+        ),
+        pytest.param(
+            "MATCH",
+            words(
+                "prefix13bytes_MATCH_tail prefix12bytes_MATCH_tail "
+                "prefix13byte_MATCH prefix14byte_MATCH prefix15byte_MATCH "
+                "prefix16bytes_MATCH"
+            ),
+            id="match-at-window-edges",
+        ),
+        pytest.param(
+            "match",
+            words(
+                "prefix13bytes_MATCH_tail prefix12bytes_MATCH_tail "
+                "prefix13byte_MATCH prefix14byte_MATCH prefix15byte_MATCH "
+                "prefix16bytes_MATCH"
+            ),
+            id="ci-match-at-window-edges",
+        ),
+        pytest.param("nomatch", [], id="no-false-match-at-boundary"),
+    ])
+    def test_window_boundaries(
+        self, binary: Path, boundary_tree: Path, pattern: str, expected: list[bytes]
+    ):
+        res = run_in(binary, boundary_tree, "--case=smart", pattern)
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert sorted(entries(res.out)) == sorted(expected)
