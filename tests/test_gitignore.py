@@ -82,19 +82,6 @@ class TestGitignore:
         assert entries(res.out) == [b"FOO", b"Foo"]
 
 
-BUILDS = {
-    "parallel": "zfind_path",
-    "serial": "serial_zfind_path",
-    "unknown": "unknown_zfind_path",
-    "range": "range_zfind_path",
-}
-
-
-@pytest.fixture(params=list(BUILDS))
-def binary(request: pytest.FixtureRequest) -> Path:
-    return request.getfixturevalue(BUILDS[request.param])
-
-
 class TestJujutsuAndMetadataPruning:
     def test_git_only_repository_prunes_both_metadata_dirs(
         self, binary: Path, tmp_path: Path

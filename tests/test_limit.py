@@ -436,49 +436,36 @@ class TestLimitNone:
         assert res == full
 
 
-LIMIT_BUILDS = {
-    "parallel": "zfind_path",
-    "serial": "serial_zfind_path",
-    "unknown": "unknown_zfind_path",
-    "range": "range_zfind_path",
-}
-
-
-@pytest.fixture(params=list(LIMIT_BUILDS))
-def limit_binary(request: pytest.FixtureRequest) -> Path:
-    return request.getfixturevalue(LIMIT_BUILDS[request.param])
-
-
 class TestLimitNoneAcrossBuilds:
     """`--limit none` and `--limit 0` in every build, hook builds included."""
 
     def test_none_matches_unlimited_and_zero_writes_nothing(
-        self, limit_binary: Path, tmp_path: Path
+        self, binary: Path, tmp_path: Path
     ):
         tree = tmp_path / "tree"
         tree.mkdir()
         for i in range(1, 51):
             (tree / f"f{i:02d}").write_bytes(b"")
 
-        full = run_in(limit_binary, tree)
+        full = run_in(binary, tree)
         assert full.status == 0, f"Baseline failed: {full}"
         assert full.err == b""
         assert entries(full.out) == [f"f{i:02d}".encode() for i in range(1, 51)]
 
-        capped = run_in(limit_binary, tree, "--limit", "3")
+        capped = run_in(binary, tree, "--limit", "3")
         assert capped.status == 0, f"Command failed: {capped}"
         assert capped.err == b""
         assert capped.out == joined(entries(full.out)[:3], b"\n")
 
-        assert run_in(limit_binary, tree, "--limit", "none") == full
-        assert run_in(limit_binary, tree, "--limit=none") == full
+        assert run_in(binary, tree, "--limit", "none") == full
+        assert run_in(binary, tree, "--limit=none") == full
 
-        zero = run_in(limit_binary, tree, "--limit", "0")
+        zero = run_in(binary, tree, "--limit", "0")
         assert zero.status == 0, f"Command failed: {zero}"
         assert zero.err == b""
         assert zero.out == b""
 
-        cancelled = run_in(limit_binary, tree, "--limit", "3", "--limit", "none")
+        cancelled = run_in(binary, tree, "--limit", "3", "--limit", "none")
         assert cancelled == full
 
 

@@ -219,3 +219,18 @@ def unknown_zfind_path(pytestconfig: pytest.Config) -> Path:
 def range_zfind_path(pytestconfig: pytest.Config) -> Path:
     """DT_UNKNOWN hook build with RANGE_MIN/CHUNK_MIN lowered to reach walk_range."""
     return _variant_path(pytestconfig, "range")
+
+
+# Every walker build: parallel, serial, DT_UNKNOWN hook and range hook.
+BUILDS = {
+    "parallel": "zfind_path",
+    "serial": "serial_zfind_path",
+    "unknown": "unknown_zfind_path",
+    "range": "range_zfind_path",
+}
+
+
+@pytest.fixture(params=list(BUILDS))
+def binary(request: pytest.FixtureRequest) -> Path:
+    """Path of each zfind build in turn: a test that takes it runs on all four."""
+    return request.getfixturevalue(BUILDS[request.param])

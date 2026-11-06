@@ -122,18 +122,6 @@ class TestTypeEqualsForm:
 #             ones walk_dir's inline loop
 # -----------------------------------------------------------------------------
 
-BUILDS = {
-    "parallel": "zfind_path",
-    "serial": "serial_zfind_path",
-    "unknown": "unknown_zfind_path",
-    "range": "range_zfind_path",
-}
-
-
-@pytest.fixture(params=list(BUILDS))
-def binary(request: pytest.FixtureRequest) -> Path:
-    return request.getfixturevalue(BUILDS[request.param])
-
 
 def make_links_tree(root: Path) -> Path:
     for rel in (

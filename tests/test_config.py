@@ -45,14 +45,6 @@ TREE_ALL = [
 TREE_FILES = [name for name in TREE_ALL if not name.endswith(b"/")]
 TREE_DIRS = [name for name in TREE_ALL if name.endswith(b"/")]
 
-# Every walker build: parallel, serial, DT_UNKNOWN and range.
-BUILDS = {
-    "parallel": "zfind_path",
-    "serial": "serial_zfind_path",
-    "unknown": "unknown_zfind_path",
-    "range": "range_zfind_path",
-}
-
 
 def listing(names: list[bytes]) -> Result:
     """A successful run that printed exactly these newline-terminated names."""
@@ -146,12 +138,6 @@ def home(tmp_path: Path) -> Path:
 @pytest.fixture
 def cfg(zfind_path: Path, tree: Path, home: Path) -> ConfigRunner:
     return ConfigRunner(zfind_path, tree, home)
-
-
-@pytest.fixture(params=list(BUILDS))
-def binary(request: pytest.FixtureRequest) -> Path:
-    """Each walker build in turn; tests using it cover all four."""
-    return request.getfixturevalue(BUILDS[request.param])
 
 
 @pytest.fixture
