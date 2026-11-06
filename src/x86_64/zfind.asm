@@ -698,6 +698,7 @@ _start:
     inc rdi
     jmp .pat_copy
 .pat_copied:
+    mov byte [rdi], 0
     lea rax, [pat_buf]
     mov [pat_ptr], rax
 .pat_padded:
@@ -2784,12 +2785,18 @@ get_block.end_func:
 
 ; name_match: rdi = name, rsi = pattern, rdx = pattern length -> al
 ; Literal substring search over a 16-byte-padded pattern copy (folded when
-; pat_ci is set). Each window finds the positions whose first byte can start a
-; match -- (name byte | 0x20) == (pattern[0] | 0x20) is a superset of the folded
-; equality -- and each candidate is verified with 16-byte compares. Both phases
-; read at most 15 bytes past the name's NUL, which the dirent buffer (followed
-; by igbuf) and the scratch region (16-byte tail guard) make safe. A pattern
-; longer than PAT_BUF uses the scalar loop, which never over-reads.
+; pat_ci is set). Two main regimes:
+; - patlen <= 16: PCMPISTRI (SSE4.2 equal-ordered, imm8 0x0C) reports verified
+;   matches directly in 16-byte windows stepped by S = 17 - patlen, so the
+;   per-window start ranges [b, b+16-patlen] are contiguous. A match is
+;   accepted only when it fits inside the window (ECX < S); a match running
+;   off the window's end is partial and the next window retries it. ZF=1
+;   means the window holds the name's NUL, after which no match can start.
+; - patlen > 16: legacy SSE2 candidate-scan with 16-byte verify loop (or scalar
+;   loop if patlen > PAT_BUF).
+; Both SIMD regimes read at most 15 bytes past the name's NUL, which the
+; dirent buffer (followed by igbuf) and the scratch region (16-byte tail guard)
+; make safe.
 ; Clobbers rax, rcx, rdx, rsi, rdi, xmm0-xmm6; keeps r8-r11, r15.
     global name_match:function (name_match.end_func - name_match)
 name_match:
@@ -2801,6 +2808,62 @@ name_match:
     mov r13, rdx
     test r13, r13
     jz .yes
+    cmp r13, 16
+    ja .legacy
+    cmp qword [pat_ci], 0
+    jne .pc_ci
+.pc_cs:
+    movdqu xmm1, [r12]
+    mov rsi, rbx
+    mov edx, 17
+    sub edx, r13d
+.pc_cs_loop:
+    pcmpistri xmm1, [rsi], 0x0c
+    jc .pc_cs_match
+    jz .no
+    add rsi, rdx
+    jmp .pc_cs_loop
+.pc_cs_match:
+    setz al                          ; save "window has the name's NUL"
+    cmp ecx, edx                     ; match must fit in this window
+    jb .yes
+    test al, al
+    jnz .no
+    add rsi, rdx
+    jmp .pc_cs_loop
+
+.pc_ci:
+    movdqu xmm3, [r12]
+    mov rsi, rbx
+    mov edx, 17
+    sub edx, r13d
+    movdqa xmm4, [c_upper_hi]
+    movdqa xmm5, [c_upper_lo]
+    movdqa xmm6, [c_fold]
+.pc_ci_loop:
+    movdqu xmm0, [rsi]
+    movdqa xmm1, xmm4
+    pcmpgtb xmm1, xmm0
+    movdqa xmm2, xmm0
+    pcmpgtb xmm2, xmm5
+    pand xmm1, xmm2
+    pand xmm1, xmm6
+    por xmm0, xmm1
+    pcmpistri xmm3, xmm0, 0x0c
+    jc .pc_ci_match
+    jz .no
+    add rsi, rdx
+    jmp .pc_ci_loop
+.pc_ci_match:
+    setz al                          ; save "window has the name's NUL"
+    cmp ecx, edx                     ; match must fit in this window
+    jb .yes
+    test al, al
+    jnz .no
+    add rsi, rdx
+    jmp .pc_ci_loop
+
+.legacy:
     cmp r13, PAT_BUF
     ja .long_pat
     cmp qword [pat_ci], 0
