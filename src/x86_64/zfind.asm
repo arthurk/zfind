@@ -23,6 +23,13 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; arena_put; a matching directory is pruned. Explicit exclusions override
 ; .gitignore rules, but .gitignore detection and rule loading still happen
 ; when the .gitignore entry itself is excluded.
+; --type f|d|l is repeatable and selects regular files, directories and
+; symlinks. A link matches --type l on its own, broken links included. When l
+; is combined with f and/or d, a link matches by what it points to instead: a
+; selected regular file or directory, with a chain followed to its final
+; target. Broken links, links to special files and unreadable targets match no
+; combination. Links are never descended into and never printed with a trailing
+; slash, whatever the mask.
 ; Use -- before a PATTERN that starts with -.
 ; Settings may also come from a config file: --config PATH, else
 ; $XDG_CONFIG_HOME/zfind/config (non-empty absolute path), else
@@ -411,6 +418,8 @@ section .rodata
                db "  --limit N|none      print at most N results (0 prints nothing)", 10
                db "                      none: no limit, the default; also --limit=N|none", 10
                db "  --type f|d|l        repeatable; print regular files, directories, symlinks", 10
+               db "                      when combined, symlinks match by the type of their", 10
+               db "                      target; broken links appear only with l alone", 10
                db "                      also --type=V", 10
                db "  --color WHEN        color results: auto, always or never (default: auto)", 10
                db "                      also --color=WHEN; auto colors a terminal unless", 10
@@ -463,7 +472,7 @@ section .bss
     cfg_color:  resb 1                ; the config file's color mode, parked while
                                       ;   the command line is parsed (0 = not set)
     color_on:   resb 1                ; resolved once at startup: 1 = emit ANSI
-    res_type:   resb 32                ; d_type bitset: DT_DIR=4, DT_REG=8
+    res_type:   resb 32                ; d_type bitset: DT_DIR=4, DT_REG=8, DT_LNK=10
     type_seen:  resb 1
     git_repo:   resq 1
     cfg_mode:   resb 1                ; 0 = default location, 1 = --config, 2 = --no-config
@@ -4563,6 +4572,49 @@ try_range_split:
     ret
 try_range_split.end_func:
 
+; type_ok: does --type select an entry of resolved d_type edi?  Called only
+; when type_seen is set.  A non-link is selected by its own bit.  A symlink is
+; selected by its own bit (--type l) unless l is combined with f and/or d:
+; then the link matches only when what it points to is a selected regular file
+; or directory, and a broken or unreadable link matches nothing.  The lookup
+; follows the chain but never makes the walk descend.  path_buf must hold the
+; entry's full path.
+    global type_ok:function (type_ok.end_func - type_ok)
+type_ok:
+    movzx ecx, dil
+    cmp ecx, 10                      ; DT_LNK
+    jne .plain
+    test qword [res_type], 1 << 10   ; l not selected: the plain gate rejects
+    jz .plain
+    test qword [res_type], 0x110     ; bits DT_DIR (4) and DT_REG (8)
+    jz .plain
+    mov rax, 262                     ; newfstatat, following the link
+    mov rdi, AT_FDCWD
+    lea rsi, [r14+path_buf]
+    lea rdx, [r14+statbuf]
+    xor r10d, r10d                   ; no AT_SYMLINK_NOFOLLOW
+    syscall
+    test rax, rax
+    js .no                           ; broken or unreadable: dropped
+    mov eax, [r14+statbuf+24]        ; st_mode
+    and eax, 0xF000
+    cmp eax, 0x8000                  ; S_IFREG
+    je .reg
+    cmp eax, 0x4000                  ; S_IFDIR
+    jne .no                          ; fifo/socket/device have no target meaning
+    mov ecx, 4
+    jmp .plain
+.reg:
+    mov ecx, 8
+.plain:
+    bt qword [res_type], rcx
+    setc al
+    ret
+.no:
+    xor eax, eax
+    ret
+type_ok.end_func:
+
 ; walk_wide: rdi = sorted table, rsi = N.  Prepass resolves types and filters,
 ; creating and pushing a group for every non-ignored directory before any of
 ; them is linked.  Publish then walks the table in order, prints the matching
@@ -4662,7 +4714,7 @@ walk_wide:
 .no_ignore:
     xor r13d, r13d                   ; match flag
     test byte [r12-1], 1
-    jnz .matched
+    jnz .type_gate                   ; cached name match; the type is decided here
     mov rdx, [pat_len]
     test rdx, rdx
     jz .type_gate
@@ -4674,9 +4726,18 @@ walk_wide:
 .type_gate:
     cmp byte [type_seen], 0
     je .matched
-    movzx ecx, byte [rsp+40]
-    bt qword [res_type], rcx
-    jnc .match_done
+    movzx edi, byte [rsp+40]
+    cmp edi, 10                      ; DT_LNK
+    jne .gate_call
+    cmp qword [rsp+48], 0
+    jne .gate_call
+    call walk_dir.mkpath             ; type_ok follows the link via path_buf
+    mov qword [rsp+48], 1
+.gate_call:
+    movzx edi, byte [rsp+40]
+    call type_ok
+    test al, al
+    jz .match_done
 .matched:
     mov r13d, 2
 .match_done:
@@ -5109,9 +5170,15 @@ walk_dir:
 .name_ok:
     cmp byte [type_seen], 0
     je .matched
-    movzx ecx, byte [rsp+56]
-    bt qword [res_type], rcx
-    jnc .descend
+    movzx edi, byte [rsp+56]
+    cmp edi, 10                      ; DT_LNK
+    jne .gate_call
+    call .mkpath                     ; type_ok follows the link via path_buf
+.gate_call:
+    movzx edi, byte [rsp+56]
+    call type_ok
+    test al, al
+    jz .descend
 .matched:
     call .mkpath                     ; print_entry() wants the path
     mov rdi, rbp
@@ -5271,9 +5338,10 @@ walk_range:
 .name_ok:
     cmp byte [type_seen], 0
     je .matched
-    movzx ecx, byte [rsp+0]
-    bt qword [res_type], rcx
-    jnc .descend
+    movzx edi, byte [rsp+0]
+    call type_ok
+    test al, al
+    jz .descend
 .matched:
     mov rdi, rbp
     mov rsi, r13
