@@ -175,6 +175,17 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define F_DIR       2
 %define F_ANCHOR    4
 
+; d_type values as dirent.h reports them; res_type is a bitset whose bit
+; index is the d_type value, so TYPE_* (not the values) are its masks
+%define DT_UNKNOWN  0
+%define DT_DIR      4
+%define DT_REG      8
+%define DT_LNK      10
+%define DT_BIT(n)   (1 << (n))
+%define TYPE_F      DT_BIT(DT_REG)
+%define TYPE_D      DT_BIT(DT_DIR)
+%define TYPE_L      DT_BIT(DT_LNK)
+
 ; per-thread state; one instance per worker plus the main thread's, all from
 ; one mmap. r14 points at the caller's instance in every function that uses it.
 struc TSTATE
@@ -472,7 +483,8 @@ section .bss
     cfg_color:  resb 1                ; the config file's color mode, parked while
                                       ;   the command line is parsed (0 = not set)
     color_on:   resb 1                ; resolved once at startup: 1 = emit ANSI
-    res_type:   resb 32                ; d_type bitset: DT_DIR=4, DT_REG=8, DT_LNK=10
+    res_type:   resb 32                ; --type bitset: bit index is the d_type
+                                       ;   value, so TYPE_D/F/L are the masks
     type_seen:  resb 1
     git_repo:   resq 1
     cfg_mode:   resb 1                ; 0 = default location, 1 = --config, 2 = --no-config
@@ -1040,13 +1052,13 @@ parse_args:
     je .type_dir
     cmp al, 'l'
     jne bad_type
-    bts qword [res_type], 10           ; DT_LNK
+    bts qword [res_type], DT_LNK
     jmp .type_set
 .type_dir:
-    bts qword [res_type], 4            ; DT_DIR
+    bts qword [res_type], DT_DIR
     jmp .type_set
 .type_file:
-    bts qword [res_type], 8            ; DT_REG
+    bts qword [res_type], DT_REG
 .type_set:
     mov byte [type_seen], 1
     inc r12
@@ -4645,11 +4657,11 @@ try_range_split.end_func:
     global type_ok:function (type_ok.end_func - type_ok)
 type_ok:
     movzx ecx, dil
-    cmp ecx, 10                      ; DT_LNK
+    cmp ecx, DT_LNK
     jne .plain
-    test qword [res_type], 1 << 10   ; l not selected: the plain gate rejects
+    test qword [res_type], TYPE_L    ; l not selected: the plain gate rejects
     jz .plain
-    test qword [res_type], 0x110     ; bits DT_DIR (4) and DT_REG (8)
+    test qword [res_type], TYPE_F | TYPE_D
     jz .plain
     mov rax, 262                     ; newfstatat, following the link
     mov rdi, AT_FDCWD
@@ -4665,10 +4677,10 @@ type_ok:
     je .reg
     cmp eax, 0x4000                  ; S_IFDIR
     jne .no                          ; fifo/socket/device have no target meaning
-    mov ecx, 4
+    mov ecx, DT_DIR
     jmp .plain
 .reg:
-    mov ecx, 8
+    mov ecx, DT_REG
 .plain:
     bt qword [res_type], rcx
     setc al
@@ -4745,16 +4757,16 @@ walk_wide:
     cmp eax, 0xA000                  ; S_IFLNK
     je .type_lnk
 .type_unknown:
-    mov byte [r12-2], 0
+    mov byte [r12-2], DT_UNKNOWN
     jmp .have_type
 .type_lnk:
-    mov byte [r12-2], 10             ; DT_LNK
+    mov byte [r12-2], DT_LNK
     jmp .have_type
 .type_dir:
-    mov byte [r12-2], 4
+    mov byte [r12-2], DT_DIR
     jmp .have_type
 .type_file:
-    mov byte [r12-2], 8
+    mov byte [r12-2], DT_REG
 .have_type:
     movzx r13d, byte [r12-2]
     mov [rsp+40], r13
@@ -4769,7 +4781,7 @@ walk_wide:
     mov rdi, r12
     lea rsi, [r14+path_buf]
     xor edx, edx
-    cmp r13b, 4
+    cmp r13b, DT_DIR
     sete dl
     call ig_ignored
     test al, al
@@ -4790,7 +4802,7 @@ walk_wide:
     cmp byte [type_seen], 0
     je .matched
     movzx edi, byte [rsp+40]
-    cmp edi, 10                      ; DT_LNK
+    cmp edi, DT_LNK
     jne .gate_call
     cmp qword [rsp+48], 0
     jne .gate_call
@@ -5030,7 +5042,7 @@ walk_dir:
     ; discard known non-directory entries whose type bit is not selected.
     ; shortcut: known d_type may misclassify bind mounts; exact classification
     ; would require statting all entries.
-    cmp r8b, 4                       ; DT_DIR
+    cmp r8b, DT_DIR
     je .keep
     test r8b, r8b                    ; DT_UNKNOWN
     jz .keep
@@ -5170,7 +5182,7 @@ walk_dir:
     mov r12, [rdx+8]                 ; name
     movzx r13d, byte [r12-2]         ; raw d_type
     mov [rsp+56], r13                ; resolved type; calls below eat registers
-    cmp r13b, 4                      ; DT_DIR
+    cmp r13b, DT_DIR
     je .isdir
     test r13b, r13b
     jnz .notdir
@@ -5193,13 +5205,13 @@ walk_dir:
     je .unknown_lnk
     jmp .notdir                      ; special entries remain type 0
 .unknown_lnk:
-    mov byte [rsp+56], 10            ; DT_LNK, not a directory: no descent
+    mov byte [rsp+56], DT_LNK        ; not a directory: no descent
     jmp .notdir
 .unknown_dir:
-    mov byte [rsp+56], 4             ; DT_DIR
+    mov byte [rsp+56], DT_DIR
     jmp .isdir
 .unknown_file:
-    mov byte [rsp+56], 8             ; DT_REG
+    mov byte [rsp+56], DT_REG
     jmp .notdir
 .isdir:
     mov r13d, 1
@@ -5234,7 +5246,7 @@ walk_dir:
     cmp byte [type_seen], 0
     je .matched
     movzx edi, byte [rsp+56]
-    cmp edi, 10                      ; DT_LNK
+    cmp edi, DT_LNK
     jne .gate_call
     call .mkpath                     ; type_ok follows the link via path_buf
 .gate_call:
@@ -5333,7 +5345,7 @@ walk_range:
     mov r12, [rax+8]                 ; name record
     movzx r13d, byte [r12-2]         ; raw d_type
     mov [rsp+0], r13                 ; resolved type
-    cmp r13b, 4
+    cmp r13b, DT_DIR
     je .isdir
     test r13b, r13b
     jnz .notdir
@@ -5358,21 +5370,21 @@ walk_range:
     xor r13d, r13d
     jmp .resolved
 .unknown_lnk:
-    mov byte [rsp+0], 10             ; DT_LNK
+    mov byte [rsp+0], DT_LNK
     xor r13d, r13d
     jmp .resolved
 .unknown_dir:
-    mov byte [rsp+0], 4
+    mov byte [rsp+0], DT_DIR
     mov r13d, 1
     jmp .resolved
 .unknown_file:
-    mov byte [rsp+0], 8
+    mov byte [rsp+0], DT_REG
     xor r13d, r13d
     jmp .resolved
 .isdir:
     call walk_dir.mkpath
     mov r13d, 1
-    mov byte [rsp+0], 4
+    mov byte [rsp+0], DT_DIR
     jmp .resolved
 .notdir:
     call walk_dir.mkpath
