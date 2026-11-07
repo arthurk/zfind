@@ -62,6 +62,9 @@ zfind --gitignore --limit 10 main
 # Safely delete all temporary cache directories
 zfind --type d --separator='\0' .cache | xargs -0 rm -rf
 
+# Remove broken symlinks: rm removes the link, never the target
+zfind --type b --separator='\0' | xargs -0 rm
+
 # Colorized results through a pager
 zfind --color=always config | less -R
 ```
@@ -138,10 +141,23 @@ zfind --case=smart foo      # Smart case (the default); also undoes a configured
 zfind --type f              # List all regular files
 zfind --type d              # List all directories (output ends with /)
 zfind --type l              # List all symlinks (to files, to directories, or dangling)
+zfind --type b              # List broken symlinks only
+zfind --type f --type b     # Regular files plus broken symlinks ("files plus junk")
 zfind --type f --type d     # List both regular files and directories (excludes symlinks)
 zfind --type f --type l     # List regular files and symlinks to files
 zfind --type=f              # Same as --type f (--type=VALUE works for every value)
 ```
+
+`--type b` prints a link whose target definitively does not exist: it is
+missing, a path component is not a directory, or the chain loops. A link that
+merely cannot be checked (permissions, I/O errors, a stale mount) is not
+broken, and neither is a link to a device, socket or FIFO that resolves. `b`
+is self-contained and needs no `l`; combined with `f` and/or `d` it adds the
+broken links to those results. The cleanup recipe deletes the links, never
+their targets. Like any other query it sees hidden entries unless
+`--no-hidden`, and `.gitignore` rules (including paths such as
+`node_modules/.bin`) apply only with `--gitignore`; a link can also change
+between listing and `rm`.
 
 #### Filtering & Ignoring
 ```sh
@@ -186,7 +202,7 @@ Scripts need no flag: piped output is plain by default. Add `--color=never` only
 | `--no-hidden` | — | Off | Prune all hidden files and directories from traversal. |
 | `--gitignore` | — | Off | Parse and apply `.gitignore` rules (skips `.git/`). |
 | `--no-gitignore` | — | Enabled | Do not apply `.gitignore` rules; walk all non-pruned trees. |
-| `--type` | `f` \| `d` \| `l` | All types | Filter output by regular files (`f`), directories (`d`) or symlinks (`l`). Repeatable. When `l` is combined with `f` and/or `d`, a symlink matches by the type of its target: links to files for `f`, links to directories for `d`. Broken links appear only with `--type l` alone. Also accepted as `--type=VALUE`. |
+| `--type` | `f` \| `d` \| `l` \| `b` | All types | Filter output by regular files (`f`), directories (`d`), symlinks (`l`) or broken symlinks (`b`). Repeatable. When `l` is combined with `f` and/or `d`, a symlink matches by the type of its target: links to files for `f`, links to directories for `d`. `b` needs no `l` and adds broken links to `f`/`d` results. Also accepted as `--type=VALUE`. |
 | `--exclude-name` | `NAME` | None | Prune entries whose exact basename matches `NAME`. Repeatable (up to 64). |
 | `--separator` | `STR` (escaped) | `\n` | Terminate each result with `STR` (1–64 bytes). Supports escapes like `\0`, `\t`. |
 | `--limit` | `N` \| `none` | Unlimited | Print at most `N` results; `0` prints nothing. `none` means no limit: it is the default, and it also cancels a limit set in the config file. |
@@ -225,10 +241,12 @@ Scripts need no flag: piped output is plain by default. Add `--color=never` only
 - `--type f` restricts output to regular files. Directory traversal continues unaffected so child files can be found.
 - `--type d` restricts output to directories. Output paths for directories always end with a trailing slash (`/`).
 - `--type l` restricts output to symlinks: links to files, links to directories and dangling links alike. Links are never followed, so each is reported by its own name; a symlink to a directory is printed without a trailing slash and is not descended. Directory traversal continues unaffected so links below real directories are found.
-- **A link matches if what it points to matches.** When `l` is combined with `f` and/or `d`, the target decides: `--type f --type l` prints regular files and links to regular files, `--type d --type l` prints directories and links to directories, and `--type f --type d --type l` prints files, directories and links that resolve to either. A chain is followed to its final target. Broken links, links to FIFOs, sockets or devices, and links whose target cannot be read match no combination; **broken links appear only with `--type l` alone**.
+- `--type b` restricts output to **broken symlinks**: links whose target definitively does not exist because it is missing (`ENOENT`), a path component is not a directory (`ENOTDIR`), the chain loops (`ELOOP`), or the target path is too long (`ENAMETOOLONG`). `b` needs no `l` and is the mnemonic for "broken". It takes the conservative side because the main use is deletion: a link that merely cannot be checked (permissions, I/O errors, a stale mount) is **not** broken, and a link to a device, socket or FIFO that resolves is not broken either. `zfind --type b` covers the use of `find -xtype l`, with that difference for links find cannot check.
+- `--type b` combined with `--type l` is the same as `--type l` alone: `l` already matches every link, so `b` adds nothing.
+- **A link matches if what it points to matches.** When `l` is combined with `f` and/or `d`, the target decides: `--type f --type l` prints regular files and links to regular files, `--type d --type l` prints directories and links to directories, and `--type f --type d --type l` prints files, directories and links that resolve to either. A chain is followed to its final target. Links to FIFOs, sockets or devices, and links whose target cannot be read match no combination. Adding `b` to such a combination also prints every broken link: `--type f --type b` is "files plus junk", while resolvable links appear only when `l` is also given.
 - `--type f`, `--type d`, `--type f --type d` and no `--type` at all are unchanged: they print files, directories or both, and exclude every symlink. Repeating a value has no extra effect.
 - A link is still a link under every mask: it is never descended into and never printed with a trailing slash, even when its target is a directory. Special files (FIFOs, sockets, devices) are listed only when no `--type` is given.
-- The value can be written as `--type f` or `--type=f`. It must be exactly one lowercase letter (`f`, `d` or `l`); anything else, including an empty value, is a usage error. `--type` consumes the next token greedily as its value.
+- The value can be written as `--type f` or `--type=f`. It must be exactly one lowercase letter (`f`, `d`, `l` or `b`); anything else, including an empty value, is a usage error. `--type` consumes the next token greedily as its value.
 
 ### Output Format & Separators
 
@@ -385,7 +403,7 @@ Evaluation flows from **Built-in Defaults** $\rightarrow$ **Config File** $\righ
 | :--- | :--- | :--- |
 | **Modes**<br>`--hidden` / `--no-hidden`<br>`--gitignore` / `--no-gitignore` | CLI overrides config. | Conflicting flags within the same source produce an error. Setting a mode on the CLI replaces the config mode. |
 | **Scalars**<br>`--separator`, `--limit`, `--case`, `--color` | Last-write wins. | CLI overwrites config file values. Each default can be spelled out, so the CLI can undo a configured value: for example `--case=smart` over a configured `--case=sensitive`, or `--limit none` over `--limit 200`. `--limit 0` prints nothing. The config file allows only `--color auto` and `--color never`; `always` there is an error. |
-| **Type filter**<br>`--type` | Command-line set replaces the file's. | If the command line gives any `--type`, the file's `--type` values are ignored for that run; otherwise the file's apply. Repeated values within one source accumulate, so `--type f --type d` selects both. A combination that includes `l` is target-aware whichever source supplied each value. |
+| **Type filter**<br>`--type` | Command-line set replaces the file's. | If the command line gives any `--type`, the file's `--type` values are ignored for that run; otherwise the file's apply. Repeated values within one source accumulate, so `--type f --type d` selects both. A combination that includes `l` is target-aware whichever source supplied each value, and `b` selects broken links in the final set. |
 | **Exclusions**<br>`--exclude-name` | Cumulative set union. | Command-line values append to config file entries. Duplicate items are deduplicated. The total combined unique `--exclude-name` entries must not exceed 64. Use `--no-config` to discard configured exclusions. |
 
 ---
