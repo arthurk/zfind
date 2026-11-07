@@ -73,15 +73,61 @@ make test         # one line per test (pytest.ini sets -vv)
 - End experiments with `| head` or `| wc -l`, and write their output files
   outside the tree zfind searches.
 
+## Implementing an issue
+
+All of these start the same loop: "implement issue 9", "implement #9",
+"implement https://github.com/arthurk/zfind/issues/9", "work on #9".
+
+That sentence authorises the whole loop: branch, commits, push, PR and one
+issue comment. Nothing shorter does.
+
+Before step 1, start from a clean tree: `git status -sb`. If unrelated changes
+are present, stop and ask; never mix them into the issue. Branch with
+`git switch -c issue-N-slug`.
+
+1. Read the issue with `gh issue view` (it accepts a number, `#N` or a URL).
+   The issue is the spec; its decided rows are binding. Check its blocked-by
+   issues first; if one is open, say so and stop. If the issue leaves a
+   behaviour undecided that matters here, ask before choosing.
+2. One issue per session. If a second one appears, finish this one and ask
+   for a new session.
+3. Find the code with `scripts/xref.py`; keep source reads to 80 lines or less.
+4. Make the smallest change that satisfies the issue. Do not refactor past
+   it. Ask before restructuring a walker or a shared helper.
+5. Implement the issue's gates. For a behaviour change, change the code first,
+   run `make test-quiet`, then add or extend the tests the gates name. Update
+   the documentation the issue names: the header comment, `help_msg`,
+   `README.md`, or `AGENTS.md`.
+6. All four builds matter: `make test` builds parallel, serial, unknown and
+   range. Run the gates on each (until #11 adds `scripts/allbuilds.py`, loop
+   over `build/x86_64{,-serial,-unknown,-range}/zfind`). For output that must
+   not change, build `main` in a throwaway worktree and diff.
+7. Give the `reviewer` subagent the issue and the diff, not your reasoning.
+   Fix what it confirms.
+8. Stage only the files you changed (never `git add -A`), commit in small
+   units (`zfind:`, `tests:`, `docs:`, `tools:`, `build:`, `ci:`), push, and
+   open one PR whose body contains `Closes #N`. Check CI before the issue
+   comment.
+9. Finish with one issue comment: the commands run and their actual results,
+   failures included, with long output inside `<details>`. Then stop.
+
+The comment is evidence, not a summary: one line per command and its result.
+
+Do not create `PLAN.md`, `IMPLEMENTATION.md` or `JOURNAL.md`.
+
 ## Commits and issues
 
-- Commit only when asked. Then create many small commits rather than one
-  large: one logical change per commit, for example the assembly change, its
-  tests and its docs (README, help text) as separate commits.
+- Outside the issue loop above, commit only when asked. When committing,
+  stage only the files you changed (never `git add -A`) and create many small
+  commits rather than one large: one logical change per commit, for example
+  the assembly change, its tests and its docs (README, help text) as separate
+  commits.
 - Subject lines start with the area: `zfind: ...`, `tests: ...`, `docs: ...`,
-  `tools: ...`.
-- Read an issue with `gh issue view N`, not by fetching its web page, which is
-  mostly navigation.
+  `tools: ...`, `build: ...`, `ci: ...`.
+- Read an issue with `gh issue view` (number, `#N` or URL), not by fetching
+  its web page, which is mostly navigation.
+- File new issues with `.github/ISSUE_TEMPLATE/feature.md`. A good issue is a
+  spec the loop above can implement without questions.
 - Keep git output small: `git status -sb`, `git log -n 5 --format=%s`,
   `git diff --stat` (then `git diff -- FILE` for a single file).
 
