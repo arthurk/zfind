@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import stat
 from pathlib import Path
 from typing import Optional
 
@@ -14,7 +16,7 @@ TINY = words("a b ca cb dir/ dir/c dir/d e")
 TINY_FILES_ONLY = words("a b ca cb dir/c dir/d e")
 TINY_DIRS_ONLY = words("dir/")
 
-TYPE_ERROR = b"zfind: expected f, d or l after --type\n"
+TYPE_ERROR = b"zfind: expected f, d, l or b after --type\n"
 
 
 class TestType:
@@ -50,7 +52,7 @@ class TestType:
 
     def test_help_documents_the_type_values(self, zfind: ZfindRunner):
         out = zfind("tiny", "--help").out
-        assert b"--type f|d|l" in out
+        assert b"--type f|d|l|b" in out
         assert b"--type=V" in out
 
 
@@ -160,6 +162,26 @@ def links_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return make_links_tree(tmp_path_factory.mktemp("links"))
 
 
+BROKEN_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG})
+
+
+def link_state(path: Path) -> Optional[str]:
+    """What a symlink resolves to: "f", "d", "other", "b" when broken, None unknown.
+
+    Broken means the resolution failed with ENOENT, ENOTDIR, ELOOP or
+    ENAMETOOLONG. Any other error is indeterminate: it must match b nowhere.
+    """
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        return "b" if exc.errno in BROKEN_ERRNOS else None
+    if stat.S_ISREG(st.st_mode):
+        return "f"
+    if stat.S_ISDIR(st.st_mode):
+        return "d"
+    return "other"
+
+
 def model(
     root: Path,
     kinds: Optional[set[str]] = None,
@@ -169,25 +191,32 @@ def model(
 ) -> list[bytes]:
     """What zfind must print: sorted by name per directory, depth first.
 
-    kinds is a set of "f", "d", "l", or None for no type filter. Symlinks are
-    never followed for traversal, and directories (only) end with "/".
+    kinds is a set of "f", "d", "l", "b", or None for no type filter. Symlinks
+    are never followed for traversal, and directories (only) end with "/".
 
     A link matches its own "l" kind. When "l" is combined with "f" and/or
     "d", the target decides instead: the link matches only when it resolves to
-    a selected regular file or directory. Broken links, and links to special
-    files, match no combination.
+    a selected regular file or directory. "b" selects links whose target
+    definitively does not exist, with or without "l"; it adds those links to
+    an f/d combination. Links to special files match no f/d combination.
     """
     out: list[bytes] = []
 
     def selected(entry: os.DirEntry, kind: str) -> bool:
-        combined = kinds is not None and "l" in kinds and bool(kinds & {"f", "d"})
-        if kind == "l" and combined:
-            if entry.is_file(follow_symlinks=True):
-                return "f" in kinds
-            if entry.is_dir(follow_symlinks=True):
-                return "d" in kinds
+        if kinds is None:
+            return True
+        if kind != "l":
+            return kind in kinds
+        if "l" in kinds and not kinds & {"f", "d"}:
+            return True                     # l alone (b adds nothing here)
+        if "l" not in kinds and "b" not in kinds:
             return False
-        return kinds is None or kind in kinds
+        state = link_state(Path(entry.path))
+        if state == "b":
+            return "b" in kinds
+        if state in ("f", "d"):
+            return "l" in kinds and state in kinds
+        return False
 
     def walk(directory: Path, prefix: str) -> None:
         for entry in sorted(os.scandir(directory), key=lambda e: os.fsencode(e.name)):
@@ -308,7 +337,7 @@ class TestTypeLinks:
 
     def test_help_lists_the_new_type(self, binary: Path, links_tree: Path):
         res = run_in(binary, links_tree, "--help")
-        assert b"--type f|d|l" in res.out
+        assert b"--type f|d|l|b" in res.out
 
     @pytest.mark.parametrize("arg", ["--type=L", "--type=ll", "--type=sym"])
     def test_other_spellings_of_l_are_rejected(self, binary: Path, links_tree: Path, arg: str):
@@ -320,7 +349,7 @@ class TestTypeLinks:
 
 @pytest.fixture(scope="module")
 def combos_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """The fixture from issue #8."""
+    """The extended fixture from issue #9 (issue #8's tree plus four links)."""
     root = tmp_path_factory.mktemp("combos")
     for rel in ("a.txt", "FOO.txt", "foo.txt", "Foo.txt", "sub/b.txt", "sub2/c.txt"):
         path = root / rel
@@ -330,13 +359,18 @@ def combos_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     (root / "lnk_dir").symlink_to("sub")
     (root / "lnk_dangling").symlink_to("nowhere")
     (root / "sub" / "inner_lnk").symlink_to("../sub2")
+    (root / "lnk_null").symlink_to("/dev/null")          # resolves: not broken
+    (root / "lnk_notdir").symlink_to("a.txt/nope")       # ENOTDIR
+    (root / "lnk_loop_a").symlink_to("lnk_loop_b")       # ELOOP
+    (root / "lnk_loop_b").symlink_to("lnk_loop_a")
     return root
 
 
 class TestTargetAwareCombinations:
     """When l is combined with f and/or d, a link matches by its target's type."""
 
-    LINKS = [b"lnk_dangling", b"lnk_dir", b"lnk_file", b"sub/inner_lnk"]
+    LINKS = [b"lnk_dangling", b"lnk_dir", b"lnk_file", b"lnk_loop_a",
+             b"lnk_loop_b", b"lnk_notdir", b"lnk_null", b"sub/inner_lnk"]
     FILES_AND_LINKS = [b"FOO.txt", b"Foo.txt", b"a.txt", b"foo.txt", b"lnk_file",
                        b"sub/b.txt", b"sub2/c.txt"]
     DIRS_AND_LINKS = [b"lnk_dir", b"sub/", b"sub/inner_lnk", b"sub2/"]
@@ -412,6 +446,93 @@ class TestTargetAwareCombinations:
         assert listing(binary, tmp_path, "--type", "l") == [b"lnk_fifo"]
         assert listing(binary, tmp_path, "--type", "f", "--type", "l") == []
         assert listing(binary, tmp_path, "--type", "d", "--type", "l") == []
+
+
+class TestBrokenSymlinks:
+    """--type b selects links whose target definitively does not exist."""
+
+    BROKEN = [b"lnk_dangling", b"lnk_loop_a", b"lnk_loop_b", b"lnk_notdir"]
+    ALL_LINKS = TestTargetAwareCombinations.LINKS
+    FILES_AND_BROKEN = [b"FOO.txt", b"Foo.txt", b"a.txt", b"foo.txt",
+                        b"lnk_dangling", b"lnk_loop_a", b"lnk_loop_b",
+                        b"lnk_notdir", b"sub/b.txt", b"sub2/c.txt"]
+    DIRS_AND_BROKEN = [b"lnk_dangling", b"lnk_loop_a", b"lnk_loop_b",
+                       b"lnk_notdir", b"sub/", b"sub2/"]
+    FILES_DIRS_AND_BROKEN = [b"FOO.txt", b"Foo.txt", b"a.txt", b"foo.txt",
+                             b"lnk_dangling", b"lnk_loop_a", b"lnk_loop_b",
+                             b"lnk_notdir", b"sub/", b"sub/b.txt", b"sub2/",
+                             b"sub2/c.txt"]
+    FILES_LINKS_AND_BROKEN = [b"FOO.txt", b"Foo.txt", b"a.txt", b"foo.txt",
+                              b"lnk_dangling", b"lnk_file", b"lnk_loop_a",
+                              b"lnk_loop_b", b"lnk_notdir", b"sub/b.txt",
+                              b"sub2/c.txt"]
+    EVERYTHING_AND_BROKEN = [b"FOO.txt", b"Foo.txt", b"a.txt", b"foo.txt",
+                             b"lnk_dangling", b"lnk_dir", b"lnk_file",
+                             b"lnk_loop_a", b"lnk_loop_b", b"lnk_notdir", b"sub/",
+                             b"sub/b.txt", b"sub/inner_lnk", b"sub2/", b"sub2/c.txt"]
+
+    @pytest.mark.parametrize("kinds, expected", [
+        pytest.param(("b",), BROKEN, id="broken"),
+        pytest.param(("f", "b"), FILES_AND_BROKEN, id="files-and-broken"),
+        pytest.param(("d", "b"), DIRS_AND_BROKEN, id="dirs-and-broken"),
+        pytest.param(("f", "d", "b"), FILES_DIRS_AND_BROKEN, id="files-dirs-broken"),
+        pytest.param(("l", "b"), ALL_LINKS, id="links-and-broken"),
+        pytest.param(("f", "l", "b"), FILES_LINKS_AND_BROKEN, id="files-links-broken"),
+        pytest.param(("f", "d", "l", "b"), EVERYTHING_AND_BROKEN,
+                     id="files-dirs-links-broken"),
+    ])
+    def test_the_issue_gates(
+        self, binary: Path, combos_tree: Path, kinds: tuple[str, ...], expected: list[bytes]
+    ):
+        args = [arg for kind in kinds for arg in ("--type", kind)]
+        assert listing(binary, combos_tree, *args) == expected
+        assert listing(binary, combos_tree, *args) == model(combos_tree, set(kinds))
+
+    def test_b_lists_no_resolvable_link_and_no_trailing_slash(
+        self, binary: Path, combos_tree: Path
+    ):
+        got = listing(binary, combos_tree, "--type", "b")
+        assert got == self.BROKEN
+        assert b"lnk_null" not in got          # resolves to /dev/null: not broken
+        assert not [name for name in got if name.endswith(b"/")]
+
+    def test_the_equals_form_selects_the_same_set(self, binary: Path, combos_tree: Path):
+        assert listing(binary, combos_tree, "--type=b") == self.BROKEN
+
+    def test_a_pattern_composes_with_the_broken_rule(self, binary: Path, combos_tree: Path):
+        assert listing(binary, combos_tree, "--type", "b", "lnk_loop") == [
+            b"lnk_loop_a", b"lnk_loop_b"
+        ]
+
+    def test_a_limit_applies_after_the_broken_rule(self, binary: Path, combos_tree: Path):
+        assert listing(binary, combos_tree, "--type", "b", "--limit", "2") == (
+            self.BROKEN[:2]
+        )
+
+    def test_b_finds_nested_broken_links_and_still_descends_directories(
+        self, binary: Path, links_tree: Path
+    ):
+        # big/ has 40 entries, so the range build takes walk_range here.
+        got = listing(binary, links_tree, "--type", "b")
+        assert got == model(links_tree, {"b"})
+        assert b"big/ldang" in got and b"lnk_dangling" in got
+
+    def test_a_link_behind_an_unreadable_directory_is_not_broken(
+        self, binary: Path, tmp_path: Path
+    ):
+        if os.geteuid() == 0:
+            pytest.skip("root can read a mode-000 directory")
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        (locked / "target.txt").write_bytes(b"")
+        (tmp_path / "lnk_locked").symlink_to("locked/target.txt")
+        locked.chmod(0)
+        try:
+            assert listing(binary, tmp_path, "--type", "b") == []
+            assert listing(binary, tmp_path, "--type", "l") == [b"lnk_locked"]
+            assert listing(binary, tmp_path, "--type", "f", "--type", "l") == []
+        finally:
+            locked.chmod(0o700)
 
 
 class TestTypeLinksAndGitignore:
