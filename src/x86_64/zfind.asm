@@ -3,7 +3,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; zfind, "simple search" use case only:
 ;   zfind [--help] [--separator STR] [--case smart|sensitive|insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
-;         [--exclude-name NAME] [--limit N|none] [--type f|d|l]
+;         [--exclude-name NAME] [--limit N|none] [--type f|d|l|b]
 ;         [--color auto|always|never]
 ;         [--config PATH | --no-config] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
@@ -23,13 +23,16 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; arena_put; a matching directory is pruned. Explicit exclusions override
 ; .gitignore rules, but .gitignore detection and rule loading still happen
 ; when the .gitignore entry itself is excluded.
-; --type f|d|l is repeatable and selects regular files, directories and
-; symlinks. A link matches --type l on its own, broken links included. When l
-; is combined with f and/or d, a link matches by what it points to instead: a
+; --type f|d|l|b is repeatable and selects regular files, directories,
+; symlinks and broken symlinks. A link matches --type l on its own, broken
+; links included; b selects the broken subset and needs no l. When l is
+; combined with f and/or d, a link matches by what it points to instead: a
 ; selected regular file or directory, with a chain followed to its final
-; target. Broken links, links to special files and unreadable targets match no
-; combination. Links are never descended into and never printed with a trailing
-; slash, whatever the mask.
+; target; b then adds the broken links. Broken means resolution failed with
+; ENOENT, ENOTDIR, ELOOP or ENAMETOOLONG; any other failure is indeterminate
+; and matches b nowhere. Links to special files match no f/d combination.
+; Links are never descended into and never printed with a trailing slash,
+; whatever the mask.
 ; Use -- before a PATTERN that starts with -.
 ; Settings may also come from a config file: --config PATH, else
 ; $XDG_CONFIG_HOME/zfind/config (non-empty absolute path), else
@@ -185,6 +188,8 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define TYPE_F      DT_BIT(DT_REG)
 %define TYPE_D      DT_BIT(DT_DIR)
 %define TYPE_L      DT_BIT(DT_LNK)
+%define DT_B        11                ; not a d_type: b is the broken-link subset
+%define TYPE_B      DT_BIT(DT_B)
 
 ; per-thread state; one instance per worker plus the main thread's, all from
 ; one mmap. r14 points at the caller's instance in every function that uses it.
@@ -285,7 +290,7 @@ section .rodata
     e_arg_e:
     e_limit     db "zfind: invalid limit (expected a whole number or none)", 10
     e_limit_e:
-    e_type      db "zfind: expected f, d or l after --type", 10
+    e_type      db "zfind: expected f, d, l or b after --type", 10
     e_type_e:
     e_flag      db "zfind: unknown option", 10
     e_flag_e:
@@ -384,7 +389,7 @@ section .rodata
     cfg_sfx_home_e:
     help_msg    db "usage: zfind [--help] [--separator STR] [--case smart|sensitive|insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
-               db "             [--exclude-name NAME]... [--limit N|none] [--type f|d|l]", 10
+               db "             [--exclude-name NAME]... [--limit N|none] [--type f|d|l|b]", 10
                db "             [--color auto|always|never]", 10
                db "             [--config PATH | --no-config] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
@@ -428,9 +433,10 @@ section .rodata
                db "                      also --exclude-name=NAME; matching dirs are pruned", 10
                db "  --limit N|none      print at most N results (0 prints nothing)", 10
                db "                      none: no limit, the default; also --limit=N|none", 10
-               db "  --type f|d|l        repeatable; print regular files, directories, symlinks", 10
-               db "                      when combined, symlinks match by the type of their", 10
-               db "                      target; broken links appear only with l alone", 10
+               db "  --type f|d|l|b      repeatable; f files, d directories, l symlinks, b broken", 10
+               db "                      symlinks; with l+f/d a symlink matches by its target;", 10
+               db "                      broken links appear with l alone and b adds them to", 10
+               db "                      f/d combinations", 10
                db "                      also --type=V", 10
                db "  --color WHEN        color results: auto, always or never (default: auto)", 10
                db "                      also --color=WHEN; auto colors a terminal unless", 10
@@ -484,7 +490,8 @@ section .bss
                                       ;   the command line is parsed (0 = not set)
     color_on:   resb 1                ; resolved once at startup: 1 = emit ANSI
     res_type:   resb 32                ; --type bitset: bit index is the d_type
-                                       ;   value, so TYPE_D/F/L are the masks
+                                       ;   value, plus TYPE_B; so TYPE_D/F/L/B are
+                                       ;   the masks
     type_seen:  resb 1
     git_repo:   resq 1
     cfg_mode:   resb 1                ; 0 = default location, 1 = --config, 2 = --no-config
@@ -1040,7 +1047,7 @@ parse_args:
 .opt_type_eq:
     mov rdi, [rbp+r12*8]
     add rdi, 7                         ; len("--type=")
-.opt_type_value:                       ; rdi = the value: exactly one of f, d, l
+.opt_type_value:                       ; rdi = the value: exactly one of f, d, l, b
     movzx eax, byte [rdi]
     test al, al
     jz bad_type                        ; "--type=" with nothing after it
@@ -1051,7 +1058,12 @@ parse_args:
     cmp al, 'd'
     je .type_dir
     cmp al, 'l'
+    je .type_link
+    cmp al, 'b'
     jne bad_type
+    bts qword [res_type], DT_B
+    jmp .type_set
+.type_link:
     bts qword [res_type], DT_LNK
     jmp .type_set
 .type_dir:
@@ -4651,26 +4663,37 @@ try_range_split.end_func:
 ; when type_seen is set.  A non-link is selected by its own bit.  A symlink is
 ; selected by its own bit (--type l) unless l is combined with f and/or d:
 ; then the link matches only when what it points to is a selected regular file
-; or directory, and a broken or unreadable link matches nothing.  The lookup
-; follows the chain but never makes the walk descend.  path_buf must hold the
-; entry's full path.
+; or directory.  b selects a link whose target definitively does not exist
+; (ENOENT, ENOTDIR, ELOOP, ENAMETOOLONG), with or without l.  Any other
+; resolution failure is indeterminate: it matches b nowhere, l alone, and no
+; f/d combination.  The lookup follows the chain but never makes the walk
+; descend.  path_buf must hold the entry's full path.
     global type_ok:function (type_ok.end_func - type_ok)
 type_ok:
     movzx ecx, dil
     cmp ecx, DT_LNK
     jne .plain
-    test qword [res_type], TYPE_L    ; l not selected: the plain gate rejects
-    jz .plain
+    test qword [res_type], TYPE_L
+    jz .broken_only
     test qword [res_type], TYPE_F | TYPE_D
-    jz .plain
-    mov rax, 262                     ; newfstatat, following the link
+    jz .yes                          ; l on its own: every link, broken included
+    mov r8d, 1                       ; l + f/d: the target decides
+    jmp .follow
+.broken_only:
+    test qword [res_type], TYPE_B
+    jz .no
+    xor r8d, r8d                     ; b without l: only broken links
+.follow:
+    mov rax, 262                     ; newfstatat, following the whole chain
     mov rdi, AT_FDCWD
     lea rsi, [r14+path_buf]
     lea rdx, [r14+statbuf]
     xor r10d, r10d                   ; no AT_SYMLINK_NOFOLLOW
     syscall
     test rax, rax
-    js .no                           ; broken or unreadable: dropped
+    js .resolution_failed
+    test r8d, r8d
+    jz .no                           ; b alone: a resolving link never matches
     mov eax, [r14+statbuf+24]        ; st_mode
     and eax, 0xF000
     cmp eax, 0x8000                  ; S_IFREG
@@ -4681,6 +4704,25 @@ type_ok:
     jmp .plain
 .reg:
     mov ecx, DT_REG
+    jmp .plain
+.resolution_failed:
+    ; stat returns -errno.  Only definitive absence counts; EACCES, EIO,
+    ; ESTALE and friends are indeterminate ("when in doubt, not broken").
+    neg eax
+    cmp eax, 2                       ; ENOENT
+    je .broken
+    cmp eax, 20                      ; ENOTDIR
+    je .broken
+    cmp eax, 40                      ; ELOOP
+    je .broken
+    cmp eax, 36                      ; ENAMETOOLONG
+    jne .no
+.broken:
+    test qword [res_type], TYPE_B
+    jz .no
+.yes:
+    mov eax, 1
+    ret
 .plain:
     bt qword [res_type], rcx
     setc al
@@ -5049,7 +5091,11 @@ walk_dir:
     cmp byte [type_seen], 0
     je .type_visible
     bt qword [res_type], r8
-    jnc .pskip
+    jc .type_visible
+    cmp r8b, DT_LNK                  ; b keeps links for type_ok to test
+    jne .pskip
+    test qword [res_type], TYPE_B
+    jz .pskip
 .type_visible:
     ; Directories and unknown types were kept above; only known non-directories
     ; reach this pattern prefilter.
