@@ -31,7 +31,7 @@ else
 endif
 
 # ---------- targets ----------
-.PHONY: all run map clean testdata test test-quiet release
+.PHONY: all run clean testdata test test-quiet release
 
 all: $(BIN)
 
