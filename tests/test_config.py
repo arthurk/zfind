@@ -117,13 +117,14 @@ def tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture
 def links_cfg(zfind_path: Path, tmp_path: Path, home: Path) -> ConfigRunner:
-    """A runner over a small tree with a file, a directory and two symlinks."""
+    """A runner over a small tree with a file, a directory and three symlinks."""
     root = tmp_path / "links"
     (root / "dir").mkdir(parents=True)
     (root / "dir" / "inner").write_bytes(b"")
     (root / "file").write_bytes(b"")
     (root / "lnk").symlink_to("file")
     (root / "dlnk").symlink_to("dir")
+    (root / "broken").symlink_to("gone")
     return ConfigRunner(zfind_path, root, home)
 
 
@@ -303,7 +304,7 @@ class TestConfigSelection:
             (("--separator", "--config=x", "config"), Result(b".git/config--config=x", b"", 0)),
             (("--limit", "--no-config"), failure(b"zfind: invalid limit (expected a whole number or none)\n")),
             (("--limit", "--config", "/nonexistent"), failure(b"zfind: invalid limit (expected a whole number or none)\n")),
-            (("--type", "--no-config"), failure(b"zfind: expected f, d or l after --type\n")),
+            (("--type", "--no-config"), failure(b"zfind: expected f, d, l or b after --type\n")),
         ],
     )
     def test_value_options_swallow_config_option_names(
@@ -490,14 +491,14 @@ class TestConfigErrors:
             pytest.param("--exclude-name\n", 1, "missing value for --exclude-name", id="exclude-without-value"),
             pytest.param("--exclude-name=''\n", 1, "empty name for --exclude-name", id="exclude-empty-quoted"),
             pytest.param("--exclude-name=a/b\n", 1, "--exclude-name matches basenames only; '/' is not allowed", id="exclude-slash"),
-            pytest.param("--type\n", 1, "expected f, d or l after --type", id="type-without-value"),
-            pytest.param("--type x\n", 1, "expected f, d or l after --type", id="type-bad-value"),
-            pytest.param("--type=\n", 1, "expected f, d or l after --type", id="type-equals-without-value"),
-            pytest.param("--type=x\n", 1, "expected f, d or l after --type", id="type-equals-bad-value"),
-            pytest.param("--type=ff\n", 1, "expected f, d or l after --type", id="type-equals-two-letters"),
-            pytest.param("--type=''\n", 1, "expected f, d or l after --type", id="type-equals-empty-quoted"),
-            pytest.param("--type f d\n", 1, "expected f, d or l after --type", id="type-value-is-the-rest-of-the-line"),
-            pytest.param("--type=f d\n", 1, "expected f, d or l after --type", id="type-equals-value-is-the-rest-of-the-line"),
+            pytest.param("--type\n", 1, "expected f, d, l or b after --type", id="type-without-value"),
+            pytest.param("--type x\n", 1, "expected f, d, l or b after --type", id="type-bad-value"),
+            pytest.param("--type=\n", 1, "expected f, d, l or b after --type", id="type-equals-without-value"),
+            pytest.param("--type=x\n", 1, "expected f, d, l or b after --type", id="type-equals-bad-value"),
+            pytest.param("--type=ff\n", 1, "expected f, d, l or b after --type", id="type-equals-two-letters"),
+            pytest.param("--type=''\n", 1, "expected f, d, l or b after --type", id="type-equals-empty-quoted"),
+            pytest.param("--type f d\n", 1, "expected f, d, l or b after --type", id="type-value-is-the-rest-of-the-line"),
+            pytest.param("--type=f d\n", 1, "expected f, d, l or b after --type", id="type-equals-value-is-the-rest-of-the-line"),
             pytest.param("--exclude-name='abc\n", 1, "malformed quotes in config value", id="quote-never-closed"),
             pytest.param("--exclude-name='a'b'\n", 1, "malformed quotes in config value", id="quote-inside-quoted"),
             pytest.param("--exclude-name='a'b\n", 1, "malformed quotes in config value", id="text-after-closing-quote"),
@@ -549,7 +550,7 @@ class TestConfigErrors:
     ):
         cfg.write("--type f\n--type q\n")
         res = cfg("--type", "d")
-        assert res == failure(cfg.error(2, "expected f, d or l after --type"))
+        assert res == failure(cfg.error(2, "expected f, d, l or b after --type"))
 
     def test_nul_byte_is_an_error_not_a_truncated_line(self, cfg: ConfigRunner):
         cfg.write(b"--hidden\n--no\x00hidden\n")
@@ -697,7 +698,7 @@ class TestConfigPrecedence:
     def test_l_selects_symlinks_in_the_file_in_either_form(self, links_cfg: ConfigRunner):
         for line in ("--type l\n", "--type=l\n"):
             links_cfg.write(line)
-            assert links_cfg() == listing([b"dlnk", b"lnk"]), line
+            assert links_cfg() == listing([b"broken", b"dlnk", b"lnk"]), line
 
     def test_command_line_type_replaces_a_configured_l(self, links_cfg: ConfigRunner):
         links_cfg.write("--type=l\n")
@@ -706,7 +707,18 @@ class TestConfigPrecedence:
 
     def test_command_line_l_replaces_a_configured_type(self, links_cfg: ConfigRunner):
         links_cfg.write("--type f\n")
-        assert links_cfg("--type=l") == listing([b"dlnk", b"lnk"])
+        assert links_cfg("--type=l") == listing([b"broken", b"dlnk", b"lnk"])
+
+    def test_configured_b_selects_only_broken_links(self, links_cfg: ConfigRunner):
+        links_cfg.write("--type b\n")
+        assert links_cfg() == listing([b"broken"])
+        assert links_cfg("--type", "b") == listing([b"broken"])  # idempotent
+
+    def test_command_line_b_and_l_replace_the_configured_set(self, links_cfg: ConfigRunner):
+        links_cfg.write("--type l\n")
+        assert links_cfg("--type", "b") == listing([b"broken"])
+        links_cfg.write("--type b\n")
+        assert links_cfg("--type", "l") == listing([b"broken", b"dlnk", b"lnk"])
 
     def test_a_configured_combination_is_target_aware(self, links_cfg: ConfigRunner):
         # The rule applies to the final set, whatever source supplied each
