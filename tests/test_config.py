@@ -741,6 +741,32 @@ class TestConfigPrecedence:
         full = cfg("--exclude-name", "one-too-many", "config")
         assert full == failure(b"zfind: too many --exclude-name values (max 64)\n")
 
+    def test_exclude_types_accumulate_across_layers(self, links_cfg: ConfigRunner):
+        links_cfg.write("--exclude-type l\n")
+        assert links_cfg() == listing([b"dir/", b"dir/inner", b"file"])
+        both = listing([b"dir/inner", b"file"])
+        assert links_cfg("--exclude-type", "d") == both
+        assert links_cfg("--exclude-type=d") == both
+
+    def test_a_configured_exclude_type_accepts_both_forms(self, links_cfg: ConfigRunner):
+        expected = [b"broken", b"dir/inner", b"file", b"lnk"]
+        for line in ("--exclude-type d\n", "--exclude-type=d\n"):
+            links_cfg.write(line)
+            assert links_cfg() == listing(expected), line
+
+    def test_a_post_merge_contradiction_fails_at_startup(self, links_cfg: ConfigRunner):
+        expected = failure(
+            b"zfind: cannot combine --type and --exclude-type for the same value\n"
+        )
+        links_cfg.write("--type l\n")
+        assert links_cfg("--exclude-type", "l") == expected
+        links_cfg.write("--exclude-type l\n")
+        assert links_cfg("--type", "l") == expected
+
+    def test_a_configured_invalid_exclude_type_names_the_line(self, cfg: ConfigRunner):
+        cfg.write("--exclude-type z\n")
+        assert cfg() == failure(cfg.error(1, "expected f, d, l or b after --exclude-type"))
+
     def test_options_the_file_does_not_set_keep_their_defaults(self, cfg: ConfigRunner):
         cfg.write("--limit 2\n")
         assert cfg("Config") == listing([b"Config.md"])  # smart case still applies

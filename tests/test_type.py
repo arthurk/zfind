@@ -555,3 +555,181 @@ class TestTypeLinksAndGitignore:
     def test_without_gitignore_both_are_listed(self, binary: Path, repo: Path):
         assert listing(binary, repo, "--type", "l") == [b"ign"]
         assert listing(binary, repo, "--type", "d") == [b".git/", b"sub/", b"sub/ign/"]
+
+
+# -----------------------------------------------------------------------------
+# --exclude-type
+#
+# Exclusion is the union of its values and uses the same meanings as --type:
+# f and d test what an entry behaves like (a link by its target), l and b test
+# the link itself. A result must match --type, when given, and must not match
+# --exclude-type. The oracle walks the filesystem in Python so the same tests
+# run against every build variant.
+
+EXCLUDE_TYPE_ERROR = b"zfind: expected f, d, l or b after --exclude-type\n"
+TYPE_CONFLICT_ERROR = (
+    b"zfind: cannot combine --type and --exclude-type for the same value\n"
+)
+
+
+def excluded_values(args: list[str]) -> set[str]:
+    """The kinds named by the --exclude-type options in args."""
+    kinds: set[str] = set()
+    i = 0
+    while i < len(args):
+        if args[i] == "--exclude-type":
+            kinds.add(args[i + 1])
+            i += 2
+        elif args[i].startswith("--exclude-type="):
+            kinds.add(args[i].split("=", 1)[1])
+            i += 1
+        else:
+            i += 1
+    return kinds
+
+
+def excluded_model(
+    root: Path,
+    drop: set[str],
+    *,
+    substring: bytes = b"",
+    hidden: bool = True,
+) -> list[bytes]:
+    """What zfind must print under --exclude-type for each kind in drop."""
+
+    def excluded(entry: os.DirEntry, kind: str) -> bool:
+        if kind != "l":
+            return kind in drop
+        if "l" in drop:
+            return True                      # l tests the link: no target lookup
+        state = link_state(Path(entry.path))
+        if state == "b":
+            return "b" in drop
+        if state in ("f", "d"):
+            return state in drop             # f/d test what it behaves like
+        return False
+
+    out: list[bytes] = []
+
+    def walk(directory: Path, prefix: str) -> None:
+        for entry in sorted(os.scandir(directory), key=lambda e: os.fsencode(e.name)):
+            if entry.name.startswith(".") and not hidden:
+                continue
+            if entry.is_symlink():
+                kind, slash = "l", ""
+            elif entry.is_dir(follow_symlinks=False):
+                kind, slash = "d", "/"
+            else:
+                kind, slash = "f", ""
+            rel = prefix + entry.name
+            if not excluded(entry, kind) and substring in os.fsencode(entry.name):
+                out.append(os.fsencode(rel + slash))
+            if kind == "d":
+                walk(Path(entry.path), rel + "/")
+
+    walk(root, "")
+    return out
+
+
+class TestExcludeType:
+    """The issue #10 gates on the issue #9 fixture."""
+
+    FILES = [b"FOO.txt", b"Foo.txt", b"a.txt", b"foo.txt", b"sub/b.txt", b"sub2/c.txt"]
+    NO_DIRS = [b"FOO.txt", b"Foo.txt", b"a.txt", b"foo.txt", b"lnk_dangling",
+               b"lnk_file", b"lnk_loop_a", b"lnk_loop_b", b"lnk_notdir",
+               b"lnk_null", b"sub/b.txt", b"sub2/c.txt"]
+    NO_LINKS = [b"FOO.txt", b"Foo.txt", b"a.txt", b"foo.txt", b"sub/",
+                b"sub/b.txt", b"sub2/", b"sub2/c.txt"]
+    NO_FILES = [b"lnk_dangling", b"lnk_dir", b"lnk_loop_a", b"lnk_loop_b",
+                b"lnk_notdir", b"lnk_null", b"sub/", b"sub/inner_lnk", b"sub2/"]
+    NO_BROKEN = [b"FOO.txt", b"Foo.txt", b"a.txt", b"foo.txt", b"lnk_dir",
+                 b"lnk_file", b"lnk_null", b"sub/", b"sub/b.txt",
+                 b"sub/inner_lnk", b"sub2/", b"sub2/c.txt"]
+    LINKS_EXCEPT_DIRS = [b"lnk_dangling", b"lnk_file", b"lnk_loop_a",
+                         b"lnk_loop_b", b"lnk_notdir", b"lnk_null"]
+
+    @pytest.mark.parametrize("args, expected", [
+        pytest.param(["--exclude-type", "d"], NO_DIRS, id="no-directories"),
+        pytest.param(["--exclude-type", "l"], NO_LINKS, id="no-links"),
+        pytest.param(["--exclude-type", "f"], NO_FILES, id="no-files"),
+        pytest.param(["--exclude-type", "b"], NO_BROKEN, id="no-broken-links"),
+        pytest.param(["--type", "l", "--exclude-type", "d"], LINKS_EXCEPT_DIRS,
+                     id="links-except-dirs"),
+        pytest.param(["--type", "f", "--exclude-type", "d"], FILES,
+                     id="files-except-dirs"),
+        pytest.param(["--exclude-type", "d", "--exclude-type", "b"],
+                     [b"FOO.txt", b"Foo.txt", b"a.txt", b"foo.txt", b"lnk_file",
+                      b"lnk_null", b"sub/b.txt", b"sub2/c.txt"],
+                     id="no-dirs-no-broken"),
+        pytest.param(["--exclude-type=l"], NO_LINKS, id="equals-form"),
+        pytest.param(["--exclude-type", "l", "--exclude-type", "d"], FILES,
+                     id="exclusions-union"),
+    ])
+    def test_the_issue_gates(
+        self, binary: Path, combos_tree: Path, args: list[str], expected: list[bytes]
+    ):
+        got = listing(binary, combos_tree, *args)
+        assert got == expected
+        if "--type" not in args and not any(arg.startswith("--type=") for arg in args):
+            assert got == excluded_model(combos_tree, excluded_values(args))
+
+    def test_pattern_and_limit_compose(self, binary: Path, combos_tree: Path):
+        got = listing(binary, combos_tree, "--exclude-type", "l", "--limit", "3", "txt")
+        assert got == [b"FOO.txt", b"Foo.txt", b"a.txt"]
+
+    @pytest.mark.parametrize("args", [
+        pytest.param(["--exclude-type"], id="missing-arg"),
+        pytest.param(["--exclude-type", "z"], id="invalid-letter"),
+        pytest.param(["--exclude-type", "F"], id="uppercase-letter"),
+        pytest.param(["--exclude-type", "dir"], id="word-instead-of-char"),
+        pytest.param(["--exclude-type", ""], id="empty-value"),
+        pytest.param(["--exclude-type", "--limit", "5"], id="subsequent-flag-as-value"),
+        pytest.param(["--exclude-type", "--no-config"], id="config-option-as-value"),
+        pytest.param(["--exclude-type="], id="empty-equals"),
+        pytest.param(["--exclude-type=ff"], id="two-letters"),
+    ])
+    def test_invalid_values_fail(self, binary: Path, combos_tree: Path, args: list[str]):
+        res = run_in(binary, combos_tree, *args)
+        assert res.status == 1, f"Expected exit 1: {res}"
+        assert res.err == EXCLUDE_TYPE_ERROR
+        assert res.out == b""
+
+    @pytest.mark.parametrize("args", [
+        pytest.param(["--type", "f", "--exclude-type", "f"], id="files"),
+        pytest.param(["--type", "d", "--exclude-type=d"], id="dirs-equals"),
+        pytest.param(["--type", "l", "--exclude-type", "l"], id="links"),
+        pytest.param(["--type", "f", "--type", "d", "--exclude-type", "d"],
+                     id="one-value-of-a-set"),
+    ])
+    def test_the_same_value_in_both_sets_fails(
+        self, binary: Path, combos_tree: Path, args: list[str]
+    ):
+        res = run_in(binary, combos_tree, *args)
+        assert res.status == 1, f"Expected exit 1: {res}"
+        assert res.err == TYPE_CONFLICT_ERROR
+        assert res.out == b""
+
+    def test_no_contradiction_when_the_sets_differ(self, binary: Path, combos_tree: Path):
+        assert listing(binary, combos_tree, "--type", "f", "--exclude-type", "d") == self.FILES
+
+    def test_help_documents_exclude_type(self, binary: Path, combos_tree: Path):
+        out = run_in(binary, combos_tree, "--help").out
+        assert b"--exclude-type f|d|l|b" in out
+        assert b"--exclude-type=V" in out
+
+
+class TestExcludeTypeAcrossTreeShapes:
+    """Every walker path sees the same exclusion over the links fixture."""
+
+    @pytest.mark.parametrize("drop", [
+        pytest.param({"d"}, id="dirs"),
+        pytest.param({"l"}, id="links"),
+        pytest.param({"f"}, id="files"),
+        pytest.param({"b"}, id="broken"),
+        pytest.param({"f", "d"}, id="files-and-dirs"),
+        pytest.param({"l", "d"}, id="links-and-dirs"),
+        pytest.param({"d", "b"}, id="dirs-and-broken"),
+    ])
+    def test_the_oracle_agrees(self, binary: Path, links_tree: Path, drop: set[str]):
+        args = [arg for kind in sorted(drop) for arg in ("--exclude-type", kind)]
+        assert listing(binary, links_tree, *args) == excluded_model(links_tree, drop)
