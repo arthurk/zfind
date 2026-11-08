@@ -3,8 +3,8 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; zfind, "simple search" use case only:
 ;   zfind [--help] [--separator STR] [--case smart|sensitive|insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
-;         [--exclude-name NAME] [--limit N|none] [--type f|d|l|b]
-;         [--color auto|always|never]
+;         [--exclude-name NAME] [--exclude-type f|d|l|b] [--limit N|none]
+;         [--type f|d|l|b] [--color auto|always|never]
 ;         [--config PATH | --no-config] [--] [PATTERN]
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
@@ -33,7 +33,16 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; and matches b nowhere. Links to special files match no f/d combination.
 ; Links are never descended into and never printed with a trailing slash,
 ; whatever the mask.
-; Use -- before a PATTERN that starts with -.
+; --exclude-type f|d|l|b is repeatable, takes the same values, and drops every
+; entry the corresponding --type set would select. Inclusion and exclusion are
+; independent: a result must match --type (if given) and must not match
+; --exclude-type. Exclusion follows links for f and d even without l, so
+; --exclude-type d removes links to directories and --exclude-type f removes
+; links to files; broken links are kept under both. l drops every link with no
+; target lookup; b drops broken links and needs one lookup per link. Unlike
+; --exclude-name, --exclude-type never prunes traversal: an excluded directory
+; is still walked and its children still printed. The same value in --type and
+; --exclude-type is a usage error. Use -- before a PATTERN that starts with -.
 ; Settings may also come from a config file: --config PATH, else
 ; $XDG_CONFIG_HOME/zfind/config (non-empty absolute path), else
 ; $HOME/.config/zfind/config. --no-config reads none. The file is one option per
@@ -43,10 +52,10 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; the built-in defaults, then the file, then the command line: a mode
 ; (hidden, gitignore) set on the command line replaces the file's, a scalar
 ; (--separator, --limit, --case) is overwritten, a command-line --type replaces
-; the file's whole set, and --exclude-name accumulates. Opposing hidden or
-; gitignore modes within one source are an error. A missing default file is
-; normal; anything else wrong with the file stops zfind before the walk, and
-; the error names the file and line.
+; the file's whole set, and --exclude-name and --exclude-type accumulate.
+; Opposing hidden or gitignore modes within one source are an error. A missing
+; default file is normal; anything else wrong with the file stops zfind before
+; the walk, and the error names the file and line.
 ; --color auto|always|never controls ANSI styling of results: directories are
 ; cyan, matching basename bytes are bold+reverse, everything else is default.
 ; auto (the default) colors only a terminal with NO_COLOR unset or empty and
@@ -292,6 +301,10 @@ section .rodata
     e_limit_e:
     e_type      db "zfind: expected f, d, l or b after --type", 10
     e_type_e:
+    e_xtype     db "zfind: expected f, d, l or b after --exclude-type", 10
+    e_xtype_e:
+    e_conflict  db "zfind: cannot combine --type and --exclude-type for the same value", 10
+    e_conflict_e:
     e_flag      db "zfind: unknown option", 10
     e_flag_e:
     e_write     db "zfind: write error", 10
@@ -361,6 +374,8 @@ section .rodata
     excl_eq     db "--exclude-name=", 0 ; 15 bytes of prefix
     t_long      db "--type", 0
     t_eq        db "--type=", 0      ; 7 bytes of prefix
+    xt_long     db "--exclude-type", 0
+    xt_eq       db "--exclude-type=", 0 ; 15 bytes of prefix
     g_long      db "--gitignore", 0
     nog_long    db "--no-gitignore", 0
     hidden_long db "--hidden", 0
@@ -389,7 +404,8 @@ section .rodata
     cfg_sfx_home_e:
     help_msg    db "usage: zfind [--help] [--separator STR] [--case smart|sensitive|insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
-               db "             [--exclude-name NAME]... [--limit N|none] [--type f|d|l|b]", 10
+               db "             [--exclude-name NAME]... [--exclude-type f|d|l|b]", 10
+               db "             [--limit N|none] [--type f|d|l|b]", 10
                db "             [--color auto|always|never]", 10
                db "             [--config PATH | --no-config] [--] [PATTERN]", 10, 10
                db "Search the current directory tree for entries whose name contains", 10
@@ -408,7 +424,8 @@ section .rodata
                db "Settings are also read from $XDG_CONFIG_HOME/zfind/config, else", 10
                db "~/.config/zfind/config: one option per line, # starts a comment line.", 10
                db "Command-line options override the file, except --exclude-name, which adds", 10
-               db "to it; a command-line --type replaces the file's --type values.", 10
+               db "to it, and --exclude-type, which also adds; a command-line --type replaces", 10
+               db "the file's --type values.", 10
                db "--config and --no-config are command-line only.", 10, 10
                db "Hidden entries are searched like any other, .git and .jj included; --no-hidden", 10
                db "skips entries whose name starts with . and everything inside them.", 10
@@ -438,6 +455,9 @@ section .rodata
                db "                      broken links appear with l alone and b adds them to", 10
                db "                      f/d combinations", 10
                db "                      also --type=V", 10
+               db "  --exclude-type V    repeatable; drop entries selected by type V", 10
+               db "                      f/d follow links; b is the broken subset; no pruning", 10
+               db "                      also --exclude-type=V", 10
                db "  --color WHEN        color results: auto, always or never (default: auto)", 10
                db "                      also --color=WHEN; auto colors a terminal unless", 10
                db "                      NO_COLOR or TERM=dumb; an unset TERM is plain", 10
@@ -492,7 +512,10 @@ section .bss
     res_type:   resb 32                ; --type bitset: bit index is the d_type
                                        ;   value, plus TYPE_B; so TYPE_D/F/L/B are
                                        ;   the masks
-    type_seen:  resb 1
+    type_seen:  resb 1                 ; a --type set was given
+    res_excl:   resb 32                ; --exclude-type bitset, same encoding
+    excl_seen:  resb 1                 ; an --exclude-type set was given
+    type_filter: resb 1                ; either filter is active
     git_repo:   resq 1
     cfg_mode:   resb 1                ; 0 = default location, 1 = --config, 2 = --no-config
     cfg_hid:    resb 1                ; the config file's modes, parked while the
@@ -612,11 +635,20 @@ _start:
     mov [res_ig], rax
 .merge_type:
     cmp byte [type_seen], 0
-    jne .merge_color                ; command line chose types: the file's are dropped
+    jne .merge_excl                 ; command line chose types: the file's are dropped
     mov rax, [cfg_type]
     mov [res_type], rax
     test rax, rax
     setnz byte [type_seen]
+.merge_excl:
+    mov rax, [res_excl]              ; additive across the file and the command
+    test rax, rax                    ;   line, so there is nothing to merge
+    setnz byte [excl_seen]
+    and rax, [res_type]
+    jnz bad_conflict                 ; the same value contradicts itself
+    mov al, [type_seen]
+    or al, [excl_seen]
+    mov [type_filter], al
 .merge_color:
     cmp byte [color_mode], 0
     jne .have_args
@@ -972,6 +1004,14 @@ parse_args:
     call startswith
     je .opt_excl_eq
     mov rdi, [rbp+r12*8]
+    lea rsi, [xt_long]
+    call streq
+    je .opt_xtype
+    mov rdi, [rbp+r12*8]
+    lea rsi, [xt_eq]
+    call startswith
+    je .opt_xtype_eq
+    mov rdi, [rbp+r12*8]
     lea rsi, [g_long]
     call streq
     je .opt_git
@@ -1073,6 +1113,44 @@ parse_args:
     bts qword [res_type], DT_REG
 .type_set:
     mov byte [type_seen], 1
+    inc r12
+    jmp .args_loop
+
+.opt_xtype:
+    inc r12
+    cmp r12, rbx
+    jae bad_xtype
+    mov rdi, [rbp+r12*8]
+    jmp .opt_xtype_value
+.opt_xtype_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 15                        ; len("--exclude-type=")
+.opt_xtype_value:                      ; rdi = the value: exactly one of f, d, l, b
+    movzx eax, byte [rdi]
+    test al, al
+    jz bad_xtype                       ; "--exclude-type=" with nothing after it
+    cmp byte [rdi+1], 0
+    jne bad_xtype                      ; "ff", "file", ...
+    cmp al, 'f'
+    je .xtype_file
+    cmp al, 'd'
+    je .xtype_dir
+    cmp al, 'l'
+    je .xtype_link
+    cmp al, 'b'
+    jne bad_xtype
+    bts qword [res_excl], DT_B
+    jmp .xtype_set
+.xtype_link:
+    bts qword [res_excl], DT_LNK
+    jmp .xtype_set
+.xtype_dir:
+    bts qword [res_excl], DT_DIR
+    jmp .xtype_set
+.xtype_file:
+    bts qword [res_excl], DT_REG
+.xtype_set:
+    mov byte [excl_seen], 1
     inc r12
     jmp .args_loop
 
@@ -1296,6 +1374,10 @@ find_config:
     je .skip
     mov rdi, [rbp+r12*8]
     lea rsi, [t_long]
+    call streq
+    je .skip
+    mov rdi, [rbp+r12*8]
+    lea rsi, [xt_long]
     call streq
     je .skip
     mov rdi, [rbp+r12*8]
@@ -1612,6 +1694,9 @@ cfg_line:
     call streq
     je .split
     lea rsi, [t_long]
+    call streq
+    je .split
+    lea rsi, [xt_long]
     call streq
     je .split
     lea rsi, [case_long]
@@ -3910,6 +3995,16 @@ bad_type:
     mov rdx, e_type_e - e_type
     jmp die
 
+bad_xtype:
+    lea rsi, [e_xtype]
+    mov rdx, e_xtype_e - e_xtype
+    jmp die
+
+bad_conflict:
+    lea rsi, [e_conflict]
+    mov rdx, e_conflict_e - e_conflict
+    jmp die
+
 bad_color:
     lea rsi, [e_color]
     mov rdx, e_color_e - e_color
@@ -4659,37 +4754,66 @@ try_range_split:
     ret
 try_range_split.end_func:
 
-; type_ok: does --type select an entry of resolved d_type edi?  Called only
-; when type_seen is set.  A non-link is selected by its own bit.  A symlink is
-; selected by its own bit (--type l) unless l is combined with f and/or d:
-; then the link matches only when what it points to is a selected regular file
-; or directory.  b selects a link whose target definitively does not exist
-; (ENOENT, ENOTDIR, ELOOP, ENAMETOOLONG), with or without l.  Any other
-; resolution failure is indeterminate: it matches b nowhere, l alone, and no
-; f/d combination.  The lookup follows the chain but never makes the walk
-; descend.  path_buf must hold the entry's full path.
+; type_ok: does the entry of resolved d_type edi survive the type filters?
+; Called only when type_filter is set.  Inclusion (--type, when given) and
+; exclusion (--exclude-type, when given) are evaluated with the same core:
+; a non-link is selected by its own bit; a symlink is selected by its own bit
+; (l) unless l is combined with f and/or d, when the link matches only when
+; what it points to is a selected regular file or directory; b selects a link
+; whose target definitively does not exist (ENOENT, ENOTDIR, ELOOP,
+; ENAMETOOLONG), with or without l.  Any other resolution failure is
+; indeterminate: it matches b nowhere, l alone, and no f/d combination.
+; Exclusion is the union of its values: l drops every link without a lookup,
+; b drops the broken ones, and f/d drop what the entry behaves like, so
+; --exclude-type d drops links to directories even without l and f drops links
+; to files; broken links survive both.  type_ok returns 1 when inclusion
+; selects the entry and exclusion does not.  The lookup follows the chain but
+; never makes the walk descend.  path_buf must hold the entry's full path.
     global type_ok:function (type_ok.end_func - type_ok)
 type_ok:
+    cmp byte [type_seen], 0
+    je .excl
+    lea rsi, [res_type]
+    call .match
+    test al, al
+    jz .no
+.excl:
+    cmp byte [excl_seen], 0
+    je .yes
+    lea rsi, [res_excl]
+    call .xmatch
+    test al, al
+    jnz .no
+.yes:
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+.match:                              ; rsi = inclusion mask; edi is preserved
+    mov r9, rsi                      ; mask; syscall preserves r9
     movzx ecx, dil
     cmp ecx, DT_LNK
     jne .plain
-    test qword [res_type], TYPE_L
+    test qword [r9], TYPE_L
     jz .broken_only
-    test qword [res_type], TYPE_F | TYPE_D
+    test qword [r9], TYPE_F | TYPE_D
     jz .yes                          ; l on its own: every link, broken included
     mov r8d, 1                       ; l + f/d: the target decides
     jmp .follow
 .broken_only:
-    test qword [res_type], TYPE_B
+    test qword [r9], TYPE_B
     jz .no
     xor r8d, r8d                     ; b without l: only broken links
 .follow:
-    mov rax, 262                     ; newfstatat, following the whole chain
+    push rdi                         ; syscall needs rdi, but .match is called
+    mov rax, 262                     ;   twice and edi is the entry's d_type
     mov rdi, AT_FDCWD
     lea rsi, [r14+path_buf]
     lea rdx, [r14+statbuf]
     xor r10d, r10d                   ; no AT_SYMLINK_NOFOLLOW
     syscall
+    pop rdi
     test rax, rax
     js .resolution_failed
     test r8d, r8d
@@ -4718,17 +4842,61 @@ type_ok:
     cmp eax, 36                      ; ENAMETOOLONG
     jne .no
 .broken:
-    test qword [res_type], TYPE_B
+    test qword [r9], TYPE_B
     jz .no
-.yes:
-    mov eax, 1
-    ret
+    jmp .yes
 .plain:
-    bt qword [res_type], rcx
+    bt qword [r9], rcx
     setc al
     ret
-.no:
-    xor eax, eax
+.xmatch:                             ; rsi = exclusion mask; union of values
+    mov r9, rsi
+    movzx ecx, dil
+    cmp ecx, DT_LNK
+    jne .xplain
+    test qword [r9], TYPE_L
+    jnz .yes                         ; l tests the link itself: no lookup
+    test qword [r9], TYPE_F | TYPE_D | TYPE_B
+    jz .no
+.xfollow:
+    push rdi
+    mov rax, 262
+    mov rdi, AT_FDCWD
+    lea rsi, [r14+path_buf]
+    lea rdx, [r14+statbuf]
+    xor r10d, r10d
+    syscall
+    pop rdi
+    test rax, rax
+    js .xresolution_failed
+    mov eax, [r14+statbuf+24]        ; st_mode
+    and eax, 0xF000
+    cmp eax, 0x8000                  ; S_IFREG: behaves like a file
+    je .xreg
+    cmp eax, 0x4000                  ; S_IFDIR: behaves like a directory
+    jne .no                          ; special files match no f/d exclusion
+    mov ecx, DT_DIR
+    jmp .xplain
+.xreg:
+    mov ecx, DT_REG
+    jmp .xplain
+.xresolution_failed:
+    neg eax
+    cmp eax, 2                       ; ENOENT
+    je .xbroken
+    cmp eax, 20                      ; ENOTDIR
+    je .xbroken
+    cmp eax, 40                      ; ELOOP
+    je .xbroken
+    cmp eax, 36                      ; ENAMETOOLONG
+    jne .no
+.xbroken:
+    test qword [r9], TYPE_B
+    jz .no
+    jmp .yes
+.xplain:
+    bt qword [r9], rcx
+    setc al
     ret
 type_ok.end_func:
 
@@ -4841,7 +5009,7 @@ walk_wide:
     test al, al
     jz .match_done
 .type_gate:
-    cmp byte [type_seen], 0
+    cmp byte [type_filter], 0
     je .matched
     movzx edi, byte [rsp+40]
     cmp edi, DT_LNK
@@ -5289,7 +5457,7 @@ walk_dir:
     test al, al
     jz .descend
 .name_ok:
-    cmp byte [type_seen], 0
+    cmp byte [type_filter], 0
     je .matched
     movzx edi, byte [rsp+56]
     cmp edi, DT_LNK
@@ -5457,7 +5625,7 @@ walk_range:
     test al, al
     jz .descend
 .name_ok:
-    cmp byte [type_seen], 0
+    cmp byte [type_filter], 0
     je .matched
     movzx edi, byte [rsp+0]
     call type_ok
