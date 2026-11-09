@@ -31,7 +31,7 @@ else
 endif
 
 # ---------- targets ----------
-.PHONY: all run clean testdata test test-quiet release
+.PHONY: all run clean testdata test test-quiet release bench cqa
 
 all: $(BIN)
 
@@ -113,3 +113,12 @@ T ?=
 
 test-quiet:
 	@$(MAKE) --no-print-directory -s test PYTEST_ARGS="-o addopts= -q --no-header --tb=short -rfE --strict-markers --strict-config $$T"
+
+# Development-only measurements of the current checkout; both write under
+# build/bench/ only. bench needs hyperfine (from the devshell), cqa needs
+# maqao (a system tool).
+bench: $(BIN)
+	python3 scripts/bench.py --binary $(BIN)
+
+cqa: $(BIN)
+	python3 scripts/cqa.py --binary $(BIN)
