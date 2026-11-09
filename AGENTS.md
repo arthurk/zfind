@@ -177,3 +177,33 @@ make testdata  # PRESET ?= default; see tests/mktrees.py
   port needs `src/<arch>/zfind.asm` plus an `ifeq` block in the Makefile.
 - Extra flags pass through the variables, e.g.
   `make ASFLAGS="-f elf64 -g -DNO_EOF_SHORTCUT"`.
+
+## Benchmarking
+
+Two development-only commands measure the current checkout; both write only
+under `build/bench/` and neither compares revisions:
+
+```sh
+nix develop -c make bench   # hyperfine: wall time, instructions, cycles, peak RSS
+make cqa                    # MAQAO CQA: static per-loop report (system maqao)
+```
+
+- `make bench` runs `scripts/bench.py` on `$(BIN)` in a generated tree,
+  `build/bench/tree/`: 200,000 empty files in 2,100 directories, kept across
+  runs and regenerated only when `build/bench/tree.marker` does not match the
+  layout. `--tree PATH` benchmarks an existing tree instead. Pass
+  `--pattern`, `--runs` or `--warmup` through to the script directly.
+- Reports go to `build/bench/results-<describe>.md` and
+  `build/bench/cqa/<describe>.md`, where `<describe>` is
+  `git describe --tags --always --dirty`. The binary SHA-256 in the header
+  identifies the artifact; `dirty` covers tracked modifications only.
+- Wall-time differences below roughly 5 % are noise on a laptop. Instruction
+  counts are the stable regression signal. The bench report shows **minima**
+  for instructions, cycles and RSS, because measurement noise is non-negative.
+- If perf counters are restricted, `bench` reruns once with wall time and RSS
+  only: the header then says `counters: unavailable` and those columns are
+  `n/a`, not zero. The script also warns when wall-time CV exceeds 10 % or
+  instruction CV exceeds 1 %.
+- CQA is a static estimate, not an execution profile, and its numbers depend
+  on the target CPU model MAQAO detects.
+- The scripts' self-test is `python3 -m doctest scripts/bench.py scripts/cqa.py`.
