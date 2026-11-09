@@ -21,6 +21,8 @@
           gnumake     # Makefile targets
           python314
           python314Packages.pytest
+          hyperfine   # `make bench` timing runner
+          git         # `git describe` in bench.py and cqa.py
         ];
 
         shellHook = "ulimit -c 0";   # debug live under gdb, don't litter core dumps
