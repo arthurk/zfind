@@ -73,6 +73,54 @@ make test         # one line per test (pytest.ini sets -vv)
 - End experiments with `| head` or `| wc -l`, and write their output files
   outside the tree zfind searches.
 
+## Autonomous debugging and profiling
+
+NASM does not support `.cfi_*` directives, but `Makefile` passes
+`ASFLAGS="-f elf64 -g"` and every subroutine carries explicit ELF function
+bounds (`global name:function (name.end_func - name)`). This gives GDB and
+profilers the function bounds needed to reconstruct stack frames. In
+non-interactive agent sessions, never run bare interactive tools (`gdb`,
+interactive `perf report`) which block on TTY prompts. Use batch mode:
+
+### Crash triage with GDB
+
+- **Live crash triage**: run the failing invocation under GDB in batch mode to
+  print the failing thread, backtrace across all threads, register state, and
+  faulting instruction:
+  ```sh
+  gdb -batch -return-child-result \
+      -ex "run" \
+      -ex "echo \n--- BACKTRACE ---\n" \
+      -ex "thread apply all bt full" \
+      -ex "echo \n--- REGISTERS ---\n" \
+      -ex "info registers" \
+      -ex "echo \n--- INSTRUCTION ---\n" \
+      -ex "x/5i \$rip - 8" \
+      --args build/x86_64/zfind [ARGS...]
+  ```
+- **Post-mortem core dump analysis**:
+  ```sh
+  gdb -batch \
+      -ex "echo \n--- BACKTRACE ---\n" \
+      -ex "thread apply all bt full" \
+      -ex "echo \n--- REGISTERS ---\n" \
+      -ex "info registers" \
+      build/x86_64/zfind core.<PID>
+  ```
+
+### Call-graph profiling with perf
+
+When profiling call hierarchies or investigating where time is spent across
+callers, run `perf` non-interactively with `--stdio` (never bare `perf report`,
+which opens an interactive pager):
+
+```sh
+perf record --call-graph dwarf -F 99 -e cycles:u -o /tmp/perf.data -- \
+    build/x86_64/zfind --no-config [TREE] [PATTERN]
+perf report -i /tmp/perf.data --stdio --no-children \
+    -g folded,0,caller,overhead,cycles | head -n 40
+```
+
 ## Implementing an issue
 
 All of these start the same loop: "implement issue 9", "implement #9",
