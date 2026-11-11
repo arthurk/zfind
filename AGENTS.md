@@ -89,49 +89,10 @@ Use `scripts/triage.py` (which wraps batch GDB and perf checks):
 python3 scripts/triage.py -- build/x86_64/zfind --no-config [ARGS...]
 
 # Post-mortem core dump analysis:
-python3 scripts/triage.py core.<PID>
+python3 scripts/triage.py --core core.<PID>
 
 # Call-graph profiling (checks kernel permissions before recording):
-python3 scripts/triage.py --profile --tree [TREE] [PATTERN]
-```
-
-### Direct GDB batch mode
-
-If invoking GDB directly without the wrapper, always pass `-batch`:
-
-- **Live crash triage**:
-  ```sh
-  gdb -batch -return-child-result \
-      -ex "run" \
-      -ex "echo \n--- BACKTRACE ---\n" \
-      -ex "thread apply all bt full" \
-      -ex "echo \n--- REGISTERS ---\n" \
-      -ex "info registers" \
-      -ex "echo \n--- INSTRUCTION ---\n" \
-      -ex "x/5i \$rip - 8" \
-      --args build/x86_64/zfind [ARGS...]
-  ```
-- **Post-mortem core dump analysis**:
-  ```sh
-  gdb -batch \
-      -ex "echo \n--- BACKTRACE ---\n" \
-      -ex "thread apply all bt full" \
-      -ex "echo \n--- REGISTERS ---\n" \
-      -ex "info registers" \
-      build/x86_64/zfind core.<PID>
-  ```
-
-### Call-graph profiling with perf
-
-`scripts/triage.py --profile` checks `/proc/sys/kernel/perf_event_paranoid`
-before invoking perf. Direct calls must use non-interactive flags (`--stdio`,
-never bare `perf report`):
-
-```sh
-perf record --call-graph dwarf -F 99 -e cycles:u -o /tmp/perf.data -- \
-    build/x86_64/zfind --no-config [TREE] [PATTERN]
-perf report -i /tmp/perf.data --stdio --no-children \
-    -g folded,0,caller,overhead,cycles | head -n 40
+python3 scripts/triage.py --profile --tree [TREE] -- [PATTERN]
 ```
 
 ## Implementing an issue
