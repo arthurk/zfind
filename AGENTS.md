@@ -69,6 +69,14 @@ make test         # one line per test (pytest.ini sets -vv)
 - zfind reads `~/.config/zfind/config`, and a personal one can exclude `.git`
   and more. In manual runs pass `--no-config`; if output looks wrong, check that
   first. The tests are not affected (`conftest.py` sets HOME).
+- A bare directory name such as `src` is not an automatic path candidate: use
+  `--path src`, `src/` or `./src`. In particular, `zfind src` searches for the
+  literal substring `src` in entry names unless a matching path-candidate rule
+  applies.
+- Patterns are literal substrings. `*`, `?` and regex syntax have no special
+  meaning. For example, `*.c` searches for those literal characters; it does
+  not select files by extension. Use a substring known to occur in a basename
+  when testing matching.
 - Each shell call is a fresh shell: set variables and use them in the same call.
 - End experiments with `| head` or `| wc -l`, and write their output files
   outside the tree zfind searches.
@@ -82,18 +90,44 @@ profilers the function bounds needed to reconstruct stack frames. In
 non-interactive agent sessions, never run bare interactive tools (`gdb`,
 interactive `perf report`) which block on TTY prompts.
 
-Use `scripts/triage.py` (which wraps batch GDB and perf checks):
+Use `scripts/triage.py` (which wraps batch GDB and perf recording/reporting):
 
 ```sh
-# Live crash triage: runs under GDB, detects faults, and reports backtraces
-python3 scripts/triage.py -- build/x86_64/zfind --no-config [ARGS...]
+# Live crash triage: run the command under GDB and report its outcome
+python3 scripts/triage.py -- build/x86_64/zfind --no-config --path src
 
-# Post-mortem core dump analysis:
-python3 scripts/triage.py --core core.<PID>
+# Post-mortem core dump analysis (uses the default build/x86_64/zfind binary)
+python3 scripts/triage.py --core core.359936
 
-# Call-graph profiling (checks kernel permissions before recording):
-python3 scripts/triage.py --profile --tree [TREE] -- [PATTERN]
+# Profile the complete src tree; no search pattern is needed
+python3 scripts/triage.py --profile --tree src
+
+# Profile names containing a literal substring; this is not a glob
+python3 scripts/triage.py --profile --tree src -- zfind
+
+# Keep perf.data instead of deleting the temporary recording after the report
+python3 scripts/triage.py --profile --perf-data perf.data --tree src
+
+# Print the complete GDB transcript as well as the concise triage report
+python3 scripts/triage.py --verbose -- build/x86_64/zfind --no-config --path src
 ```
+
+- The live command separator (`--`) belongs to `triage.py`; everything after
+  it is the binary and its arguments.
+- In profile mode, `--tree` selects the traversal root and is passed to zfind
+  as `--path DIR`. A bare name such as `src` therefore works in this option.
+- In profile mode, the optional pattern must follow the script's `--` and is
+  passed literally to zfind. It is a substring, not a glob or regular
+  expression. Omit it to profile a full traversal.
+- Without `--perf-data FILE`, the script writes the recording to a temporary
+  directory and removes it after printing the report. Supply `--perf-data` to
+  retain the recording for later inspection.
+- The script does not pre-check `perf_event_paranoid`; `perf record` determines
+  whether the requested event is permitted and reports any permission error.
+- `perf report` may show unresolved kernel addresses as `[unknown]` when kernel
+  symbol information is unavailable or restricted. User-space symbols can
+  still be useful. Treat percentages from very small sample counts as noisy;
+  use a larger workload before making optimization decisions.
 
 ## Implementing an issue
 
@@ -187,12 +221,12 @@ Check with `readelf -sW build/x86_64/zfind | grep ' FUNC '`.
 - Use the Makefile:
 
 ```sh
-make           # assemble + link
-make run       # build, then run
+make             # assemble + link
+make run         # build, then run
 make clean
 make test-quiet  # build + pytest, failures and summary only
 make test        # build + pytest, one line per test
-make testdata  # PRESET ?= default; see tests/mktrees.py
+make testdata    # PRESET ?= default; see tests/mktrees.py
 ```
 
 - `ARCH ?= x86_64`; `ARCH=aarch64` is a stub that errors until ported. A new
