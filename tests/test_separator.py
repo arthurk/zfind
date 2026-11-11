@@ -149,7 +149,7 @@ class TestSeparatorParsing:
     def test_separator_after_pattern_is_unexpected_argument(self, zfind: ZfindRunner):
         res = zfind("tiny", "a", "--separator=XY")
         assert res.status == 1, f"Expected exit 1: {res}"
-        assert res.err == b"zfind: unexpected argument\n"
+        assert res.err == b"zfind: unexpected argument '--separator=XY'\n"
         assert res.out == b""
 
     def test_invalid_separator_fails_even_if_a_later_value_would_win(self, zfind: ZfindRunner):

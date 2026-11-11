@@ -277,8 +277,8 @@ class TestConfigSelection:
             (("--config=x", "--no-config"), b"zfind: cannot combine --config and --no-config\n"),
             (("--no-config", "--config=x"), b"zfind: cannot combine --config and --no-config\n"),
             (("--no-config", "--config", "x"), b"zfind: cannot combine --config and --no-config\n"),
-            (("config", "--config", "x"), b"zfind: unexpected argument\n"),
-            (("config", "--no-config"), b"zfind: unexpected argument\n"),
+            (("config", "--config", "x"), b"zfind: unexpected argument '--config'\n"),
+            (("config", "--no-config"), b"zfind: unexpected argument '--no-config'\n"),
             (("--no-confi",), b"zfind: unknown option\n"),
             (("--config-file=x",), b"zfind: unknown option\n"),
         ],
@@ -514,6 +514,12 @@ class TestConfigErrors:
             pytest.param("--gitignore\n--no-gitignore\n", 2, "cannot combine --gitignore and --no-gitignore", id="conflict-gitignore"),
             pytest.param("--hidden\n--hidden\n--no-hidden\n", 3, "cannot combine --hidden and --no-hidden", id="conflict-names-the-later-line"),
             pytest.param("config\n", 1, "config lines must be long options", id="positional-pattern"),
+            pytest.param(".\n", 1, "config lines must be long options", id="positional-dot"),
+            pytest.param("..\n", 1, "config lines must be long options", id="positional-dot-dot"),
+            pytest.param("./src\n", 1, "config lines must be long options", id="positional-path"),
+            pytest.param("--path .\n", 1, "option not allowed in a config file", id="path-blank"),
+            pytest.param("--path=.\n", 1, "option not allowed in a config file", id="path-equals"),
+            pytest.param("--path src\n", 1, "option not allowed in a config file", id="path-directory"),
             pytest.param("-x\n", 1, "config lines must be long options", id="short-option"),
             pytest.param("-\n", 1, "config lines must be long options", id="single-dash"),
             pytest.param("--hidden foo\n", 1, "unexpected argument", id="stray-word-after-flag"),
@@ -577,7 +583,7 @@ class TestConfigErrors:
             b"zfind: invalid limit (expected a whole number or none)\n"
         )
         assert cfg("--bogus", "config") == failure(b"zfind: unknown option\n")
-        assert cfg("config", "extra") == failure(b"zfind: unexpected argument\n")
+        assert cfg("config", "extra") == failure(b"zfind: unexpected argument 'extra'\n")
 
     def test_opposing_modes_on_the_command_line_still_conflict(self, cfg: ConfigRunner):
         cfg.write("--no-hidden\n")

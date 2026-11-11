@@ -15,7 +15,7 @@ from helpers import ZfindRunner, entries, run_in
 CURRENT_HELP_OPTIONS = [
     b"--separator", b"--case", b"--gitignore", b"--no-gitignore", b"--hidden",
     b"--no-hidden", b"--exclude-name", b"--limit", b"--type", b"--color",
-    b"--config", b"--no-config", b"--help",
+    b"--config", b"--no-config", b"--path", b"--help",
 ]
 
 
@@ -39,7 +39,7 @@ class TestCliBasics:
     def test_unexpected_positional_arguments_fail(self, zfind: ZfindRunner):
         res = zfind("tiny", "pattern1", "pattern2")
         assert res.status == 1, f"Expected exit 1: {res}"
-        assert res.err == b"zfind: unexpected argument\n"
+        assert res.err == b"zfind: unexpected argument 'pattern2'\n"
         assert res.out == b""
 
     def test_double_dash_escapes_option_like_patterns(self, zfind: ZfindRunner):
@@ -169,7 +169,7 @@ class TestParserEdges:
 
         res = run_in(zfind_path, tree, "--", "p", "q")
         assert res.status == 1
-        assert res.err == b"zfind: unexpected argument\n"
+        assert res.err == b"zfind: unexpected argument 'q'\n"
         assert res.out == b""
 
 

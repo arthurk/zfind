@@ -288,3 +288,253 @@ class TestJujutsuAndMetadataPruning:
             b"sub/.gitignore",
             b"sub/keep.log",
         ]
+
+
+class TestPathSelectedRepositoryDiscovery:
+    """A selected starting path inherits rules from its nearest repository."""
+
+    def test_no_path_keeps_cwd_only_detection(self, binary: Path, tmp_path: Path):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"*.log\n")
+        sub = repo / "sub"
+        (sub / ".gitignore").parent.mkdir(parents=True)
+        (sub / ".gitignore").write_bytes(b"*.tmp\n")
+        (sub / "noise.log").write_bytes(b"")
+        (sub / "local.tmp").write_bytes(b"")
+        (sub / "keep.txt").write_bytes(b"")
+
+        res = run_in(binary, sub, "--gitignore")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [
+            b".gitignore",
+            b"keep.txt",
+            b"local.tmp",
+            b"noise.log",
+        ]
+
+    def test_selected_dot_discovers_the_parent_repository(
+        self, binary: Path, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"*.log\n")
+        sub = repo / "sub"
+        (sub / ".gitignore").parent.mkdir(parents=True)
+        (sub / ".gitignore").write_bytes(b"*.tmp\n")
+        (sub / "noise.log").write_bytes(b"")
+        (sub / "local.tmp").write_bytes(b"")
+        (sub / "keep.txt").write_bytes(b"")
+
+        res = run_in(binary, sub, "--gitignore", ".")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"./.gitignore", b"./keep.txt"]
+
+    def test_selected_repository_root_loads_its_own_rules(
+        self, binary: Path, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"*.log\n")
+        (repo / "noise.log").write_bytes(b"")
+        (repo / "keep").write_bytes(b"")
+        (repo / "sub").mkdir()
+        (repo / "sub" / "x.log").write_bytes(b"")
+
+        res = run_in(binary, tmp_path, "--gitignore", "--path", "repo")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"repo/.gitignore", b"repo/keep", b"repo/sub/"]
+
+    def test_ancestor_anchored_rule_uses_the_repository_match_path(
+        self, binary: Path, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"/sub/build/\n/sub/drop.txt\n")
+        sub = repo / "sub"
+        (sub / "build").mkdir(parents=True)
+        (sub / "build" / "out").write_bytes(b"")
+        (sub / "drop.txt").write_bytes(b"")
+        (sub / "keep").write_bytes(b"")
+
+        res = run_in(binary, sub, "--gitignore", ".")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"./keep"]
+
+    def test_intermediate_rules_load_in_parent_to_child_order(
+        self, binary: Path, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"*.log\n")
+        mid = repo / "mid"
+        (mid / "sub").mkdir(parents=True)
+        (mid / ".gitignore").write_bytes(b"!keep.log\n")
+        (mid / "sub" / "keep.log").write_bytes(b"")
+        (mid / "sub" / "noise.log").write_bytes(b"")
+
+        res = run_in(binary, repo, "--gitignore", "mid/sub")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"mid/sub/keep.log"]
+
+    def test_selected_root_own_gitignore_applies_to_descendants(
+        self, binary: Path, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"")
+        sub = repo / "sub"
+        (sub / "nested").mkdir(parents=True)
+        (sub / ".gitignore").write_bytes(b"*.tmp\n")
+        (sub / "nested" / "x.tmp").write_bytes(b"")
+        (sub / "nested" / "keep").write_bytes(b"")
+
+        res = run_in(binary, repo, "--gitignore", "--path", "sub")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"sub/.gitignore", b"sub/nested/", b"sub/nested/keep"]
+
+    def test_ancestor_rule_can_ignore_the_selected_root(
+        self, binary: Path, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"/sub/\n")
+        sub = repo / "sub"
+        (sub / "deep").mkdir(parents=True)
+        (sub / "keep").write_bytes(b"")
+        (sub / "deep" / "file").write_bytes(b"")
+
+        for root in ("sub", "sub/deep"):
+            res = run_in(binary, repo, "--gitignore", root)
+            assert res.status == 0, f"Command failed for {root}: {res}"
+            assert res.err == b""
+            assert res.out == b""
+
+    def test_symlink_root_uses_the_physical_match_path(
+        self, binary: Path, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"/sub/drop.txt\n*.log\n")
+        sub = repo / "sub"
+        sub.mkdir(parents=True)
+        (sub / "keep.txt").write_bytes(b"")
+        (sub / "drop.txt").write_bytes(b"")
+        (sub / "noise.log").write_bytes(b"")
+        (tmp_path / "link").symlink_to("repo/sub")
+
+        res = run_in(binary, tmp_path, "--gitignore", "--path", "link")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"link/keep.txt"]
+
+        res = run_in(binary, tmp_path, "--gitignore", "./link")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"./link/keep.txt"]
+
+    def test_selected_path_uses_its_own_repository_not_cwd_rules(
+        self, binary: Path, tmp_path: Path
+    ):
+        a = tmp_path / "a"
+        (a / ".git").mkdir(parents=True)
+        (a / ".gitignore").write_bytes(b"*.keep\n")
+        b = tmp_path / "b"
+        (b / ".git").mkdir(parents=True)
+        (b / ".gitignore").write_bytes(b"*.drop\n")
+        sub = b / "sub"
+        sub.mkdir(parents=True)
+        (sub / "a.keep").write_bytes(b"")
+        (sub / "b.drop").write_bytes(b"")
+        (sub / "c.txt").write_bytes(b"")
+
+        res = run_in(binary, a, "--gitignore", "../b/sub")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"../b/sub/a.keep", b"../b/sub/c.txt"]
+
+    def test_selected_path_outside_a_repository_inherits_nothing(
+        self, binary: Path, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"*.log\n")
+        outside = tmp_path / "outside" / "sub"
+        outside.mkdir(parents=True)
+        (outside / "noise.log").write_bytes(b"")
+        (outside / "keep").write_bytes(b"")
+
+        res = run_in(binary, repo, "--gitignore", "../outside/sub")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [
+            b"../outside/sub/keep",
+            b"../outside/sub/noise.log",
+        ]
+
+    def test_nearest_nested_repository_stops_outer_inheritance(
+        self, binary: Path, tmp_path: Path
+    ):
+        outer = tmp_path / "outer"
+        (outer / ".git").mkdir(parents=True)
+        (outer / ".gitignore").write_bytes(b"*.log\n")
+        inner = outer / "inner"
+        (inner / ".git").mkdir(parents=True)
+        (inner / ".gitignore").write_bytes(b"*.tmp\n")
+        sub = inner / "sub"
+        sub.mkdir(parents=True)
+        (sub / "a.log").write_bytes(b"")
+        (sub / "b.tmp").write_bytes(b"")
+        (sub / "c.txt").write_bytes(b"")
+
+        res = run_in(binary, outer, "--gitignore", "inner/sub")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"inner/sub/a.log", b"inner/sub/c.txt"]
+
+    @pytest.mark.parametrize("marker", ["git-file", "jj-dir"])
+    def test_git_file_and_jj_directory_are_repository_markers(
+        self, binary: Path, tmp_path: Path, marker: str
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        if marker == "git-file":
+            (repo / ".gitdir").mkdir()
+            (repo / ".git").write_bytes(f"gitdir: {repo}/.gitdir\n".encode())
+        else:
+            (repo / ".jj").mkdir()
+        (repo / ".gitignore").write_bytes(b"*.log\n")
+        sub = repo / "sub"
+        sub.mkdir()
+        (sub / "noise.log").write_bytes(b"")
+        (sub / "keep").write_bytes(b"")
+
+        res = run_in(binary, tmp_path, "--gitignore", "repo/sub")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"repo/sub/keep"]
+
+    @pytest.mark.parametrize(
+        "root",
+        [".git", ".git/objects", ".jj", ".jj/store"],
+    )
+    def test_metadata_roots_are_pruned(
+        self, binary: Path, tmp_path: Path, root: str
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git" / "objects").mkdir(parents=True)
+        (repo / ".git" / "objects" / "object").write_bytes(b"")
+        (repo / ".jj" / "store").mkdir(parents=True)
+        (repo / ".jj" / "store" / "data").write_bytes(b"")
+        (repo / ".gitignore").write_bytes(b"")
+
+        res = run_in(binary, repo, "--gitignore", "--path", root)
+        assert res.status == 0, f"Command failed for {root}: {res}"
+        assert res.err == b""
+        assert res.out == b""
