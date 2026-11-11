@@ -465,7 +465,7 @@ To create a new release:
    git tag -a v1.0.0 -m "v1.0.0"
    git push origin v1.0.0
    ```
-3. The automated CI tag workflow will build the project, run the test suite, and generate a GitHub Release containing the `zfind-linux-x86_64-v3` artifact.
+3. The automated CI tag workflow builds the project, runs the test suite, and creates a **draft** GitHub Release containing the `zfind-linux-x86_64-v3` artifact and its `.sha256` checksum. The tag must match `vMAJOR.MINOR.PATCH` and point to a commit on `main`, or the workflow aborts. Review the assets, write the release notes, and publish the draft.
 
 ## Disclaimer
 
