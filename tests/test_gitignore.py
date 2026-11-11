@@ -416,6 +416,54 @@ class TestPathSelectedRepositoryDiscovery:
             assert res.err == b""
             assert res.out == b""
 
+    def test_a_directories_rules_do_not_ignore_that_directory(
+        self, binary: Path, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"")
+        sub = repo / "a"
+        (sub / "b").mkdir(parents=True)
+        (sub / ".gitignore").write_bytes(b"a\n")
+        (sub / "b" / "keep").write_bytes(b"")
+
+        res = run_in(binary, repo, "--gitignore", "--path", "a/b")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"a/b/keep"]
+
+    def test_a_parents_rules_still_ignore_a_child_root(
+        self, binary: Path, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"")
+        sub = repo / "a"
+        (sub / "b").mkdir(parents=True)
+        (sub / ".gitignore").write_bytes(b"b\n")
+        (sub / "b" / "keep").write_bytes(b"")
+
+        res = run_in(binary, repo, "--gitignore", "--path", "a/b")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert res.out == b""
+
+    def test_a_roots_own_rules_cannot_ignore_that_root(
+        self, binary: Path, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".gitignore").write_bytes(b"")
+        sub = repo / "sub"
+        sub.mkdir()
+        (sub / ".gitignore").write_bytes(b"sub\n")
+        (sub / "keep").write_bytes(b"")
+
+        res = run_in(binary, repo, "--gitignore", "--path", "sub")
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [b"sub/.gitignore", b"sub/keep"]
+
     def test_symlink_root_uses_the_physical_match_path(
         self, binary: Path, tmp_path: Path
     ):

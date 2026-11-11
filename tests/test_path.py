@@ -104,6 +104,13 @@ class TestPositionalClassification:
             out=b"".join(name + b"\n" for name in DOT_SRC_LISTING), err=b"", status=0
         )
 
+    def test_trailing_slash_without_a_dot_prefix_is_stripped(
+        self, binary: Path, tree: Path
+    ):
+        assert run_in(binary, tree, "src/") == Result(
+            out=b"".join(name + b"\n" for name in SRC_LISTING), err=b"", status=0
+        )
+
     def test_dot_is_a_starting_directory(self, binary: Path, tree: Path):
         res = run_in(binary, tree, ".")
         assert res == Result(
@@ -187,6 +194,7 @@ class TestPositionalClassification:
         self, binary: Path, tree: Path
     ):
         assert run_in(binary, tree, "./missing", "top") == failed(quoted("top"))
+        assert run_in(binary, tree, "top", "./missing") == failed(quoted("./missing"))
 
     def test_explicit_path_accepts_only_one_pattern(self, binary: Path, tree: Path):
         assert run_in(binary, tree, "--path", "src", "a", "b") == failed(
@@ -209,6 +217,9 @@ class TestPositionalClassification:
         )
         assert run_in(binary, tree, "top", "--limit", "1") == failed(
             quoted("--limit")
+        )
+        assert run_in(binary, tree, "src", "--path", "other") == failed(
+            quoted("--path")
         )
 
 
@@ -260,6 +271,20 @@ class TestExplicitPathOption:
 
         assert run_in(binary, tree, "--path", "--hidden") == Result(
             out=b"--hidden/file\n", err=b"", status=0
+        )
+
+    def test_help_prescan_still_wins_over_a_path_value(
+        self, binary: Path, tree: Path
+    ):
+        assert run_in(binary, tree, "--no-config", "--path", "--help") == run_in(
+            binary, tree, "--no-config", "--help"
+        )
+
+    def test_equals_form_keeps_help_as_a_literal_path(
+        self, binary: Path, tree: Path
+    ):
+        assert run_in(binary, tree, "--path=--help") == failed(
+            b"zfind: starting path '--help' does not exist\n"
         )
 
     def test_path_consumes_the_next_token_even_for_config_names(
@@ -330,9 +355,25 @@ class TestRootValidationAndOutput:
         )
 
     def test_explicit_too_long_path_is_an_error(self, binary: Path, tree: Path):
-        token = "a" * 5000
+        token = "a" * 4096
         assert run_in(binary, tree, "--path", token) == failed(
             f"zfind: starting path '{token}' is too long\n".encode()
+        )
+
+    def test_overlong_diagnostic_is_truncated_not_crashing(
+        self, binary: Path, tree: Path
+    ):
+        res = run_in(binary, tree, "a", "x" * 130000)
+        assert res == failed(
+            b"zfind: unexpected argument '" + b"x" * 4548 + b"'\n"
+        )
+
+    def test_overlong_explicit_path_diagnostic_is_truncated(
+        self, binary: Path, tree: Path
+    ):
+        res = run_in(binary, tree, "--path", "a" * 5000)
+        assert res == failed(
+            b"zfind: starting path '" + b"a" * 4554 + b"' is too long\n"
         )
 
     def test_automatic_unreadable_candidate_is_an_error_and_not_a_fallback(
@@ -357,11 +398,34 @@ class TestRootValidationAndOutput:
         )
 
     def test_automatic_too_long_candidate_is_reported(self, binary: Path, tree: Path):
-        token = "./" + "a" * 5000
+        token = "./" + "a" * 4094
         assert run_in(binary, tree, token) == failed(
             b"zfind: cannot open starting path '" + token.encode()
             + b"' (ENAMETOOLONG)\n"
         )
+
+    def test_descendant_path_too_long_for_the_buffer_is_skipped(
+        self, binary: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        parts = ["d" * 255] * 15 + ["d" * 240]
+        rel = "/".join(parts)
+        for part in parts:
+            os.mkdir(part)
+            os.chdir(part)
+        names = [f"f{index:02d}" for index in range(15)]
+        for name in names:
+            Path(name).write_bytes(b"")
+        # The sixteenth entry cannot fit; 16 entries also make the range build
+        # split this directory into walk_range groups.
+        Path("b" * 100).write_bytes(b"")
+
+        res = run_in(binary, tmp_path, "--no-config", "--path", rel)
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == [
+            (rel + "/" + name).encode() for name in names
+        ]
 
     @requires_strace
     def test_automatic_open_error_is_not_a_fallback(self, zfind_path: Path, tree: Path):
