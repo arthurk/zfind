@@ -116,12 +116,15 @@ The repository includes a Nix flake for reproducible builds.
 ### Syntax
 
 ```text
-zfind [OPTIONS] [--] [PATTERN]
+zfind [OPTIONS] [--path DIR] [--] [PATH] [PATTERN]
 ```
 
-- **`PATTERN`** is optional. When omitted, `zfind` lists every traversed entry (subject to `--type` and exclusion filters). When provided, it performs a literal substring search on entry names. Regex and glob expansions are not supported.
-- **Options** must precede `PATTERN`.
-- **`--`** explicitly terminates option parsing. Any subsequent token is treated as `PATTERN`, which is necessary when searching for names beginning with a hyphen (e.g., `zfind -- -draft`).
+- **`PATH`** is an optional starting directory. Without `--path`, a positional token containing `/`, or the exact token `.` or `..`, is an automatic path candidate. If it names an accessible directory it becomes the starting directory; if it is missing or not a directory it is searched as a literal pattern instead. At most one automatic path candidate is accepted, and it may appear before or after `PATTERN`.
+- **`PATTERN`** is optional. When omitted, `zfind` lists every traversed entry (subject to `--type` and exclusion filters). When provided, it performs a literal substring search on entry names. Regex and glob expansions are not supported. At most one pattern is accepted.
+- **`--path DIR` / `--path=DIR`** selects the starting directory explicitly. Its value is always a path and never falls back to a pattern, which is how bare directory names are searched: `zfind --path src`.
+- **Options** must precede all positional arguments. Once a positional argument has appeared, another option or `--` is an unexpected argument.
+- **`--`** must appear before the first positional argument and explicitly terminates option parsing. Every following token is a literal pattern; this is necessary for path-like patterns and names beginning with a hyphen: `zfind -- ./src`, `zfind -- -draft`.
+- Because `.` and `..` are automatic path candidates, `zfind .` searches the current directory. Use `zfind -- .` to search for names containing a literal dot.
 - **`--help`** can be passed anywhere before `--` (including where an option value or pattern would otherwise appear). It immediately prints help text and exits.
 
 ---
@@ -136,6 +139,22 @@ zfind --case=sensitive foo  # Force exact case-sensitive byte comparison
 zfind --case=insensitive FOO # Force case-insensitive match for "foo", "Foo", etc.
 zfind --case=smart foo      # Smart case (the default); also undoes a configured --case
 ```
+
+#### Starting Directories
+```sh
+zfind ./src                 # Search from src (root not printed)
+zfind src/                  # The trailing slash is stripped in output paths
+zfind ./src foo             # Starting directory src, pattern foo
+zfind foo ./src             # Same, path and pattern in either order
+zfind --path src            # Explicit path, needed for a bare directory name
+zfind --path=src foo        # Explicit path with a pattern
+zfind -- ./src              # Literal pattern "./src", no path detection
+zfind --path src ./other    # Literal pattern "./other" under src
+zfind .                     # Search the current directory; paths start with ./
+zfind ..                    # Search the parent directory; paths start with ../
+```
+
+The starting directory is a traversal root, not a result: it is never printed, and `--type`, `--no-hidden` and `--exclude-name` apply only to its descendants. Output keeps the spelling you supplied, except for redundant trailing slashes: selecting `./src/` prints `./src/foo`, selecting `/` prints `/foo`, and an absolute root keeps its absolute prefix.
 
 #### Traversal & File Types
 ```sh
@@ -165,7 +184,8 @@ between listing and `rm`.
 #### Filtering & Ignoring
 ```sh
 zfind --no-hidden TODO      # Skip dotfiles/hidden directories like .git/ or .env
-zfind --gitignore Cargo     # Apply .gitignore rules (requires .git in current directory)
+zfind --gitignore Cargo     # Apply .gitignore rules (cwd or selected path repository)
+zfind --gitignore ./src     # Inherit rules from the nearest repository above src
 zfind --exclude-name=target --exclude-name=dist bundle
 zfind --exclude-name='a*b'  # Matches the literal name "a*b", not a glob
 ```
@@ -203,8 +223,9 @@ Scripts need no flag: piped output is plain by default. Add `--color=never` only
 | `--case` | `smart` \| `sensitive` \| `insensitive` | `smart` | Match `PATTERN` with smart case, exact case-sensitive bytes, or ASCII case-insensitive folding. Also accepted as `--case=MODE`; repeated uses are last-wins. |
 | `--hidden` | — | Enabled | Search hidden files and directories (names starting with `.`). |
 | `--no-hidden` | — | Off | Prune all hidden files and directories from traversal. |
-| `--gitignore` | — | Off | Parse and apply `.gitignore` rules (skips `.git/`). |
+| `--gitignore` | — | Off | Parse and apply `.gitignore` rules (skips `.git/` and `.jj/`). With a selected path, rules are inherited from its nearest repository; otherwise only the current directory is checked. |
 | `--no-gitignore` | — | Enabled | Do not apply `.gitignore` rules; walk all non-pruned trees. |
+| `--path` | `DIR` | Current directory | Search from `DIR`. Accepts `--path DIR` and `--path=DIR`; the value must be non-empty, may begin with `-`, and may be given only once. Missing, non-directory, too-long and unopenable paths are errors. Command-line only. |
 | `--type` | `f` \| `d` \| `l` \| `b` | All types | Filter output by regular files (`f`), directories (`d`), symlinks (`l`) or broken symlinks (`b`). Repeatable. When `l` is combined with `f` and/or `d`, a symlink matches by the type of its target: links to files for `f`, links to directories for `d`. `b` needs no `l` and adds broken links to `f`/`d` results. Also accepted as `--type=VALUE`. |
 | `--exclude-type` | `f` \| `d` \| `l` \| `b` | None | Drop entries selected by the same type meanings as `--type`. Repeatable, and additive across the config file and command line. `f`/`d` follow links to their target; `l` drops every link and `b` the broken ones. A value present in both `--type` and `--exclude-type` is a usage error. Also accepted as `--exclude-type=VALUE`. |
 | `--exclude-name` | `NAME` | None | Prune entries whose exact basename matches `NAME`. Repeatable (up to 64). |
@@ -213,7 +234,7 @@ Scripts need no flag: piped output is plain by default. Add `--color=never` only
 | `--color` | `auto` \| `always` \| `never` | `auto` | Style results for terminals. `auto` colors only a tty with `NO_COLOR` unset/empty and `TERM` set and not `dumb`; `always` forces ANSI even into pipes; `never` disables it. Also accepted as `--color=WHEN`. |
 | `--config` | `PATH` | System paths | Load persistent configuration from `PATH`. |
 | `--no-config` | — | Off | Bypass all configuration files for this run. |
-| `--` | — | — | Cease option processing; remaining argument is taken as `PATTERN`. |
+| `--` | — | — | Cease option processing before the first positional argument; every remaining token is a literal `PATTERN`. |
 
 ---
 
@@ -222,6 +243,7 @@ Scripts need no flag: piped output is plain by default. Add `--color=never` only
 ### Pattern Matching & Smart Case
 
 - **Literal Substrings:** `PATTERN` is checked directly against directory and file basenames. Glob patterns (`*`, `?`) and regular expressions are treated as raw literal bytes.
+- **Path Candidates Win First:** Before matching, a positional token containing `/`, or the exact token `.` or `..`, is tested as a starting directory. A successful directory open makes it the root; `ENOENT` and `ENOTDIR` turn it back into a pattern, while other open errors are reported. Use `--` to force a path-like token to be a pattern.
 - **Smart Case (Default):** Matching is ASCII case-insensitive unless the query string contains at least one uppercase ASCII character (`A`–`Z`), in which case matching becomes case-sensitive.
 - **Explicit Modes:**
   - `--case=smart` (the default) applies smart case as described above.
@@ -240,7 +262,9 @@ Scripts need no flag: piped output is plain by default. Add `--color=never` only
 
 ### Symlinks & Type Filtering
 
-- `zfind` **never descends into symlinked directories**.
+- `zfind` **never descends into symlinked directories** encountered below the starting directory.
+- A symlink supplied explicitly as the starting directory is followed. This is the only traversal exception; output keeps the symlink spelling (for example `link/foo`) and Gitignore matching uses its physical location.
+- The selected starting directory itself is not filtered: `--type`, `--no-hidden` and `--exclude-name` apply to descendants only, so an explicitly selected hidden or excluded-name directory can still be searched.
 - By default, all entry types (files, directories, symlinks, special files) are output.
 - `--type f` restricts output to regular files. Directory traversal continues unaffected so child files can be found.
 - `--type d` restricts output to directories. Output paths for directories always end with a trailing slash (`/`).
@@ -265,7 +289,7 @@ Scripts need no flag: piped output is plain by default. Add `--color=never` only
 ### Output Format & Separators
 
 - **Ordering:** Output is deterministic. Within any given directory, entries are sorted lexicographically by name. Directories are output in depth-first traversal order.
-- **Relative Paths:** All output paths are relative to the current directory (e.g. `src/main.c`, `build/`).
+- **Output Paths:** Results are descendants of the selected starting directory and keep its display spelling. With no selected path they are relative to the current directory (`src/main.c`, `build/`); selecting `./src` prints `./src/main.c`, selecting `.` prints `./main.c`, selecting `/` prints `/main.c` without a doubled slash, and selecting an absolute path keeps that prefix. Redundant trailing slashes are removed from the root, and the root itself is never printed.
 - **Separators:** Every match, including the last one, is followed by the chosen separator. If no matches are found, `zfind` writes zero bytes.
 - Custom delimiters can be specified via `--separator STR` or `--separator=STR`:
   - Decoded length must be between 1 and 64 bytes.
@@ -337,22 +361,31 @@ By default, `.gitignore` files are ignored, and `.git/` and `.jj/` are traversed
 
 Passing `--gitignore` activates Git-style ignore filtering in Git and Jujutsu repositories with the following rules:
 
-1. **Repository Root Requirement:** `--gitignore` activates if the **current working directory** contains a `.git` or `.jj` entry. If both are present, ignore processing is enabled once. `zfind` does not search parent directories for a repository root.
-2. **Metadata Directories:** When `--gitignore` is enabled for a recognized repository, `.git` and `.jj` are never listed, traversed, or counted, even if `--hidden` is passed.
-3. **Hierarchical Traversal:** `.gitignore` files are read dynamically as the directory tree is walked. Rules encountered deeper in the filesystem hierarchy override inherited parent rules.
-4. **Limits:**
+1. **Repository Discovery:** Without a selected path, `--gitignore` activates only if the **current working directory** contains a `.git` or `.jj` entry; parent directories are not searched. With a selected path, the nearest enclosing repository is found by walking upward from the directory's **actual filesystem location**: a `.git` directory, a regular `.git` file, or a `.jj` directory is a marker, and the nearest marker wins. An unrelated current-directory repository is never used. If there is no marker, ignore processing stays inactive. If both `.git` and `.jj` exist at the same level, processing is enabled once.
+2. **Ancestor Rules:** For a selected path, `.gitignore` files from the repository root down to the selected directory's parent are loaded in parent-to-child order. The selected root's own `.gitignore` applies only to descendants, after checking whether an ancestor rule already ignores the root. An ignored selected root produces a successful empty result without traversal.
+3. **Symlink Roots:** Repository discovery and matching use the physical location of a selected symlink, while output keeps the symlink spelling. For `link -> repo/sub`, a rule `/sub/build/` matches under `link/build/`.
+4. **Metadata Directories:** When `--gitignore` is enabled for a recognized repository, `.git` and `.jj` are never listed, traversed, or counted, even if `--hidden` is passed. A selected root equal to or below a metadata directory (for example `repo/.git/objects` or `repo/.jj/store`) is pruned and produces no results.
+5. **Hierarchical Traversal:** `.gitignore` files are read dynamically as the directory tree is walked. Rules encountered deeper in the filesystem hierarchy override inherited parent rules.
+6. **Limits:**
    - Maximum `.gitignore` file size: **65,535 bytes**.
    - Maximum number of active rules kept per directory: **1,024 rules**.
-5. **Supported Patterns:**
+7. **Supported Patterns:**
    - Negation prefixes (`!`)
    - Wildcards: `*` and `?`
    - Anchored paths: `/pattern`
    - Directory-only patterns: `pattern/`
    - Leading and trailing glob stars: `**/foo` and `foo/**`
-6. **Unsupported Features:**
+8. **Unsupported Features:**
    - Character classes (e.g. `[a-z]`)
    - Backslash escape sequences (e.g. `\#` or `\*`)
    - Global ignore files (`~/.config/git/ignore`), repo-level `.git/info/exclude`, or `.ignore` files
+
+The no-path and path-selected rules intentionally differ. From `repo/sub`:
+
+```sh
+zfind --gitignore      # current-directory only: repo/.git is not discovered
+zfind . --gitignore    # selected path: discovers repo/.git and inherits repo rules
+```
 
 > [!NOTE]
 > `--exclude-name` takes absolute precedence over `.gitignore`. If a directory is excluded via `--exclude-name`, any `.gitignore` file inside it is never read.
@@ -407,7 +440,7 @@ The configuration file uses a line-oriented format matching command-line option 
 - **Comments:** Lines starting with `#` (ignoring leading whitespace) are comments. Inline comments are not supported (`#` elsewhere is treated as part of the value).
 - **Quoting:** Values may be enclosed in single (`'...'`) or double (`"..."`) quotes to preserve leading or trailing whitespace. The enclosing quote character cannot appear inside the string.
 - **Escapes & Expansions:** Shell variables (`$VAR`), tilde (`~`), globs, and command substitutions are not expanded. Backslashes are passed directly to the corresponding option handler (e.g. `--separator='\t'`).
-- **Disallowed Options:** Short options, `PATTERN`, `--`, `--help`, `--config`, and `--no-config` are forbidden inside the configuration file. `--color always` is also rejected (use `auto` or `never`).
+- **Disallowed Options:** Short options, positional `PATH`, positional `PATTERN`, `--`, `--path`, `--help`, `--config`, and `--no-config` are forbidden inside the configuration file. This includes path-like tokens such as `.`, `..` and `./src`; a config line is an option, not a search. `--color always` is also rejected (use `auto` or `never`).
 
 ### Precedence & Merging
 
