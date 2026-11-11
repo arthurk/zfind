@@ -37,7 +37,7 @@ class TestExcludeNameParser:
             (("--exclude-name", ""), b"zfind: empty name for --exclude-name\n"),
             (("--exclude-name=a/b",), b"zfind: --exclude-name matches basenames only; '/' is not allowed\n"),
             (("--exclude-name", "a/"), b"zfind: --exclude-name matches basenames only; '/' is not allowed\n"),
-            (("--exclude-name=a", "pattern", "--exclude-name=b"), b"zfind: unexpected argument\n"),
+            (("--exclude-name=a", "pattern", "--exclude-name=b"), b"zfind: unexpected argument '--exclude-name=b'\n"),
             (("--exclude-nam=x",), b"zfind: unknown option\n"),
             (("--exclude_name=x",), b"zfind: unknown option\n"),
             (("--EXCLUDE-NAME=x",), b"zfind: unknown option\n"),
