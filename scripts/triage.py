@@ -2,24 +2,23 @@
 """Run automated crash triage with GDB or inspect performance profiling.
 
 Usage:
-    scripts/triage.py [COREFILE] [--binary BIN]
+    scripts/triage.py --core COREFILE [--binary BIN]
     scripts/triage.py [--binary BIN] -- [ARGS...]
-    scripts/triage.py --profile [--binary BIN] [--tree TREE] [PATTERN]
+    scripts/triage.py --profile [--binary BIN] [--tree TREE] [-- PATTERN]
 
 Examples:
     # Live triage: run a command under GDB and report on crash
     python3 scripts/triage.py -- build/x86_64/zfind --no-config src
 
     # Core dump analysis:
-    python3 scripts/triage.py core.359936
+    python3 scripts/triage.py --core core.359936
 
     # Call-graph profiling (checks kernel permissions first):
-    python3 scripts/triage.py --profile --tree src
+    python3 scripts/triage.py --profile --tree src -- '*.c'
 
 Self-test:  python3 -m doctest scripts/triage.py
 """
 import argparse
-import os
 import re
 import subprocess
 import sys
@@ -189,6 +188,12 @@ def run_gdb_triage(binary, args=None, corefile=None):
 
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     parsed = parse_gdb_output(res.stdout)
+    # If GDB itself failed (binary missing, can't open core, etc.) and we didn't
+    # detect a crash signal, surface the raw output so the caller isn't misled.
+    if res.returncode != 0 and not parsed["crashed"] and parsed["exit_status"] is None:
+        sys.stderr.write("GDB exited with an error:\n")
+        sys.stderr.write(res.stdout)
+        return parsed, None
     report = format_triage_report(parsed)
     return parsed, report
 
@@ -209,8 +214,11 @@ def run_perf_profile(binary, tree="src", pattern=None):
         perf_cmd.append(pattern)
 
     sys.stdout.write(f"Running: {' '.join(perf_cmd)}\n")
-    rec = subprocess.run(perf_cmd)
+    rec = subprocess.run(perf_cmd, stderr=subprocess.PIPE, text=True)
     if rec.returncode != 0:
+        sys.stderr.write(f"perf record failed (exit {rec.returncode}):\n")
+        if rec.stderr:
+            sys.stderr.write(rec.stderr)
         return rec.returncode
 
     rep = subprocess.run(
@@ -225,7 +233,7 @@ def run_perf_profile(binary, tree="src", pattern=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("target", nargs="?", help="Core file or starting path")
+    parser.add_argument("--core", metavar="COREFILE", help="Core dump file to analyse")
     parser.add_argument("--binary", default=DEFAULT_BINARY, help=f"Path to zfind binary (default: {DEFAULT_BINARY})")
     parser.add_argument("--profile", action="store_true", help="Run perf profiling instead of GDB crash triage")
     parser.add_argument("--tree", default="src", help="Directory tree to profile (default: src)")
@@ -233,27 +241,18 @@ def main(argv=None):
 
     opts = parser.parse_args(argv)
 
+    # Strip a leading '--' separator from REMAINDER in all modes.
+    extra = opts.args
+    if extra and extra[0] == "--":
+        extra = extra[1:]
+
     if opts.profile:
-        pattern = opts.args[0] if opts.args else None
+        pattern = extra[0] if extra else None
         return run_perf_profile(opts.binary, tree=opts.tree, pattern=pattern)
 
-    # Determine core file vs live invocation
-    corefile = None
-    exec_args = []
-
-    if opts.target and (opts.target.startswith("core") or os.path.exists(opts.target) and "core" in opts.target):
-        corefile = opts.target
-    elif opts.target:
-        exec_args.append(opts.target)
-
-    if opts.args:
-        # Strip leading '--' if present
-        extra = opts.args
-        if extra and extra[0] == "--":
-            extra = extra[1:]
-        exec_args.extend(extra)
-
-    parsed, report = run_gdb_triage(opts.binary, args=exec_args, corefile=corefile)
+    parsed, report = run_gdb_triage(opts.binary, args=extra, corefile=opts.core)
+    if report is None:
+        return 2  # GDB itself failed; error already written to stderr
     print(report)
     return 1 if parsed["crashed"] else 0
 
