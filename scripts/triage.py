@@ -3,7 +3,7 @@
 
 Usage:
     scripts/triage.py --core COREFILE [--binary BIN]
-    scripts/triage.py [--binary BIN] -- [ARGS...]
+    scripts/triage.py -- BINARY [ARGS...]
     scripts/triage.py --profile [--binary BIN] [--tree TREE] [-- PATTERN]
 
 Examples:
@@ -250,7 +250,14 @@ def main(argv=None):
         pattern = extra[0] if extra else None
         return run_perf_profile(opts.binary, tree=opts.tree, pattern=pattern)
 
-    parsed, report = run_gdb_triage(opts.binary, args=extra, corefile=opts.core)
+    # When invoked as: triage.py -- BINARY [ARGS...]
+    # the first token after '--' overrides --binary.
+    binary = opts.binary
+    if extra and not opts.core:
+        binary = extra[0]
+        extra = extra[1:]
+
+    parsed, report = run_gdb_triage(binary, args=extra, corefile=opts.core)
     if report is None:
         return 2  # GDB itself failed; error already written to stderr
     print(report)
