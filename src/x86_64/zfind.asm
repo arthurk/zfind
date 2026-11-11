@@ -67,7 +67,9 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; $HOME/.config/zfind/config. --no-config reads none. The file is one option per
 ; line (--name, --name=value or --name value, # comment lines, matching quotes
 ; around a value) and is read by the same parser as the command line
-; (parse_args), so each line is checked exactly like its flag. The layers are
+; (parse_args), so each line is checked exactly like its flag. --help,
+; --config, --no-config, --path and "--" are command-line only, and a
+; positional PATH or PATTERN is rejected in the file. The layers are
 ; the built-in defaults, then the file, then the command line: a mode
 ; (hidden, gitignore) set on the command line replaces the file's, a scalar
 ; (--separator, --limit, --case) is overwritten, a command-line --type replaces
@@ -133,6 +135,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 
 %define AT_FDCWD    -100
 %define PATH_MAX    4096
+%define NAME_MAX    255               ; longest component Linux accepts
 %define SEP_MAX     64                ; decoded --separator bytes
 %define EXCL_MAX    64                ; unique --exclude-name values
 %define CFG_MAX     65536             ; config file bytes; a larger file is an error
@@ -2010,10 +2013,11 @@ load_config.end_func:
 ; ignored; the value may be wrapped in matching quotes, which are removed).
 ; It is run through parse_args as a one-entry argv, or a two-entry one when the
 ; option takes a value (--limit, --type, --case, --separator, --exclude-name,
-; --color): text after a flag is an error, so a line can never carry a second
-; option. The line is edited in place and the buffer lives for the whole run:
-; excl_names points into it. --help, --config, --no-config and "--" are
-; command-line only.
+; --exclude-type, --color): text after a flag is an error, so a line can never
+; carry a second option. The line is edited in place and the buffer lives for
+; the whole run: excl_names points into it. --help, --config, --no-config,
+; --path and "--" are command-line only, and a positional PATH or PATTERN is
+; rejected: a config line never selects a starting directory or pattern.
     global cfg_line:function (cfg_line.end_func - cfg_line)
 cfg_line:
 .lead:                               ; skip leading blanks and \r
@@ -2848,7 +2852,7 @@ root_ign_setup:
     lea rsi, [r14+ign_buf]
     mov edx, 1
     push rcx
-    call ig_ignored
+    call ig_ignored_bounded          ; rcx = this component's path length
     pop rcx
     mov byte [r14+ign_buf+rcx], '/'
     test al, al
@@ -2859,7 +2863,8 @@ root_ign_setup:
     lea rdi, [r14+ign_buf+r8]
     lea rsi, [r14+ign_buf]
     mov edx, 1
-    call ig_ignored
+    mov rcx, [rsp+24]
+    call ig_ignored_bounded
     test al, al
     jnz .skip
 .not_ignored:
@@ -4705,24 +4710,32 @@ die:                                 ; rsi, rdx = message; exits 1
     syscall
 die.end_func:
 
-; append_quoted: rsi = NUL-terminated token, rdi = destination. Copies it
-; inside a single-quoted shell word, spelling ' as '\'' so the bytes survive.
+; append_quoted: rsi = NUL-terminated token, rdi = destination, rdx = one past
+; the usable destination. Copies the token inside a single-quoted shell word,
+; spelling ' as '\'' so the bytes survive, and stops before rdx so the caller's
+; closing quote and suffix still fit.
     global append_quoted:function (append_quoted.end_func - append_quoted)
 append_quoted:
+.loop:
+    cmp rdi, rdx
+    jae .ret
     mov al, [rsi]
     test al, al
     jz .ret
     cmp al, 0x27                     ; '
     jne .plain
+    lea rax, [rdi+4]
+    cmp rax, rdx
+    ja .ret
     mov dword [rdi], 0x27275c27      ; '\''
     add rdi, 4
     inc rsi
-    jmp append_quoted
+    jmp .loop
 .plain:
     mov [rdi], al
     inc rdi
     inc rsi
-    jmp append_quoted
+    jmp .loop
 .ret:
     ret
 append_quoted.end_func:
@@ -4783,6 +4796,7 @@ die_unexpected:
 .copy:
     rep movsb
     mov rsi, rbx
+    lea rdx, [err_buf + PATH_MAX + 512 - 32]
     call append_quoted
     mov byte [rdi], 0x27
     inc rdi
@@ -4808,6 +4822,7 @@ die_start_path:
     mov ecx, e_start_path_e - e_start_path
     rep movsb
     mov rsi, rbx
+    lea rdx, [err_buf + PATH_MAX + 512 - 32]
     call append_quoted
     mov byte [rdi], 0x27
     inc rdi
@@ -4846,6 +4861,7 @@ die_start_path:
     mov ecx, e_start_path_mid_e - e_start_path_mid
     rep movsb
     mov rsi, rbx
+    lea rdx, [err_buf + PATH_MAX + 512 - 32]
     call append_quoted
     mov byte [rdi], 0x27
     inc rdi
@@ -5157,8 +5173,24 @@ globmatch.end_func:
 ; ig_chain links one immutable node per directory that has rules, innermost
 ; last. Ancestors are applied before the node itself, so the deepest matching
 ; rule still wins - the order the single-threaded walk appended them in.
+; ig_ignored_bounded also takes rcx = the path length being tested; rules from
+; directories at or below it do not govern it, so the root check can test an
+; ancestor without applying rules that belong to that ancestor's children.
+; Both set r10 = the longest rule prefix that may match and tail-call ig_apply.
     global ig_ignored:function (ig_ignored.end_func - ig_ignored)
 ig_ignored:
+    mov r10, -1                      ; every rule governs this path
+    jmp ig_apply
+ig_ignored.end_func:
+
+    global ig_ignored_bounded:function (ig_ignored_bounded.end_func - ig_ignored_bounded)
+ig_ignored_bounded:
+    mov r10, rcx                     ; rules with a longer prefix are skipped
+    jmp ig_apply
+ig_ignored_bounded.end_func:
+
+    global ig_apply:function (ig_apply.end_func - ig_apply)
+ig_apply:
     push rbx
     push rbp
     push r12
@@ -5177,7 +5209,7 @@ ig_ignored:
     pop rbp
     pop rbx
     ret
-ig_ignored.end_func:
+ig_apply.end_func:
 
 ; ig_levels: apply r15's rules, then its ancestors'
     global ig_levels:function (ig_levels.end_func - ig_levels)
@@ -5199,6 +5231,8 @@ ig_levels:
     mov rax, r9
     shl rax, 5
     add rax, r8
+    cmp qword [rax+16], r10          ; a rule governs only paths below its dir
+    ja .skip
     push rax
     mov rdx, [rax+8]                 ; flags
     test rdx, F_DIR
@@ -5237,8 +5271,8 @@ ig_levels:
 ig_levels.end_func:
 
 ; ig_add_line: rdi = one .gitignore line, NUL-terminated; appends a rule to
-; this thread's scratch array. rbx (the containing directory's path length)
-; is used for the prefix.
+; this thread's scratch array. [r14+ig_prefix] (the containing directory's
+; length plus one, or zero at the repository root) is the rule's prefix.
     global ig_add_line:function (ig_add_line.end_func - ig_add_line)
 ig_add_line:
     mov al, [rdi]
@@ -5943,6 +5977,8 @@ walk_wide:
     test r13b, r13b
     jnz .have_type
     call walk_dir.mkpath             ; DT_UNKNOWN needs a path for lstat
+    test rbp, rbp
+    js .ignored
     mov qword [rsp+48], 1
     mov rax, 262                     ; DT_UNKNOWN: lstat without following
     mov rdi, AT_FDCWD
@@ -5980,6 +6016,8 @@ walk_wide:
     cmp qword [rsp+48], 0
     jne .ignore_path_ready
     call walk_dir.mkpath             ; ignore rules may need the full path
+    test rbp, rbp
+    js .ignored
     mov qword [rsp+48], 1
 .ignore_path_ready:
     mov rdi, r12
@@ -6011,6 +6049,8 @@ walk_wide:
     cmp qword [rsp+48], 0
     jne .gate_call
     call walk_dir.mkpath             ; type_ok follows the link via path_buf
+    test rbp, rbp
+    js .ignored
     mov qword [rsp+48], 1
 .gate_call:
     movzx edi, byte [rsp+40]
@@ -6027,6 +6067,8 @@ walk_wide:
     cmp qword [rsp+48], 0
     jne .dir_path_ready
     call walk_dir.mkpath             ; groups need their complete directory path
+    test rbp, rbp
+    js .ignored
     mov qword [rsp+48], 1
 .dir_path_ready:
     mov rdi, rbp
@@ -6056,6 +6098,8 @@ walk_wide:
     add rax, [rsp+0]
     mov r12, [rax+8]
     call walk_dir.mkpath
+    test rbp, rbp
+    js .pub_next
     mov rdi, rbp
     xor esi, esi
     cmp byte [r12-2], 4
@@ -6426,6 +6470,8 @@ walk_dir:
     test r13b, r13b
     jnz .notdir
     call .mkpath                     ; DT_UNKNOWN: lstat, do not follow links
+    test rbp, rbp
+    js .next
     mov rax, 262
     mov rdi, AT_FDCWD
     lea rsi, [r14+path_buf]
@@ -6455,6 +6501,8 @@ walk_dir:
 .isdir:
     mov r13d, 1
     call .mkpath
+    test rbp, rbp
+    js .next
     jmp .resolved
 .notdir:
     xor r13d, r13d
@@ -6464,6 +6512,8 @@ walk_dir:
     jz .check_match
 .ig_check:
     call .mkpath                     ; ig_ignored() wants the match path
+    test rbp, rbp
+    js .next
     mov rdi, r12
     lea rsi, [r14+ign_buf]
     mov rdx, r13
@@ -6488,6 +6538,8 @@ walk_dir:
     cmp edi, DT_LNK
     jne .gate_call
     call .mkpath                     ; type_ok follows the link via path_buf
+    test rbp, rbp
+    js .next
 .gate_call:
     movzx edi, byte [rsp+56]
     call type_ok
@@ -6495,6 +6547,8 @@ walk_dir:
     jz .descend
 .matched:
     call .mkpath                     ; print_entry() wants the path
+    test rbp, rbp
+    js .next
     mov rdi, rbp
     mov rsi, r13
     call print_entry
@@ -6520,10 +6574,33 @@ walk_dir:
 ; rbp = display entry length; [r14+ign_entry] = ignore match length. Joining
 ; is separator-aware: "/" never gains a second slash, "." gains one.
 ; Plain files that neither match nor carry ignore rules skip this: most
-; entries are those.
+; entries are those. A base that still leaves room for NAME_MAX copies without
+; a per-byte bound check; nearer the limit the append is measured first, and
+; an entry that cannot fit is skipped by the caller instead of truncated.
 .mkpath:
     lea rdi, [r14+path_buf]
     add rdi, rbx
+    cmp rbx, PATH_MAX - NAME_MAX - 1
+    jb .dfast
+    mov rsi, r12                     ; deep base: measure name + separator
+    xor ecx, ecx
+.dlen:
+    cmp byte [rsi+rcx], 0
+    je .dlen_done
+    inc rcx
+    jmp .dlen
+.dlen_done:
+    mov rdx, rbx
+    test rbx, rbx
+    jz .dlen_nosep
+    cmp byte [r14+path_buf+rbx-1], '/'
+    je .dlen_nosep
+    inc rdx
+.dlen_nosep:
+    add rdx, rcx
+    cmp rdx, PATH_MAX
+    jae .over
+.dfast:
     test rbx, rbx
     jz .dnosep
     cmp byte [rdi-1], '/'
@@ -6552,6 +6629,26 @@ walk_dir:
     mov rcx, [r14+ign_len]
     lea rdi, [r14+ign_buf]
     add rdi, rcx
+    cmp rcx, PATH_MAX - NAME_MAX - 1
+    jb .ifast
+    mov rsi, r12                     ; deep base: measure name + separator
+    xor edx, edx
+.ilen:
+    cmp byte [rsi+rdx], 0
+    je .ilen_done
+    inc rdx
+    jmp .ilen
+.ilen_done:
+    add rdx, rcx
+    test rcx, rcx
+    jz .ilen_nosep
+    cmp byte [r14+ign_buf+rcx-1], '/'
+    je .ilen_nosep
+    inc rdx
+.ilen_nosep:
+    cmp rdx, PATH_MAX
+    jae .over
+.ifast:
     test rcx, rcx
     jz .inosep
     cmp byte [rdi-1], '/'
@@ -6571,6 +6668,10 @@ walk_dir:
     sub rdi, rax
     dec rdi
     mov [r14+ign_entry], rdi
+    ret
+.over:
+    mov rbp, -1                      ; too long to open: the caller skips it
+    mov qword [r14+ign_entry], 0
     ret
 .fin:
     mov rdi, [rsp+40]
@@ -6628,6 +6729,8 @@ walk_range:
     test r13b, r13b
     jnz .notdir
     call walk_dir.mkpath
+    test rbp, rbp
+    js .next
     mov rax, 262
     mov rdi, AT_FDCWD
     lea rsi, [r14+path_buf]
@@ -6661,11 +6764,15 @@ walk_range:
     jmp .resolved
 .isdir:
     call walk_dir.mkpath
+    test rbp, rbp
+    js .next
     mov r13d, 1
     mov byte [rsp+0], DT_DIR
     jmp .resolved
 .notdir:
     call walk_dir.mkpath
+    test rbp, rbp
+    js .next
     xor r13d, r13d
 .resolved:
     mov rax, [r14+ig_chain]
