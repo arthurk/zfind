@@ -80,13 +80,26 @@ NASM does not support `.cfi_*` directives, but `Makefile` passes
 bounds (`global name:function (name.end_func - name)`). This gives GDB and
 profilers the function bounds needed to reconstruct stack frames. In
 non-interactive agent sessions, never run bare interactive tools (`gdb`,
-interactive `perf report`) which block on TTY prompts. Use batch mode:
+interactive `perf report`) which block on TTY prompts.
 
-### Crash triage with GDB
+Use `scripts/triage.py` (which wraps batch GDB and perf checks):
 
-- **Live crash triage**: run the failing invocation under GDB in batch mode to
-  print the failing thread, backtrace across all threads, register state, and
-  faulting instruction:
+```sh
+# Live crash triage: runs under GDB, detects faults, and reports backtraces
+python3 scripts/triage.py -- build/x86_64/zfind --no-config [ARGS...]
+
+# Post-mortem core dump analysis:
+python3 scripts/triage.py core.<PID>
+
+# Call-graph profiling (checks kernel permissions before recording):
+python3 scripts/triage.py --profile --tree [TREE] [PATTERN]
+```
+
+### Direct GDB batch mode
+
+If invoking GDB directly without the wrapper, always pass `-batch`:
+
+- **Live crash triage**:
   ```sh
   gdb -batch -return-child-result \
       -ex "run" \
@@ -110,9 +123,9 @@ interactive `perf report`) which block on TTY prompts. Use batch mode:
 
 ### Call-graph profiling with perf
 
-When profiling call hierarchies or investigating where time is spent across
-callers, run `perf` non-interactively with `--stdio` (never bare `perf report`,
-which opens an interactive pager):
+`scripts/triage.py --profile` checks `/proc/sys/kernel/perf_event_paranoid`
+before invoking perf. Direct calls must use non-interactive flags (`--stdio`,
+never bare `perf report`):
 
 ```sh
 perf record --call-graph dwarf -F 99 -e cycles:u -o /tmp/perf.data -- \
@@ -254,4 +267,4 @@ make cqa                    # MAQAO CQA: static per-loop report (system maqao)
   instruction CV exceeds 1 %.
 - CQA is a static estimate, not an execution profile, and its numbers depend
   on the target CPU model MAQAO detects.
-- The scripts' self-test is `python3 -m doctest scripts/bench.py scripts/cqa.py`.
+- The scripts' self-test is `python3 -m doctest scripts/bench.py scripts/cqa.py scripts/triage.py`.
