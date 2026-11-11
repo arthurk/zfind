@@ -5,19 +5,38 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
 ;         [--exclude-name NAME] [--exclude-type f|d|l|b] [--limit N|none]
 ;         [--type f|d|l|b] [--color auto|always|never]
-;         [--config PATH | --no-config] [--] [PATTERN]
+;         [--config PATH | --no-config] [--path DIR] [--] [PATH] [PATTERN]
+; PATH is an optional starting directory. Without --path, a positional token
+; containing '/' or the exact tokens . and .. is an automatic path candidate:
+; if it opens as a directory it is the root, and ENOENT/ENOTDIR turn it back
+; into a pattern. At most one automatic candidate and one PATTERN are
+; accepted, in either order; any other positional token is an error. --path
+; DIR (or --path=DIR) selects the root explicitly, never falls back, rejects
+; repeats and an empty value, and accepts a literal pattern after it. Options
+; and -- must precede all positionals. The selected root is opened with
+; O_DIRECTORY and followed if it is a symlink, before traversal and before the
+; --limit 0 exit, and its descriptor is consumed by the root worker; open and
+; read failures are errors. Its display spelling is kept (redundant trailing
+; '/' removed, '/' kept) and the root itself is never printed. --type,
+; --no-hidden and --exclude-name apply to descendants only.
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
 ; Every entry is searched, including hidden names and dot-directories like
 ; .git and .jj. --hidden states the default explicitly; --no-hidden skips
 ; them. The two options conflict. --no-gitignore states the default (no
 ; .gitignore rules, .git and .jj not pruned) explicitly; --gitignore applies
-; .gitignore rules when cwd contains .git or .jj and prunes both metadata dirs.
-; The two options conflict. .gitignore rules apply only when --gitignore is
-; given and cwd contains .git or .jj (the existing shortcut; no ancestor walk);
-; with the flag, .git and .jj entries are pruned - never printed, never walked -
-; because neither git nor jujutsu tracks anything under them. --no-gitignore
-; leaves them as ordinary hidden entries. The pattern is matched against the name only.
+; .gitignore rules and prunes both metadata dirs. Without a selected path it
+; activates only when cwd contains .git or .jj and does not walk ancestors.
+; With a selected path it resolves the opened root through /proc/self/fd,
+; walks up to the nearest .git directory, .git file or .jj directory, loads
+; ancestor .gitignore files parent-to-child, checks the root against them,
+; then loads the root's own .gitignore for its descendants. A selected root
+; at or below .git/.jj is pruned. Matching uses a separate repository-relative
+; path, so a symlink root keeps its display spelling while rules match its
+; physical location. The two options conflict. With the flag, .git and .jj
+; entries are pruned - never printed, never walked - because neither git nor
+; jujutsu tracks anything under them. --no-gitignore leaves them as ordinary
+; hidden entries. The pattern is matched against the name only.
 ; --exclude-name NAME is repeatable. It removes entries by exact basename,
 ; bytewise and case-sensitively, before the type/pattern prefilter and
 ; arena_put; a matching directory is pruned. Explicit exclusions override
@@ -62,10 +81,10 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; TERM set and not "dumb"; the mode is resolved once before the walk. The
 ; config file may say auto or never, never always: a silent global default
 ; must not put escapes into every pipe.
-; shortcut: no path arguments, no regex/glob, and none of the
-;   ignore sources beyond .gitignore in the walked tree itself (no parent
-;   dirs, no global gitignore, no .ignore, no [] or \ in patterns);
-;   add use-case by use-case.
+; shortcut: no regex/glob, and none of the ignore sources beyond .gitignore
+;   in the walked tree and, for a selected path, its ancestors up to the
+;   nearest repository (no global gitignore, no .ignore, no [] or \ in
+;   patterns); add use-case by use-case.
 ;
 ; The walk is parallel.  Output is an explicit tree of groups.  A group's
 ; items are ordered text records and child groups; the writer walks that tree
@@ -203,7 +222,10 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; per-thread state; one instance per worker plus the main thread's, all from
 ; one mmap. r14 points at the caller's instance in every function that uses it.
 struc TSTATE
-  .path_buf:  resb PATH_MAX         ; current directory path relative to cwd
+  .path_buf:  resb PATH_MAX         ; display path relative to cwd (or the
+                                    ;   supplied starting path spelling)
+  .ign_buf:   resb PATH_MAX         ; repository-relative ignore match path
+  .ig_path:   resb PATH_MAX + 16    ; scratch: a directory plus "/.gitignore"
   .statbuf:   resb 144
   .ent_buf:   resb ENT_BUF          ; one getdents64 batch
   .igbuf:     resb IGBUF_SZ         ; one buffer per thread: load_ignore never
@@ -217,6 +239,9 @@ struc TSTATE
   .sc_top:    resq 1                ; scratch bump pointer; walk_dir restores it
   .sc_end:    resq 1
   .path_len:  resq 1
+  .ign_len:   resq 1                ; current directory's ignore match path length
+  .ign_entry: resq 1                ; current entry's ignore match path length
+  .ig_prefix: resq 1                ; prefix length for rules of the file being read
   .f_deep:    resq 1
   .ig_nrules: resq 1
   .ig_chain:  resq 1                ; ancestor rules, innermost node first
@@ -237,6 +262,10 @@ endstruc
 %define igbuf      TSTATE.igbuf
 %define ig_rules   TSTATE.ig_rules
 %define path_len   TSTATE.path_len
+%define ign_buf    TSTATE.ign_buf
+%define ign_len    TSTATE.ign_len
+%define ign_entry  TSTATE.ign_entry
+%define ig_prefix  TSTATE.ig_prefix
 %define f_deep     TSTATE.f_deep
 %define ig_nrules  TSTATE.ig_nrules
 %define ig_chain   TSTATE.ig_chain
@@ -265,7 +294,9 @@ endstruc
 %define GRP_TAB       64              ; range: copied {key,name} table
 %define GRP_NAMES     72              ; range: copied name records
 %define GRP_N         80              ; range: table entries
-%define GRP_SZ        96
+%define GRP_IGNPATH   88              ; arena repository-relative ignore path
+%define GRP_IGNLEN    96
+%define GRP_SZ        104
 %define GRP_NEW       0
 %define GRP_RUNNING   1
 %define GRP_DONE      2
@@ -297,6 +328,102 @@ section .rodata
     igname      db '.gitignore', 0
     e_arg       db "zfind: unexpected argument", 10
     e_arg_e:
+    e_path_missing db "zfind: missing value after --path", 10
+    e_path_missing_e:
+    e_path_empty db "zfind: --path requires a non-empty value", 10
+    e_path_empty_e:
+    e_path_repeat db "zfind: --path may only be specified once", 10
+    e_path_repeat_e:
+    e_path_resolve db "zfind: cannot resolve starting path for --gitignore", 10
+    e_path_resolve_e:
+    e_unexp_arg db "zfind: unexpected argument '"
+    e_unexp_arg_e:
+    e_unexp_path db "zfind: unexpected path argument '"
+    e_unexp_path_e:
+    e_start_path db "zfind: starting path '"
+    e_start_path_e:
+    e_start_path_mid db " starting path '"
+    e_start_path_mid_e:
+    e_not_exist db "does not exist"
+    e_not_exist_e:
+    e_not_dir   db "is not a directory"
+    e_not_dir_e:
+    e_too_long  db "is too long"
+    e_too_long_e:
+    e_cannot_open db "zfind: cannot open"
+    e_cannot_open_e:
+    e_cannot_read db "zfind: cannot read"
+    e_cannot_read_e:
+    proc_fd     db "/proc/self/fd/", 0
+    errno_e_perm db "EPERM"
+    errno_e_perm_e:
+    errno_e_noent db "ENOENT"
+    errno_e_noent_e:
+    errno_e_io  db "EIO"
+    errno_e_io_e:
+    errno_e_badf db "EBADF"
+    errno_e_badf_e:
+    errno_e_acces db "EACCES"
+    errno_e_acces_e:
+    errno_e_fault db "EFAULT"
+    errno_e_fault_e:
+    errno_e_mfile db "EMFILE"
+    errno_e_mfile_e:
+    errno_e_nfile db "ENFILE"
+    errno_e_nfile_e:
+    errno_e_notdir db "ENOTDIR"
+    errno_e_notdir_e:
+    errno_e_nodev db "ENODEV"
+    errno_e_nodev_e:
+    errno_e_inval db "EINVAL"
+    errno_e_inval_e:
+    errno_e_nomem db "ENOMEM"
+    errno_e_nomem_e:
+    errno_e_loop db "ELOOP"
+    errno_e_loop_e:
+    errno_e_nametoolong db "ENAMETOOLONG"
+    errno_e_nametoolong_e:
+    errno_e_overflow db "EOVERFLOW"
+    errno_e_overflow_e:
+    errno_e_stale db "ESTALE"
+    errno_e_stale_e:
+    errno_e_unknown db "EUNKNOWN"
+    errno_e_unknown_e:
+    align 8
+    errno_table:
+    dq errno_e_perm
+    dd 1, errno_e_perm_e - errno_e_perm
+    dq errno_e_noent
+    dd 2, errno_e_noent_e - errno_e_noent
+    dq errno_e_io
+    dd 5, errno_e_io_e - errno_e_io
+    dq errno_e_badf
+    dd 9, errno_e_badf_e - errno_e_badf
+    dq errno_e_acces
+    dd 13, errno_e_acces_e - errno_e_acces
+    dq errno_e_fault
+    dd 14, errno_e_fault_e - errno_e_fault
+    dq errno_e_nfile
+    dd 23, errno_e_nfile_e - errno_e_nfile
+    dq errno_e_mfile
+    dd 24, errno_e_mfile_e - errno_e_mfile
+    dq errno_e_notdir
+    dd 20, errno_e_notdir_e - errno_e_notdir
+    dq errno_e_nodev
+    dd 19, errno_e_nodev_e - errno_e_nodev
+    dq errno_e_inval
+    dd 22, errno_e_inval_e - errno_e_inval
+    dq errno_e_nomem
+    dd 12, errno_e_nomem_e - errno_e_nomem
+    dq errno_e_loop
+    dd 40, errno_e_loop_e - errno_e_loop
+    dq errno_e_nametoolong
+    dd 36, errno_e_nametoolong_e - errno_e_nametoolong
+    dq errno_e_overflow
+    dd 75, errno_e_overflow_e - errno_e_overflow
+    dq errno_e_stale
+    dd 116, errno_e_stale_e - errno_e_stale
+    errno_table_end:
     e_limit     db "zfind: invalid limit (expected a whole number or none)", 10
     e_limit_e:
     e_type      db "zfind: expected f, d, l or b after --type", 10
@@ -380,6 +507,8 @@ section .rodata
     nog_long    db "--no-gitignore", 0
     hidden_long db "--hidden", 0
     no_long     db "--no-hidden", 0
+    path_long   db "--path", 0
+    path_eq     db "--path=", 0      ; 7 bytes of prefix
     cfg_long    db "--config", 0
     cfg_eq      db "--config=", 0    ; 9 bytes of prefix
     nocfg_long  db "--no-config", 0
@@ -402,13 +531,14 @@ section .rodata
     cfg_sfx_xdg_e:
     cfg_sfx_home db "/.config/zfind/config", 0
     cfg_sfx_home_e:
-    help_msg    db "usage: zfind [--help] [--separator STR] [--case smart|sensitive|insensitive]", 10
+    help_msg    db "usage: zfind [OPTIONS] [--path DIR] [--] [PATH] [PATTERN]", 10
+               db "  options: [--help] [--separator STR] [--case smart|sensitive|insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
                db "             [--exclude-name NAME]... [--exclude-type f|d|l|b]", 10
                db "             [--limit N|none] [--type f|d|l|b]", 10
                db "             [--color auto|always|never]", 10
-               db "             [--config PATH | --no-config] [--] [PATTERN]", 10, 10
-               db "Search the current directory tree for entries whose name contains", 10
+               db "             [--config PATH | --no-config]", 10, 10
+               db "Search a directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
                db "is case-insensitive unless PATTERN contains an uppercase ASCII letter", 10
                db "(--case smart, the default). --case sensitive and --case insensitive force", 10
@@ -416,24 +546,37 @@ section .rodata
                db "only); it does not apply to .gitignore rules or --exclude-name matching.", 10
                db "Without a pattern every", 10
                db "entry is listed unless --type restricts the result types.", 10, 10
-               db "Options must appear before PATTERN. --limit, --type, --case and --separator", 10
-               db "consume the next token greedily as their value. -- ends options; any", 10
-               db "following argument is treated as PATTERN. --help prints this help and", 10
-               db "exits 0 anywhere before --, including after PATTERN or where an option", 10
-               db "value is expected.", 10, 10
+               db "Options must appear before PATH and PATTERN. --limit, --type, --case,", 10
+               db "--separator, --exclude-name, --exclude-type, --color, --config and", 10
+               db "--path consume the next token greedily as their value. -- ends options;", 10
+               db "any following argument is treated as PATTERN. --help prints this help", 10
+               db "and exits 0 anywhere before --, including after PATTERN or where an", 10
+               db "option value is expected.", 10, 10
+               db "PATH is an optional starting directory. A positional token containing", 10
+               db "'/' and the exact tokens . and .. are automatic path candidates: a", 10
+               db "token that names a directory becomes the starting directory, while a", 10
+               db "missing or non-directory one is searched as a pattern. At most one", 10
+               db "PATTERN is accepted. --path DIR selects the starting directory", 10
+               db "explicitly and accepts a literal PATTERN of any spelling. Output paths", 10
+               db "keep the spelling given for PATH; redundant trailing slashes are", 10
+               db "removed. The starting directory itself is never printed, and --type,", 10
+               db "--no-hidden and --exclude-name apply to descendants only. An", 10
+               db "explicitly selected symlink is followed; output keeps its spelling.", 10, 10
                db "Settings are also read from $XDG_CONFIG_HOME/zfind/config, else", 10
                db "~/.config/zfind/config: one option per line, # starts a comment line.", 10
                db "Command-line options override the file, except --exclude-name, which adds", 10
                db "to it, and --exclude-type, which also adds; a command-line --type replaces", 10
                db "the file's --type values.", 10
-               db "--config and --no-config are command-line only.", 10, 10
+               db "--config, --no-config and --path are command-line only.", 10, 10
                db "Hidden entries are searched like any other, .git and .jj included; --no-hidden", 10
                db "skips entries whose name starts with . and everything inside them.", 10
                db "--hidden states the default explicitly; combining the two is an error.", 10
                db "Without either gitignore flag, rules are off and .git/.jj not pruned.", 10
                db "--no-gitignore states this default explicitly. --gitignore applies", 10
-               db "rules when cwd contains .git or .jj and skips both metadata dirs.", 10
-               db "Combining the two gitignore flags is an error. Entries are sorted by", 10
+               db "rules and skips both metadata dirs. Without a selected PATH it", 10
+               db "requires .git or .jj in cwd; with one it inherits rules from the", 10
+               db "nearest repository above that path. Combining the two gitignore", 10
+               db "flags is an error. Entries are sorted by", 10
                db "name within each directory; output follows depth-first order.", 10, 10
                db "  --help              show this help and exit", 10
                db "  --separator STR     terminate results with STR, 1-64 bytes", 10
@@ -462,10 +605,13 @@ section .rodata
                db "                      also --color=WHEN; auto colors a terminal unless", 10
                db "                      NO_COLOR or TERM=dumb; an unset TERM is plain", 10
                db "                      the config file allows auto and never", 10
+               db "  --path DIR          search from DIR instead of the current directory", 10
+               db "                      (also --path=DIR); DIR must exist and be a", 10
+               db "                      directory; command-line only", 10
                db "  --config PATH       read settings from PATH instead of the default file", 10
                db "                      (also --config=PATH); the file must exist", 10
                db "  --no-config         read no config file", 10
-               db "  --                  end options; a following argument is the PATTERN", 10
+               db "  --                  end options; following arguments are PATTERN", 10
     help_msg_e:
     align 8
     poll_ts     dq 0, 5000000         ; 5 ms: how stale streamed output can get
@@ -502,6 +648,21 @@ section .bss
     lim_left:    resq 1               ; writer-only remaining results; -1 = no limit or UINT64_MAX
     limit_given: resq 1               ; read-only after parsing: 1 = a numeric --limit is in force
     limit_mode:  resq 1               ; read-only after startup: 1 = frame results
+    parsed_pat:  resq 1               ; CLI/parser: pattern candidate
+    parsed_auto: resq 1               ; CLI/parser: automatic path candidate
+    pos_seq:     resq 1               ; parser: ordinal of the last positional token
+    pat_seq:     resq 1               ; parser: ordinal of the pattern candidate
+    auto_seq:    resq 1               ; parser: ordinal of the automatic candidate
+    opts_ended:  resq 1               ; parser: saw "--" before any positional
+    path_given:  resq 1               ; parser: --path was supplied
+    path_value:  resq 1               ; parser: its value
+    sel_path_yes: resq 1              ; a starting directory was selected
+    sel_path_ptr: resq 1              ; its spelling (argv memory)
+    sel_path_len: resq 1              ; spelling length, trailing '/' removed
+    root_fd:     resq 1               ; selected root descriptor, -1 when none
+    real_buf:    resb PATH_MAX + 2    ; resolved starting path (root worker only)
+    repo_buf:    resb PATH_MAX + 2    ; repository root / ancestor paths
+    probe_buf:   resb PATH_MAX + 16   ; marker and /proc/self/fd scratch
     res_ig:     resq 1                ; 0 = default, 1 = --gitignore, 2 = --no-gitignore
     hid_mode:   resb 1                ; 0 = default, 1 = --hidden, 2 = --no-hidden
     case_mode:  resb 1                ; --case: 0 = smart (default), 1 = sensitive, 2 = insensitive
@@ -590,6 +751,7 @@ _start:
 .prescan_done:
     mov qword [lim_left], -1
     mov qword [limit_given], 0
+    mov qword [root_fd], -1
     mov qword [sep_len], 1
     mov byte [sep_buf], 10
 
@@ -655,6 +817,8 @@ _start:
     mov al, [cfg_color]
     mov [color_mode], al
 .have_args:
+    call select_root                 ; validate/open the starting directory
+    mov r13, [parsed_pat]
     call resolve_color               ; once, before any result
     test r13, r13
     jz .no_pat
@@ -677,6 +841,13 @@ _start:
     mov rax, 231                     ; exit_group
     syscall
 .exit_zero:                            ; --limit 0: nothing to print, nothing to walk
+    mov rdi, [root_fd]
+    test rdi, rdi
+    js .ez_nofd
+    mov rax, 3                       ; close the validated starting directory
+    syscall
+    mov qword [root_fd], -1
+.ez_nofd:
     xor edi, edi
     mov eax, 231                     ; exit_group
     syscall
@@ -768,6 +939,8 @@ _start:
     ; metadata prune: git_repo stays 0 and every gate downstream reads 0.
     cmp qword [res_ig], 1
     jne .norepo
+    cmp qword [sel_path_yes], 0
+    jne .norepo                      ; path-selected: discovered in the root worker
     mov rax, 262                     ; newfstatat
     mov rdi, AT_FDCWD
     lea rsi, [gitname]
@@ -838,9 +1011,13 @@ _start:
     mov dword [rax+GRP_KIND], GRP_DIR
     mov qword [rax+GRP_FIRST], 0
     mov qword [rax+GRP_LAST], 0
-    mov qword [rax+GRP_PATH], 0
-    mov qword [rax+GRP_PATHLEN], 0
+    mov rcx, [sel_path_ptr]
+    mov [rax+GRP_PATH], rcx
+    mov rcx, [sel_path_len]
+    mov [rax+GRP_PATHLEN], rcx
     mov qword [rax+GRP_CHAIN], 0
+    mov qword [rax+GRP_IGNPATH], 0
+    mov qword [rax+GRP_IGNLEN], 0
     mov qword [work_head], rax
     mov qword [pending], 1
 
@@ -945,16 +1122,36 @@ parse_args:
     mov rbp, rdi
     mov rbx, rsi
     xor r13d, r13d
+    mov qword [parsed_pat], 0
+    mov qword [parsed_auto], 0
+    mov qword [pos_seq], 0
+    mov qword [pat_seq], 0
+    mov qword [auto_seq], 0
+    mov qword [opts_ended], 0
+    mov qword [path_given], 0
+    mov qword [path_value], 0
     mov r12, 1
 .args_loop:
     cmp r12, rbx
     jae .args_done
     mov rdi, [rbp+r12*8]
+    cmp qword [opts_ended], 0
+    jne .positional                   ; after "--" everything is positional
     cmp byte [rdi], '-'
-    jne .arg_pattern
+    jne .positional
     cmp byte [rdi+1], 0
-    je .arg_pattern                    ; "-" alone
+    je .positional                    ; "-" alone
+    cmp qword [pos_seq], 0
+    jne .bad_after_positional         ; options must precede positional arguments
 
+    mov rdi, [rbp+r12*8]
+    lea rsi, [path_long]
+    call streq
+    je .opt_path_next
+    mov rdi, [rbp+r12*8]
+    lea rsi, [path_eq]
+    call startswith
+    je .opt_path_eq
     mov rdi, [rbp+r12*8]
     lea rsi, [case_long]
     call streq
@@ -1047,6 +1244,38 @@ parse_args:
     cmp byte [rdi+2], 0
     je .arg_end_opts                   ; "--"
     jmp bad_flag                       ; unknown long flag
+
+.opt_path_next:
+    inc r12
+    cmp r12, rbx
+    jae bad_path_missing
+    mov rdi, [rbp+r12*8]
+    cmp byte [rdi], '-'
+    jne .opt_path_value
+    cmp byte [rdi+1], '-'
+    jne .opt_path_value               ; "-name" is a value, not an option
+    cmp byte [rdi+2], 0
+    je bad_path_missing               ; the standalone "--" is not a value
+.opt_path_value:                      ; rdi = the value
+    cmp byte [rdi], 0
+    je bad_path_empty
+    cmp qword [path_given], 0
+    jne bad_path_repeat
+    mov qword [path_given], 1
+    mov [path_value], rdi
+    inc r12
+    jmp .args_loop
+.opt_path_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 7                        ; len("--path=")
+    cmp byte [rdi], 0
+    je bad_path_empty
+    cmp qword [path_given], 0
+    jne bad_path_repeat
+    mov qword [path_given], 1
+    mov [path_value], rdi
+    inc r12
+    jmp .args_loop
 
 .opt_case:
     inc r12
@@ -1311,23 +1540,67 @@ parse_args:
     jmp .args_loop
 
 .arg_end_opts:
+    mov qword [opts_ended], 1
     inc r12
-    cmp r12, rbx
-    jae .args_done
-    mov r13, [rbp+r12*8]
-    inc r12
-    cmp r12, rbx
-    jne bad_args
-    jmp .args_done
+    jmp .args_loop
 
-.arg_pattern:
-    mov r13, [rbp+r12*8]
+.bad_after_positional:
+    mov rdi, [rbp+r12*8]
+    xor esi, esi
+    call die_unexpected
+
+.positional:                          ; rdi = the token, r8 keeps it
+    mov r8, rdi
+    inc qword [pos_seq]
+    cmp qword [opts_ended], 0
+    jne .pos_pattern
+    cmp qword [path_given], 0
+    jne .pos_pattern                  ; --path: positionals are literal patterns
+    mov rsi, r8
+.scan_slash:
+    mov al, [rsi]
+    test al, al
+    jz .check_dot
+    cmp al, '/'
+    je .pos_auto
+    inc rsi
+    jmp .scan_slash
+.check_dot:
+    cmp byte [r8], '.'
+    jne .pos_pattern
+    cmp byte [r8+1], 0
+    je .pos_auto                      ; "."
+    cmp byte [r8+1], '.'
+    jne .pos_pattern
+    cmp byte [r8+2], 0
+    je .pos_auto                      ; ".."
+.pos_pattern:
+    test r13, r13
+    jnz .bad_two_patterns
+    mov r13, r8
+    mov rax, [pos_seq]
+    mov [pat_seq], rax
     inc r12
-    cmp r12, rbx
-    jne bad_args
-    jmp .args_done
+    jmp .args_loop
+.pos_auto:
+    cmp qword [parsed_auto], 0
+    jne .bad_two_paths
+    mov [parsed_auto], r8
+    mov rax, [pos_seq]
+    mov [auto_seq], rax
+    inc r12
+    jmp .args_loop
+.bad_two_patterns:
+    mov rdi, r8
+    xor esi, esi
+    call die_unexpected
+.bad_two_paths:
+    mov rdi, r8
+    mov esi, 1
+    call die_unexpected
 
 .args_done:
+    mov [parsed_pat], r13
     mov rax, r13
     pop r13
     pop r12
@@ -1335,6 +1608,131 @@ parse_args:
     pop rbx
     ret
 parse_args.end_func:
+
+; open_dir_follow: rdi = path -> rax = fd, or a negative errno. Opens with
+; O_RDONLY|O_DIRECTORY and follows symlinks; no libc.
+    global open_dir_follow:function (open_dir_follow.end_func - open_dir_follow)
+open_dir_follow:
+    mov rsi, rdi
+    mov rdi, AT_FDCWD
+    mov edx, 0x10000                 ; O_DIRECTORY
+    xor r10d, r10d
+    mov eax, 257                     ; openat
+    syscall
+    ret
+open_dir_follow.end_func:
+
+; select_root: turn the parser's candidates into a validated starting
+; directory. An automatic candidate falls back to a pattern only for ENOENT
+; and ENOTDIR; an explicit --path is strict. On success sets sel_path_yes,
+; sel_path_ptr, sel_path_len and root_fd.
+    global select_root:function (select_root.end_func - select_root)
+select_root:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    mov qword [sel_path_yes], 0
+    mov qword [sel_path_ptr], 0
+    mov qword [sel_path_len], 0
+    cmp qword [path_given], 0
+    jne .explicit
+    mov r12, [parsed_auto]
+    test r12, r12
+    jz .ret
+    mov rdi, r12
+    call strlen
+    mov r13, rax
+    cmp rax, PATH_MAX - 1
+    ja .auto_long
+    mov rdi, r12
+    call open_dir_follow
+    test rax, rax
+    jns .success
+    neg rax
+    cmp eax, 2                       ; ENOENT
+    je .fallback
+    cmp eax, 20                      ; ENOTDIR
+    je .fallback
+    mov edx, eax
+    mov rdi, r12
+    mov esi, 3                       ; cannot open starting path (ERRNO)
+    call die_start_path
+.auto_long:
+    mov rdi, r12
+    mov esi, 3
+    mov edx, 36                      ; ENAMETOOLONG
+    call die_start_path
+.fallback:
+    cmp qword [parsed_pat], 0
+    je .use_auto
+    mov rax, [auto_seq]
+    cmp rax, [pat_seq]
+    ja .auto_later
+    mov rdi, [parsed_pat]            ; the pattern token came later
+    xor esi, esi
+    call die_unexpected
+.auto_later:
+    mov rdi, r12                     ; the path token came later
+    xor esi, esi
+    call die_unexpected
+.use_auto:
+    mov [parsed_pat], r12
+    jmp .ret
+.explicit:
+    mov r12, [path_value]
+    test r12, r12
+    jz .ret
+    mov rdi, r12
+    call strlen
+    mov r13, rax
+    cmp rax, PATH_MAX - 1
+    ja .explicit_long
+    mov rdi, r12
+    call open_dir_follow
+    test rax, rax
+    jns .success
+    neg rax
+    mov edx, eax
+    mov rdi, r12
+    cmp eax, 2
+    je .not_exist
+    cmp eax, 20
+    je .not_dir
+    cmp eax, 36
+    je .explicit_long
+    mov esi, 3
+    call die_start_path
+.not_exist:
+    xor esi, esi
+    call die_start_path
+.not_dir:
+    mov esi, 1
+    call die_start_path
+.explicit_long:
+    mov rdi, r12
+    mov esi, 2
+    call die_start_path
+.success:
+    mov [root_fd], rax
+    mov [sel_path_ptr], r12
+.trim:                               ; remove redundant trailing '/' but keep "/"
+    cmp r13, 1
+    jbe .trimmed
+    cmp byte [r12+r13-1], '/'
+    jne .trimmed
+    dec r13
+    jmp .trim
+.trimmed:
+    mov [sel_path_len], r13
+    mov qword [sel_path_yes], 1
+.ret:
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+select_root.end_func:
 
 ; find_config: pre-scan argv for --config PATH / --config=PATH / --no-config
 ; and record the choice in cfg_mode / cfg_path. Like the main loop it stops at
@@ -1394,6 +1792,10 @@ find_config:
     je .skip
     mov rdi, [rbp+r12*8]
     lea rsi, [color_long]
+    call streq
+    je .skip
+    mov rdi, [rbp+r12*8]
+    lea rsi, [path_long]
     call streq
     je .skip
     jmp .next
@@ -1682,6 +2084,9 @@ cfg_line:
     call streq
     je bad_cfg_cli
     lea rsi, [nocfg_long]
+    call streq
+    je bad_cfg_cli
+    lea rsi, [path_long]
     call streq
     je bad_cfg_cli
     mov [r10], r8b                   ; put it back
@@ -2148,6 +2553,333 @@ ev_sleep:
     ret
 ev_sleep.end_func:
 
+; is_meta_name: rdi = component, rsi = length -> eax = 1 for ".git" or ".jj"
+    global is_meta_name:function (is_meta_name.end_func - is_meta_name)
+is_meta_name:
+    cmp rsi, 4
+    jne .maybe_jj
+    cmp dword [rdi], '.git'
+    jne .no
+    mov eax, 1
+    ret
+.maybe_jj:
+    cmp rsi, 3
+    jne .no
+    cmp word [rdi], '.j'
+    jne .no
+    cmp byte [rdi+2], 'j'
+    jne .no
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+is_meta_name.end_func:
+
+; root_ign_setup: called by the root worker when a starting path was selected.
+; Resolves the already-open root descriptor through /proc/self/fd, finds the
+; nearest repository marker by walking ancestors, builds the repository-relative
+; ignore match path, loads inherited .gitignore files parent-to-child, and
+; checks whether an inherited rule hides the root. Returns eax = 1 when the
+; root must not be traversed. No path selected leaves everything as it was.
+    global root_ign_setup:function (root_ign_setup.end_func - root_ign_setup)
+root_ign_setup:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r15
+    sub rsp, 64
+    ; [rsp+0]=resolved length [rsp+8]=probe length [rsp+16]=repo length
+    ; [rsp+24]=relative length [rsp+32]=relative pointer [rsp+40]=next step
+    ; [rsp+48]=next relative start [rsp+56]=scratch
+    xor eax, eax
+    cmp qword [sel_path_yes], 0
+    je .ret
+    cmp qword [res_ig], 1
+    jne .ret
+    ; /proc/self/fd/<root_fd>
+    lea rdi, [probe_buf]
+    lea rsi, [proc_fd]
+    mov ecx, 14
+    rep movsb
+    mov rax, [root_fd]
+    xor ecx, ecx
+    mov r10d, 10
+.digits:
+    xor edx, edx
+    div r10
+    add dl, '0'
+    push rdx
+    inc ecx
+    test rax, rax
+    jnz .digits
+.pop:
+    pop rdx
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .pop
+    mov byte [rdi], 0
+    mov eax, 89                      ; readlink
+    lea rdi, [probe_buf]
+    lea rsi, [real_buf]
+    mov edx, PATH_MAX
+    syscall
+    test rax, rax
+    js bad_path_resolve
+    cmp rax, PATH_MAX
+    jae bad_path_resolve
+    mov [rsp+0], rax
+.trim:
+    cmp rax, 1
+    jbe .trimmed
+    cmp byte [real_buf+rax-1], '/'
+    jne .trimmed
+    dec rax
+    jmp .trim
+.trimmed:
+    mov [rsp+0], rax
+    mov r8, rax                      ; probe starts at the selected root
+.probe:
+    mov [rsp+8], r8
+    lea rdi, [probe_buf]
+    lea rsi, [real_buf]
+    mov rdx, r8
+    lea rcx, [gitname]
+    call join_path
+    mov rax, 262                     ; newfstatat
+    mov rdi, AT_FDCWD
+    lea rsi, [probe_buf]
+    lea rdx, [r14+statbuf]
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    js .try_jj
+    mov eax, [r14+statbuf+24]
+    and eax, 0xF000
+    cmp eax, 0x4000                  ; .git directory
+    je .found_repo
+    cmp eax, 0x8000                  ; .git file
+    je .found_repo
+.try_jj:
+    mov r8, [rsp+8]
+    lea rdi, [probe_buf]
+    lea rsi, [real_buf]
+    mov rdx, r8
+    lea rcx, [jjname]
+    call join_path
+    mov rax, 262
+    mov rdi, AT_FDCWD
+    lea rsi, [probe_buf]
+    lea rdx, [r14+statbuf]
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    js .up
+    mov eax, [r14+statbuf+24]
+    and eax, 0xF000
+    cmp eax, 0x4000                  ; .jj must be a directory
+    je .found_repo
+.up:
+    mov r8, [rsp+8]
+    cmp r8, 1
+    jbe .no_repo
+.uploop:
+    dec r8
+    cmp byte [real_buf+r8], '/'
+    jne .uploop
+    test r8, r8
+    jz .at_root
+    jmp .probe
+.at_root:
+    mov r8, 1
+    jmp .probe
+.found_repo:
+    mov rax, [rsp+8]
+    mov [rsp+16], rax
+    mov qword [git_repo], 1
+    ; repository-relative match path
+    mov rcx, [rsp+0]
+    sub rcx, rax
+    jz .rel_empty
+    mov rdx, [rsp+16]
+    cmp byte [real_buf+rdx], '/'
+    jne bad_path_resolve
+    lea rdx, [real_buf+rdx+1]
+    dec rcx
+    mov [rsp+24], rcx
+    mov [rsp+32], rdx
+    jmp .rel_ready
+.rel_empty:
+    mov qword [rsp+24], 0
+    mov qword [rsp+32], 0
+.rel_ready:
+    ; metadata pruning: a root equal to or below .git/.jj
+    mov rax, [rsp+24]
+    test rax, rax
+    jnz .scan_rel
+    mov rcx, [rsp+0]
+    mov r9, rcx
+.bloop:
+    test r9, r9
+    jz .bzero
+    dec r9
+    cmp byte [real_buf+r9], '/'
+    jne .bloop
+    lea rdi, [real_buf+r9+1]
+    mov rsi, [rsp+0]
+    sub rsi, r9
+    dec rsi
+    call is_meta_name
+    test eax, eax
+    jnz .skip
+    jmp .meta_done
+.bzero:
+    lea rdi, [real_buf]
+    mov rsi, [rsp+0]
+    call is_meta_name
+    test eax, eax
+    jnz .skip
+    jmp .meta_done
+.scan_rel:
+    xor r8d, r8d
+.scan_comp:
+    mov r11, [rsp+32]
+    mov rcx, r8
+.scan_slash:
+    cmp rcx, [rsp+24]
+    jae .scan_last
+    cmp byte [r11+rcx], '/'
+    je .scan_end
+    inc rcx
+    jmp .scan_slash
+.scan_end:
+    lea rdi, [r11+r8]
+    mov rsi, rcx
+    sub rsi, r8
+    call is_meta_name
+    test eax, eax
+    jnz .skip
+    inc rcx
+    mov r8, rcx
+    jmp .scan_comp
+.scan_last:
+    lea rdi, [r11+r8]
+    mov rsi, [rsp+24]
+    sub rsi, r8
+    call is_meta_name
+    test eax, eax
+    jnz .skip
+.meta_done:
+    ; publish the ignore match path for this root and its descendants
+    mov rcx, [rsp+24]
+    mov [r14+ign_len], rcx
+    test rcx, rcx
+    jz .ign_ready
+    mov rsi, [rsp+32]
+    lea rdi, [r14+ign_buf]
+    rep movsb
+    mov byte [rdi], 0
+.ign_ready:
+    ; ancestors: the repository root, then each directory down to the
+    ; selected root's parent, all in parent-to-child order
+    lea rsi, [real_buf]
+    lea rdi, [repo_buf]
+    mov rcx, [rsp+16]
+    rep movsb
+    mov byte [rdi], 0
+    mov rbx, [rsp+16]                ; repository path length
+    cmp qword [rsp+24], 0
+    je .root_check
+    lea rdi, [repo_buf]
+    mov rsi, rbx
+    xor edx, edx                     ; repository root prefix is empty
+    call load_ignore
+    xor r8d, r8d
+.anc_loop:
+    mov r11, [rsp+32]
+    mov rcx, r8
+.anc_find:
+    cmp rcx, [rsp+24]
+    jae .root_check                  ; no slash: this is the selected root
+    cmp byte [r11+rcx], '/'
+    je .anc_comp
+    inc rcx
+    jmp .anc_find
+.anc_comp:
+    mov r9, rcx
+    sub r9, r8                       ; component length
+    lea rdi, [repo_buf+rbx]
+    mov byte [rdi], '/'
+    inc rdi
+    inc rbx
+    lea rsi, [r11+r8]
+    mov rcx, r9
+    rep movsb
+    add rbx, r9
+    lea rax, [r8+r9]
+    inc rax
+    mov [rsp+48], rax                ; next component start
+    mov rdx, rax                     ; prefix ends after this component + '/'
+    lea rdi, [repo_buf]
+    mov rsi, rbx
+    call load_ignore
+    mov r8, [rsp+48]
+    jmp .anc_loop
+.root_check:
+    cmp qword [rsp+24], 0
+    je .not_ignored
+    cmp qword [r14+ig_chain], 0
+    je .not_ignored                  ; no inherited rules: nothing can ignore it
+    xor r8d, r8d                     ; component start in the relative path
+.prefix_loop:
+    mov rcx, r8
+.prefix_find:
+    cmp rcx, [rsp+24]
+    jae .prefix_last
+    cmp byte [r14+ign_buf+rcx], '/'
+    je .prefix_boundary
+    inc rcx
+    jmp .prefix_find
+.prefix_boundary:
+    mov byte [r14+ign_buf+rcx], 0    ; check this ancestor on its own
+    lea rdi, [r14+ign_buf+r8]
+    lea rsi, [r14+ign_buf]
+    mov edx, 1
+    push rcx
+    call ig_ignored
+    pop rcx
+    mov byte [r14+ign_buf+rcx], '/'
+    test al, al
+    jnz .skip
+    lea r8, [rcx+1]
+    jmp .prefix_loop
+.prefix_last:
+    lea rdi, [r14+ign_buf+r8]
+    lea rsi, [r14+ign_buf]
+    mov edx, 1
+    call ig_ignored
+    test al, al
+    jnz .skip
+.not_ignored:
+    xor eax, eax
+    jmp .ret
+.no_repo:
+    xor eax, eax                     ; --gitignore stays inactive for this root
+    jmp .ret
+.skip:
+    mov eax, 1
+.ret:
+    add rsp, 64
+    pop r15
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+root_ign_setup.end_func:
+
 ; walk_group: rdi = GRP.  Saves the caller's walk context, executes the group's
 ; directory or range body, marks it DONE, then helps any child groups that are
 ; still NEW.  f_deep is deliberately preserved: an inline child runs while the
@@ -2158,7 +2890,7 @@ walk_group:
     push rbp
     push r12
     push r13
-    sub rsp, 96
+    sub rsp, 112
     mov rax, [r14+TSTATE.no_split]
     mov [rsp+0], rax
     mov rax, [r14+path_len]
@@ -2183,6 +2915,10 @@ walk_group:
     mov [rsp+80], rax
     mov rax, [r14+TSTATE.tab_n]
     mov [rsp+88], rax
+    mov rax, [r14+ign_len]
+    mov [rsp+96], rax
+    mov rax, [r14+ign_entry]
+    mov [rsp+104], rax
     mov rbx, rdi
     mov [r14+cur_grp], rbx
     mov qword [r14+cur_task], 0
@@ -2200,20 +2936,41 @@ walk_group:
     mov rax, [rbx+GRP_CHAIN]
     mov [r14+ig_chain], rax
     mov qword [r14+ig_nrules], 0
+    mov rcx, [rbx+GRP_IGNLEN]
+    mov [r14+ign_len], rcx
+    mov rsi, [rbx+GRP_IGNPATH]
+    test rcx, rcx
+    jz .ign_ready
+    lea rdi, [r14+ign_buf]
+    rep movsb
+.ign_ready:
     mov qword [r14+TSTATE.parent_fd], -1
     lea rax, [root_grp]
     cmp rbx, rax
-    je .root_group
+    jne .not_root_group
+    call root_ign_setup
+    test eax, eax
+    jnz .root_skip
+    jmp .dispatch
+.not_root_group:
     cmp qword [root_width], NESTED_WIDTH_MAX
-    jbe .root_group
+    jbe .dispatch
     mov qword [r14+TSTATE.no_split], 1
-.root_group:
+.dispatch:
     cmp dword [rbx+GRP_KIND], GRP_RANGE
     je .range
     call walk_dir
     jmp .body_done
 .range:
     call walk_range
+    jmp .body_done
+.root_skip:                          ; inherited rules hide the selected root
+    mov rdi, [root_fd]
+    test rdi, rdi
+    js .body_done
+    mov rax, 3
+    syscall
+    mov qword [root_fd], -1
 .body_done:
     mov rdi, [r14+cur_task]
     test rdi, rdi
@@ -2251,7 +3008,11 @@ walk_group:
     mov [r14+TSTATE.tab_ptr], rax
     mov rax, [rsp+88]
     mov [r14+TSTATE.tab_n], rax
-    add rsp, 96
+    mov rax, [rsp+96]
+    mov [r14+ign_len], rax
+    mov rax, [rsp+104]
+    mov [r14+ign_entry], rax
+    add rsp, 112
     pop r13
     pop r12
     pop rbp
@@ -2272,9 +3033,10 @@ push_group:
     jmp notify_ev
 push_group.end_func:
 
-; make_group: rdi = path length.  Copies path_buf[0..len) and the current ignore
-; chain into a fully initialised NEW directory group and pushes it.  The group
-; is not linked yet; the wide prepass builds all siblings before publishing.
+; make_group: rdi = display path length. Copies path_buf[0..len), the current
+; ignore match path (ign_buf[0..ign_entry)) and the current ignore chain into
+; a fully initialised NEW directory group and pushes it. The group is not
+; linked yet; the wide prepass builds all siblings before publishing.
     global make_group:function (make_group.end_func - make_group)
 make_group:
     lock inc qword [group_count]
@@ -2282,7 +3044,9 @@ make_group:
     push rbp
     push r12
     push r13
+    push r15
     mov r12, rdi
+    mov r15, [r14+ign_entry]
     mov rdi, GRP_SZ
     call alloc
     mov rbx, rax
@@ -2294,6 +3058,14 @@ make_group:
     mov rcx, r12
     rep movsb
     mov byte [rdi], 0
+    lea rdi, [r15+1]
+    call alloc
+    mov rbp, rax
+    lea rsi, [r14+ign_buf]
+    mov rdi, rbp
+    mov rcx, r15
+    rep movsb
+    mov byte [rdi], 0
     mov qword [rbx+GRP_WORK_NEXT], 0
     mov qword [rbx+GRP_ITEM_NEXT], 0
     mov dword [rbx+GRP_STATE], GRP_NEW
@@ -2302,6 +3074,8 @@ make_group:
     mov qword [rbx+GRP_LAST], 0
     mov [rbx+GRP_PATH], r13
     mov [rbx+GRP_PATHLEN], r12
+    mov [rbx+GRP_IGNPATH], rbp
+    mov [rbx+GRP_IGNLEN], r15
     mov rax, [r14+ig_chain]
     mov [rbx+GRP_CHAIN], rax
     mov qword [rbx+GRP_TAB], 0
@@ -2310,6 +3084,7 @@ make_group:
     mov rdi, rbx
     call push_group
     mov rax, rbx
+    pop r15
     pop r13
     pop r12
     pop rbp
@@ -3930,6 +4705,169 @@ die:                                 ; rsi, rdx = message; exits 1
     syscall
 die.end_func:
 
+; append_quoted: rsi = NUL-terminated token, rdi = destination. Copies it
+; inside a single-quoted shell word, spelling ' as '\'' so the bytes survive.
+    global append_quoted:function (append_quoted.end_func - append_quoted)
+append_quoted:
+    mov al, [rsi]
+    test al, al
+    jz .ret
+    cmp al, 0x27                     ; '
+    jne .plain
+    mov dword [rdi], 0x27275c27      ; '\''
+    add rdi, 4
+    inc rsi
+    jmp append_quoted
+.plain:
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp append_quoted
+.ret:
+    ret
+append_quoted.end_func:
+
+; errno_name: edi = positive errno -> rax = symbolic name, rdx = length
+    global errno_name:function (errno_name.end_func - errno_name)
+errno_name:
+    lea rax, [errno_table]
+.loop:
+    lea rcx, [errno_table_end]
+    cmp rax, rcx
+    jae .unknown
+    cmp dword [rax+8], edi
+    je .found
+    add rax, 16
+    jmp .loop
+.found:
+    mov edx, [rax+12]
+    mov rax, [rax]
+    ret
+.unknown:
+    lea rax, [errno_e_unknown]
+    mov edx, errno_e_unknown_e - errno_e_unknown
+    ret
+errno_name.end_func:
+
+; fail_errbuf: rdi = one past the message in err_buf; write stderr and exit 1
+    global fail_errbuf:function (fail_errbuf.end_func - fail_errbuf)
+fail_errbuf:
+    lea rsi, [err_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov edi, 2
+    mov eax, 1
+    syscall
+    mov edi, 1
+    mov eax, 231
+    syscall
+fail_errbuf.end_func:
+
+; die_unexpected: rdi = token, esi = 0 for "unexpected argument", 1 for
+; "unexpected path argument"; exits 1.
+    global die_unexpected:function (die_unexpected.end_func - die_unexpected)
+die_unexpected:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12d, esi
+    lea rdi, [err_buf]
+    test r12d, r12d
+    jz .plain
+    lea rsi, [e_unexp_path]
+    mov ecx, e_unexp_path_e - e_unexp_path
+    jmp .copy
+.plain:
+    lea rsi, [e_unexp_arg]
+    mov ecx, e_unexp_arg_e - e_unexp_arg
+.copy:
+    rep movsb
+    mov rsi, rbx
+    call append_quoted
+    mov byte [rdi], 0x27
+    inc rdi
+    mov byte [rdi], 10
+    inc rdi
+    jmp fail_errbuf
+die_unexpected.end_func:
+
+; die_start_path: rdi = path, esi = 0 does not exist, 1 not a directory,
+; 2 too long, 3 cannot open, 4 cannot read. edx = positive errno for 3 and 4.
+    global die_start_path:function (die_start_path.end_func - die_start_path)
+die_start_path:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12d, esi
+    mov r13d, edx
+    lea rdi, [err_buf]
+    cmp r12d, 3
+    jae .cannot
+    lea rsi, [e_start_path]
+    mov ecx, e_start_path_e - e_start_path
+    rep movsb
+    mov rsi, rbx
+    call append_quoted
+    mov byte [rdi], 0x27
+    inc rdi
+    mov byte [rdi], ' '
+    inc rdi
+    cmp r12d, 0
+    je .m0
+    cmp r12d, 1
+    je .m1
+    lea rsi, [e_too_long]
+    mov ecx, e_too_long_e - e_too_long
+    rep movsb
+    jmp .newline
+.m0:
+    lea rsi, [e_not_exist]
+    mov ecx, e_not_exist_e - e_not_exist
+    rep movsb
+    jmp .newline
+.m1:
+    lea rsi, [e_not_dir]
+    mov ecx, e_not_dir_e - e_not_dir
+    rep movsb
+    jmp .newline
+.cannot:
+    cmp r12d, 3
+    jne .read
+    lea rsi, [e_cannot_open]
+    mov ecx, e_cannot_open_e - e_cannot_open
+    jmp .cannot_prefix
+.read:
+    lea rsi, [e_cannot_read]
+    mov ecx, e_cannot_read_e - e_cannot_read
+.cannot_prefix:
+    rep movsb
+    lea rsi, [e_start_path_mid]
+    mov ecx, e_start_path_mid_e - e_start_path_mid
+    rep movsb
+    mov rsi, rbx
+    call append_quoted
+    mov byte [rdi], 0x27
+    inc rdi
+    mov byte [rdi], ' '
+    inc rdi
+    mov byte [rdi], '('
+    inc rdi
+    mov r8, rdi
+    mov edi, r13d
+    call errno_name
+    mov rsi, rax
+    mov rcx, rdx
+    mov rdi, r8
+    rep movsb
+    mov byte [rdi], ')'
+    inc rdi
+.newline:
+    mov byte [rdi], 10
+    inc rdi
+    jmp fail_errbuf
+die_start_path.end_func:
+
 wfail:
     lea rsi, [e_write]
     mov rdx, e_write_e - e_write
@@ -3938,6 +4876,26 @@ wfail:
 bad_args:
     lea rsi, [e_arg]
     mov rdx, e_arg_e - e_arg
+    jmp die
+
+bad_path_missing:
+    lea rsi, [e_path_missing]
+    mov rdx, e_path_missing_e - e_path_missing
+    jmp die
+
+bad_path_empty:
+    lea rsi, [e_path_empty]
+    mov rdx, e_path_empty_e - e_path_empty
+    jmp die
+
+bad_path_repeat:
+    lea rsi, [e_path_repeat]
+    mov rdx, e_path_repeat_e - e_path_repeat
+    jmp die
+
+bad_path_resolve:
+    lea rsi, [e_path_resolve]
+    mov rdx, e_path_resolve_e - e_path_resolve
     jmp die
 
 bad_limit:
@@ -4369,19 +5327,48 @@ ig_add_line:
     add rdx, rcx
     mov [rdx], rdi
     mov [rdx+8], r11                 ; flags
-    mov rcx, rbx                     ; prefix includes the trailing '/'
-    test rcx, rcx
-    jz .base
-    inc rcx
-.base:
+    mov rcx, [r14+ig_prefix]         ; 0 at a repository root; else len+1
     mov [rdx+16], rcx
     inc qword [r14+ig_nrules]
 .ret:
     ret
 ig_add_line.end_func:
 
-; load_ignore: read this directory's .gitignore (if this is a repo) into
-; igbuf and append its rules; rbx = directory path length.
+; join_path: rdi = destination, rsi = base, rdx = base length, rcx =
+; NUL-terminated suffix. Copies base, inserts '/' only when the base is
+; non-empty and does not already end in '/', then copies the suffix and its
+; NUL. Returns rax = total length. Clobbers rsi, rdi, rcx, rdx, r8-r10.
+    global join_path:function (join_path.end_func - join_path)
+join_path:
+    mov r10, rcx                     ; the suffix
+    mov r9, rdx                      ; running length
+    mov rcx, rdx
+    rep movsb
+    test r9, r9
+    jz .nosep
+    cmp byte [rdi-1], '/'
+    je .nosep
+    mov byte [rdi], '/'
+    inc rdi
+    inc r9
+.nosep:
+    mov rcx, r10
+.copy:
+    mov al, [rcx]
+    mov [rdi], al
+    inc rcx
+    inc rdi
+    inc r9
+    test al, al
+    jnz .copy
+    mov rax, r9
+    dec rax                          ; length without the NUL
+    ret
+join_path.end_func:
+
+; load_ignore: read a directory's .gitignore into igbuf and append its rules.
+; rdi = directory path, rsi = its length, rdx = rule prefix length (0 at a
+; repository root, otherwise the ignore match path length + 1).
 ; If it added any, publish a chain node holding a copy of the whole active
 ; rule stack, so child groups created below it keep their ancestors' rules.
     global load_ignore:function (load_ignore.end_func - load_ignore)
@@ -4392,28 +5379,21 @@ load_ignore:
     sub rsp, 32
     cmp qword [git_repo], 0
     je .ret
-    mov [rsp], rbx                   ; ig_add_line wants the prefix length
+    mov [rsp], rdi                   ; directory path
+    mov [rsp+8], rsi                 ; its length
+    mov [rsp+16], rdx                ; rule prefix length
     mov rbx, [r14+ig_nrules]
-    mov [rsp+16], rbx                ; rules before this file
-    mov rbx, [rsp]                   ; the directory's path length
-    lea rdi, [r14+path_buf]
-    add rdi, rbx
-    test rbx, rbx
-    jz .nols
-    mov byte [rdi], '/'
-    inc rdi
-.nols:
-    lea rsi, [igname]
-.cp:
-    mov al, [rsi]
-    mov [rdi], al
-    inc rdi
-    inc rsi
-    test al, al
-    jnz .cp
+    mov [rsp+24], rbx                ; rules before this file
+    lea rdi, [r14+TSTATE.ig_path]
+    mov rsi, [rsp]
+    mov rdx, [rsp+8]
+    lea rcx, [igname]
+    call join_path
+    cmp rax, PATH_MAX + 15
+    ja .ret                          ; cannot even name it: leave rules off
     mov rax, 257                     ; openat
     mov rdi, AT_FDCWD
-    lea rsi, [r14+path_buf]
+    lea rsi, [r14+TSTATE.ig_path]
     xor edx, edx
     xor r10d, r10d
     syscall
@@ -4449,6 +5429,8 @@ load_ignore:
     syscall
     test r10, r10
     jz .ret
+    mov rax, [rsp+16]
+    mov [r14+ig_prefix], rax
     lea r8, [r14+igbuf]
     lea r9, [r8+r10]                 ; end of content
 .line:
@@ -4467,13 +5449,11 @@ load_ignore:
     inc rsi
     mov rdi, r8
     mov r8, rsi
-    mov rbx, [rsp]
     call ig_add_line
     jmp .line
 .eof:
     mov byte [r9], 0                 ; buffer keeps a byte for this NUL
     mov rdi, r8
-    mov rbx, [rsp]
     call ig_add_line
     jmp .publish                     ; that was the last line: r8 cannot advance
 .publish:
@@ -4484,13 +5464,13 @@ load_ignore:
     call ig_alloc
     mov rbx, rax                     ; the node
     mov rcx, [r14+ig_nrules]
-    sub rcx, [rsp+16]                ; only this directory's own rules
+    sub rcx, [rsp+24]                ; only this directory's own rules
     mov [rbx+NODE_NRULES], rcx
     mov rcx, [r14+ig_chain]
     mov [rbx+NODE_PARENT], rcx
     mov [r14+ig_chain], rbx
     mov rcx, [r14+ig_nrules]
-    sub rcx, [rsp+16]
+    sub rcx, [rsp+24]
     shl rcx, 5
     push rcx
     mov rdi, rcx
@@ -4499,11 +5479,11 @@ load_ignore:
     mov [rbx+NODE_RULES], rax
     mov rdi, rax
     lea rsi, [r14+ig_rules]
-    mov rdx, [rsp+16]
+    mov rdx, [rsp+24]
     shl rdx, 5
     add rsi, rdx                     ; this level's first rule
     rep movsb
-    mov rax, [rsp+16]                ; rules are copied into the node: free the
+    mov rax, [rsp+24]                ; rules are copied into the node: free the
     mov [r14+ig_nrules], rax         ; scratch slots, so IG_MAX is per directory
 .ret:
     add rsp, 32
@@ -4672,6 +5652,16 @@ try_range_split:
     mov rdi, rax
     rep movsb
     mov byte [rdi], 0
+    mov rax, [r14+ign_len]
+    mov [rsp+104], rax               ; ignore match path length
+    lea rdi, [rax+1]
+    call alloc
+    mov [rsp+112], rax               ; ignore match path copy
+    mov rcx, [rsp+104]
+    lea rsi, [r14+ign_buf]
+    mov rdi, rax
+    rep movsb
+    mov byte [rdi], 0
 
     mov rbx, [rsp+24]                ; source index
     mov r13, [rsp+72]                ; names cursor
@@ -4713,6 +5703,10 @@ try_range_split:
     mov [rbx+GRP_PATH], rax
     mov rax, [rsp+80]
     mov [rbx+GRP_PATHLEN], rax
+    mov rax, [rsp+112]
+    mov [rbx+GRP_IGNPATH], rax
+    mov rax, [rsp+104]
+    mov [rbx+GRP_IGNLEN], rax
     mov rax, [r14+ig_chain]
     mov [rbx+GRP_CHAIN], rax
     mov rax, [rsp+64]
@@ -4989,7 +5983,7 @@ walk_wide:
     mov qword [rsp+48], 1
 .ignore_path_ready:
     mov rdi, r12
-    lea rsi, [r14+path_buf]
+    lea rsi, [r14+ign_buf]
     xor edx, edx
     cmp r13b, DT_DIR
     sete dl
@@ -5105,13 +6099,15 @@ walk_dir:
     push r13
     push r14
     push r15
-    sub rsp, 64
+    sub rsp, 96
     ; [rsp]=saved ig_nrules [rsp+8]=saved chain [rsp+16]=count
     ; [rsp+24]=sort table [rsp+32]=split [rsp+40]=dir fd (-1: none/closed)
     ; [rsp+48]=scratch mark
     ; [rsp+56]=while parsing: this directory lists a .gitignore (as git_repo:
-    ;          so 0 unless --gitignore was given and cwd contains .git or .jj); while iterating:
+    ;          so 0 unless --gitignore was given and a repository was found); while iterating:
     ;          the current entry's resolved type
+    ; [rsp+64]=this directory's ignore match path length
+    ; [rsp+72]=1 when the selected-root descriptor was consumed below
     mov rax, [r14+ig_nrules]
     mov [rsp], rax
     mov rax, [r14+ig_chain]
@@ -5128,6 +6124,9 @@ walk_dir:
     mov [rsp+48], rax                ; everything this frame allocates dies at .fin
     mov qword [rsp+56], 0            ; no .gitignore seen yet
     mov qword [rsp+40], -1           ; no directory open yet
+    mov qword [rsp+72], 0            ; not the selected root
+    mov rax, [r14+ign_len]
+    mov [rsp+64], rax                ; base ignore match path length
     mov rbx, [r14+path_len]
     mov r12, [r14+f_deep]
     inc qword [r14+f_deep]
@@ -5136,6 +6135,14 @@ walk_dir:
     jz .open
     lea rdi, [r14+path_buf]
 .open:
+    mov rax, [root_fd]               ; the selected root, already validated
+    test rax, rax
+    js .normal_open
+    mov qword [root_fd], -1           ; walk_dir now owns and closes it
+    mov [rsp+40], rax
+    mov qword [rsp+72], 1
+    jmp .opened
+.normal_open:
     mov rsi, rdi                     ; the path, from the current directory
     mov rdi, [r14+TSTATE.parent_fd]
     mov qword [r14+TSTATE.parent_fd], -1
@@ -5151,15 +6158,17 @@ walk_dir:
     xor r10d, r10d
     syscall
     test rax, rax
-    js .fin                          ; unreadable directory: fd skips it
+    js .fin                          ; unreadable child: fd skips it
     mov [rsp+40], rax
+.opened:
     mov rax, 217                     ; getdents64
     mov rdi, [rsp+40]
     lea rsi, [r14+ent_buf]
     mov rdx, ENT_BUF
     syscall
     test rax, rax
-    jle .collected
+    js .read_error
+    jz .collected
     lea rsi, [r14+ent_buf]
     lea r10, [rsi+rax]               ; end of this getdents batch
     LAST_BATCH
@@ -5305,10 +6314,19 @@ walk_dir:
     mov rdx, ENT_BUF
     syscall
     test rax, rax
-    jle .collected
+    js .read_error
+    jz .collected
     lea r10, [rsi+rax]               ; this batch's end, not the first one's
     LAST_BATCH
     jmp .parse
+.read_error:
+    cmp qword [rsp+72], 0
+    je .collected                    ; child-directory errors keep the old skip
+    neg rax
+    mov edx, eax
+    lea rdi, [r14+path_buf]
+    mov esi, 4                       ; cannot read starting path (ERRNO)
+    call die_start_path
 .collected:
     cmp r12, [fd_keep]               ; r12 = this directory's depth in the walk
     jb .keep_open                    ; subdirectories will open relative to it
@@ -5323,7 +6341,14 @@ walk_dir:
     mov [rsp+24], rax
     cmp qword [rsp+56], 0
     je .no_ignore                    ; no .gitignore listed: nothing to open
-    call load_ignore                 ; only path_buf[path_len..) is touched
+    lea rdi, [r14+path_buf]
+    mov rsi, rbx
+    mov rdx, [r14+ign_len]
+    test rdx, rdx
+    jz .ig_load
+    inc rdx                          ; rules live one level below this directory
+.ig_load:
+    call load_ignore
 .no_ignore:
 
     ; split decision: a narrow first level may split recursively; when the
@@ -5438,9 +6463,9 @@ walk_dir:
     test rax, rax
     jz .check_match
 .ig_check:
-    call .mkpath                     ; ig_ignored() wants the path
+    call .mkpath                     ; ig_ignored() wants the match path
     mov rdi, r12
-    lea rsi, [r14+path_buf]
+    lea rsi, [r14+ign_buf]
     mov rdx, r13
     call ig_ignored
     test al, al
@@ -5477,38 +6502,75 @@ walk_dir:
     test r13, r13
     jz .next
     mov [r14+path_len], rbp
+    mov rax, [r14+ign_entry]
+    mov [r14+ign_len], rax
     mov rax, [rsp+40]
     mov [r14+TSTATE.parent_fd], rax  ; -1 if this directory is closed already
     mov [r14+TSTATE.child_name], r12
     call walk_dir
     mov [r14+path_len], rbx
+    mov rax, [rsp+64]
+    mov [r14+ign_len], rax
 .next:
     inc r15
     jmp .iter_check
 
-; mkpath: copy the entry name (r12) after the directory path in path_buf;
-; rbp = the entry's path length. Plain files that neither match nor carry
-; ignore rules skip this: most entries are those.
+; mkpath: append the entry name (r12) to the display path in path_buf and,
+; independently, to the repository-relative ignore match path in ign_buf.
+; rbp = display entry length; [r14+ign_entry] = ignore match length. Joining
+; is separator-aware: "/" never gains a second slash, "." gains one.
+; Plain files that neither match nor carry ignore rules skip this: most
+; entries are those.
 .mkpath:
     lea rdi, [r14+path_buf]
     add rdi, rbx
     test rbx, rbx
-    jz .nols
+    jz .dnosep
+    cmp byte [rdi-1], '/'
+    je .dnosep
     mov byte [rdi], '/'
     inc rdi
-.nols:
+.dnosep:
     mov rsi, r12
-.cp:
+.dcp:
     mov al, [rsi]
     mov [rdi], al
     inc rsi
     inc rdi
     test al, al
-    jnz .cp
+    jnz .dcp
     lea rax, [r14+path_buf]
     sub rdi, rax
     dec rdi
-    mov rbp, rdi                     ; entry path length
+    mov rbp, rdi                     ; display entry path length
+
+    cmp qword [git_repo], 0
+    jne .ign_copy
+    mov qword [r14+ign_entry], 0     ; no ignore rules: keep the match path empty
+    ret
+.ign_copy:
+    mov rcx, [r14+ign_len]
+    lea rdi, [r14+ign_buf]
+    add rdi, rcx
+    test rcx, rcx
+    jz .inosep
+    cmp byte [rdi-1], '/'
+    je .inosep
+    mov byte [rdi], '/'
+    inc rdi
+.inosep:
+    mov rsi, r12
+.icp:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz .icp
+    lea rax, [r14+ign_buf]
+    sub rdi, rax
+    dec rdi
+    mov [r14+ign_entry], rdi
     ret
 .fin:
     mov rdi, [rsp+40]
@@ -5524,7 +6586,7 @@ walk_dir:
     mov [r14+ig_nrules], rax
     mov rax, [rsp+8]
     mov [r14+ig_chain], rax
-    add rsp, 64
+    add rsp, 96
     pop r15
     pop r14
     pop r13
@@ -5546,6 +6608,8 @@ walk_range:
     push r15
     sub rsp, 32
     mov rbx, [r14+path_len]          ; base path length
+    mov rax, [r14+ign_len]
+    mov [rsp+8], rax                 ; base ignore match length
     xor r15d, r15d
 .loop:
     mov rax, [r14+cur_grp]
@@ -5608,7 +6672,7 @@ walk_range:
     test rax, rax
     jz .check_match
     mov rdi, r12
-    lea rsi, [r14+path_buf]
+    lea rsi, [r14+ign_buf]
     mov rdx, r13
     call ig_ignored
     test al, al
@@ -5639,10 +6703,14 @@ walk_range:
     test r13, r13
     jz .next
     mov [r14+path_len], rbp
+    mov rax, [r14+ign_entry]
+    mov [r14+ign_len], rax
     mov qword [r14+TSTATE.parent_fd], -1
     mov [r14+TSTATE.child_name], r12
     call walk_dir
     mov [r14+path_len], rbx
+    mov rax, [rsp+8]
+    mov [r14+ign_len], rax
 .next:
     inc r15
     jmp .loop
