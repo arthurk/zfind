@@ -5,3 +5,4 @@ core.*
 testdata/
 __pycache__
 build
+perf.data*
