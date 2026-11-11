@@ -3,17 +3,34 @@ name: Release
 on:
   push:
     tags:
-      - '**'
+      - 'v[0-9]*'
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-26.04
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the tag is a version on main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD FETCH_HEAD
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
@@ -22,8 +39,33 @@ jobs:
         run: |
           nix develop -c make test release
           install -D -m 755 build/x86_64/zfind.release dist/zfind-linux-x86_64-v3
+          (cd dist && sha256sum zfind-linux-x86_64-v3 > zfind-linux-x86_64-v3.sha256)
 
-      - name: Publish release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          files: dist/zfind-linux-x86_64-v3
+      - name: Create or refresh release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets=(
+            dist/zfind-linux-x86_64-v3
+            dist/zfind-linux-x86_64-v3.sha256
+          )
+          state=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+          case "$state" in
+            true)
+              gh release upload "$TAG" "${assets[@]}" --clobber
+              ;;
+            false)
+              echo "::error::release $TAG is already published; refusing to modify it" >&2
+              exit 1
+              ;;
+            *)
+              gh release create "$TAG" "${assets[@]}" \
+                --draft \
+                --verify-tag \
+                --title "$TAG"
+              ;;
+          esac
+          url=$(gh release view "$TAG" --json url --jq '.url')
+          echo "Release draft: $url" >> "$GITHUB_STEP_SUMMARY"
