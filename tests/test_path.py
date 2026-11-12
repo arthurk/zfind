@@ -150,10 +150,24 @@ class TestPositionalClassification:
             out=b"".join(name + b"\n" for name in expected), err=b"", status=0
         )
 
-    def test_path_and_pattern_work_in_either_order(self, binary: Path, tree: Path):
-        expected = Result(out=b"./src/keep.txt\n", err=b"", status=0)
-        assert run_in(binary, tree, "keep", "./src") == expected
-        assert run_in(binary, tree, "./src", "keep") == expected
+    def test_path_comes_before_pattern(self, binary: Path, tree: Path):
+        assert run_in(binary, tree, "./src", "keep") == Result(
+            out=b"./src/keep.txt\n", err=b"", status=0
+        )
+
+    def test_first_of_two_positionals_is_a_path_without_a_slash(
+        self, binary: Path, tree: Path
+    ):
+        assert run_in(binary, tree, "src", "keep") == Result(
+            out=b"src/keep.txt\n", err=b"", status=0
+        )
+
+    def test_pattern_before_path_is_a_starting_path_error(
+        self, binary: Path, tree: Path
+    ):
+        assert run_in(binary, tree, "keep", "./src") == failed(
+            b"zfind: starting path 'keep' does not exist\n"
+        )
 
     def test_double_dash_before_a_path_like_token_keeps_it_literal(
         self, binary: Path, tree: Path
@@ -165,15 +179,22 @@ class TestPositionalClassification:
             out=b"", err=b"", status=0
         )
 
-    def test_two_automatic_path_candidates_are_rejected(
+    def test_second_of_two_positionals_is_never_a_path_candidate(
         self, binary: Path, tree: Path
     ):
-        res = run_in(binary, tree, "./src", "./other")
-        assert res == failed(b"zfind: unexpected path argument './other'\n")
+        # Both tokens name directories; the second is still the pattern.
+        assert run_in(binary, tree, "./build", "build") == Result(
+            out=b"./build/build/\n", err=b"", status=0
+        )
+        # A path-like second token is a pattern, never a second candidate.
+        assert run_in(binary, tree, "./build", "./src") == Result(
+            out=b"", err=b"", status=0
+        )
 
-        # The later candidate is named even when neither one exists.
-        res = run_in(binary, tree, "./missing", "./absent")
-        assert res == failed(b"zfind: unexpected path argument './absent'\n")
+        # A missing first token is a path error, not a fallback to a pattern.
+        assert run_in(binary, tree, "./missing", "./absent") == failed(
+            b"zfind: starting path './missing' does not exist\n"
+        )
 
     def test_missing_automatic_candidate_falls_back_to_a_pattern(
         self, binary: Path, tree: Path
@@ -190,11 +211,15 @@ class TestPositionalClassification:
             out=b"", err=b"", status=0
         )
 
-    def test_fallback_that_leaves_two_patterns_names_the_later_token(
+    def test_two_positionals_never_fall_back_to_a_pattern(
         self, binary: Path, tree: Path
     ):
-        assert run_in(binary, tree, "./missing", "top") == failed(quoted("top"))
-        assert run_in(binary, tree, "top", "./missing") == failed(quoted("./missing"))
+        assert run_in(binary, tree, "./missing", "top") == failed(
+            b"zfind: starting path './missing' does not exist\n"
+        )
+        assert run_in(binary, tree, "top", "./missing") == failed(
+            b"zfind: starting path 'top' does not exist\n"
+        )
 
     def test_explicit_path_accepts_only_one_pattern(self, binary: Path, tree: Path):
         assert run_in(binary, tree, "--path", "src", "a", "b") == failed(
@@ -363,7 +388,7 @@ class TestRootValidationAndOutput:
     def test_overlong_diagnostic_is_truncated_not_crashing(
         self, binary: Path, tree: Path
     ):
-        res = run_in(binary, tree, "a", "x" * 130000)
+        res = run_in(binary, tree, ".", "a", "x" * 130000)
         assert res == failed(
             b"zfind: unexpected argument '" + b"x" * 4548 + b"'\n"
         )
@@ -453,17 +478,17 @@ class TestRootValidationAndOutput:
             out=b"", err=b"", status=0
         )
 
-    def test_limit_zero_still_classifies_an_automatic_candidate(
+    def test_limit_zero_still_validates_a_positional_path(
         self, binary: Path, tree: Path
     ):
         assert run_in(binary, tree, "--limit", "0", "./missing") == Result(
             out=b"", err=b"", status=0
         )
         assert run_in(binary, tree, "--limit", "0", "./missing", "top") == failed(
-            quoted("top")
+            b"zfind: starting path './missing' does not exist\n"
         )
-        assert run_in(binary, tree, "--limit", "0", "./src", "./other") == failed(
-            b"zfind: unexpected path argument './other'\n"
+        assert run_in(binary, tree, "--limit", "0", "./src", "./other") == Result(
+            out=b"", err=b"", status=0
         )
 
     def test_no_match_is_a_successful_empty_result(self, binary: Path, tree: Path):

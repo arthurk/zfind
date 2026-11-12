@@ -37,9 +37,9 @@ class TestCliBasics:
         assert res.out == b""
 
     def test_unexpected_positional_arguments_fail(self, zfind: ZfindRunner):
-        res = zfind("tiny", "pattern1", "pattern2")
+        res = zfind("tiny", "pattern1", "pattern2", "pattern3")
         assert res.status == 1, f"Expected exit 1: {res}"
-        assert res.err == b"zfind: unexpected argument 'pattern2'\n"
+        assert res.err == b"zfind: unexpected argument 'pattern3'\n"
         assert res.out == b""
 
     def test_double_dash_escapes_option_like_patterns(self, zfind: ZfindRunner):
