@@ -47,6 +47,45 @@ make test         # one line per test (pytest.ini sets -vv)
 
 - Use `make test-quiet` by default; do not re-read passing output.
 - Run a subset the same way: `make test-quiet T="tests/test_limit.py -k none"`.
+
+When a test run fails, identify the relevant test names before reading a
+large test file. Use `pytest --collect-only -q` or `grep -n 'def test_'` to
+locate them. Read the affected test functions and any fixtures or helpers they
+depend on. Expand the inspection when needed; do not read a whole large test
+file by default.
+
+For each changed behaviour, add at least one focused regression test that
+fails against the base revision and passes against the implementation. Run
+the test against both revisions using the appropriate binaries. Related
+tests that protect existing behaviour do not need to fail against the base
+revision. Record the base revision, command and result in the issue comment.
+
+Use the base commit SHA, not a moving branch name. Keep this check manual; do
+not add a script or Makefile target.
+
+For tests using the `binary` fixture, build the four binaries from the base
+revision in a throwaway worktree and supply their paths when running the test
+from the implementation checkout. For example, after creating the worktree
+and building it with `make -C /tmp/zfind-base test-quiet`:
+
+```sh
+ZFIND=/tmp/zfind-base/build/x86_64/zfind \
+ZFIND_SERIAL=/tmp/zfind-base/build/x86_64-serial/zfind \
+ZFIND_UNKNOWN=/tmp/zfind-base/build/x86_64-unknown/zfind \
+ZFIND_RANGE=/tmp/zfind-base/build/x86_64-range/zfind \
+    python3 -m pytest tests/test_path.py -k TEST_NAME
+```
+
+The baseline run must fail. Then run the same focused test against the
+implementation using the normal command, for example:
+
+```sh
+make test-quiet T="tests/test_path.py -k TEST_NAME"
+```
+
+Adapt the worktree path, test file and selector to the behaviour being
+changed. Remove the temporary worktree when finished.
+
 - For a behaviour change, change the code first, run `make test-quiet`, and
   update the tests it fails. Do not grep `tests/` up front.
 - Behaviour tests run against four builds: `parallel`, `serial`, `unknown` and
@@ -154,10 +193,10 @@ are present, stop and ask; never mix them into the issue. Branch with
    run `make test-quiet`, then add or extend the tests the gates name. Update
    the documentation the issue names: the header comment, `help_msg`,
    `README.md`, or `AGENTS.md`.
-6. All four builds matter: `make test` builds parallel, serial, unknown and
-   range. Run the gates on each (until #11 adds `scripts/allbuilds.py`, loop
-   over `build/x86_64{,-serial,-unknown,-range}/zfind`). For output that must
-   not change, build `main` in a throwaway worktree and diff.
+6. All four builds matter: `make test` and `make test-quiet` build and run
+   against parallel, serial, unknown and range, so one run covers all four.
+   For output that must not change, build `main` in a throwaway worktree and
+   diff.
 7. Give the `reviewer` subagent the issue and the diff, not your reasoning.
    Fix what it confirms.
 8. Stage only the files you changed (never `git add -A`), commit in small
