@@ -116,12 +116,12 @@ The repository includes a Nix flake for reproducible builds.
 ### Syntax
 
 ```text
-zfind [OPTIONS] [--path DIR] [--] [PATH] [PATTERN]
+zfind [OPTIONS] [PATH] [PATTERN]
 ```
 
-- **`PATH`** is an optional starting directory. Without `--path`, a positional token containing `/`, or the exact token `.` or `..`, is an automatic path candidate. If it names an accessible directory it becomes the starting directory; if it is missing or not a directory it is searched as a literal pattern instead. At most one automatic path candidate is accepted, and it may appear before or after `PATTERN`.
+- **`PATH`** is an optional starting directory and must come before `PATTERN`. When two positional arguments are given, the first is always the starting directory and the second is always the pattern; the first must be a directory, or `zfind` reports the starting-path error. With a single positional argument, a token containing `/`, or the exact token `.` or `..`, is an automatic path candidate. If it names an accessible directory it becomes the starting directory; if it is missing or not a directory it is searched as a literal pattern instead.
 - **`PATTERN`** is optional. When omitted, `zfind` lists every traversed entry (subject to `--type` and exclusion filters). When provided, it performs a literal substring search on entry names. Regex and glob expansions are not supported. At most one pattern is accepted.
-- **`--path DIR` / `--path=DIR`** selects the starting directory explicitly. Its value is always a path and never falls back to a pattern, which is how bare directory names are searched: `zfind --path src`.
+- **`--path DIR` / `--path=DIR`** selects the starting directory explicitly. Its value is always a path and never falls back to a pattern; it is how a bare directory name is searched when it is the only positional argument: `zfind --path src`.
 - **Options** must precede all positional arguments. Once a positional argument has appeared, another option or `--` is an unexpected argument.
 - **`--`** must appear before the first positional argument and explicitly terminates option parsing. Every following token is a literal pattern; this is necessary for path-like patterns and names beginning with a hyphen: `zfind -- ./src`, `zfind -- -draft`.
 - Because `.` and `..` are automatic path candidates, `zfind .` searches the current directory. Use `zfind -- .` to search for names containing a literal dot.
@@ -145,8 +145,8 @@ zfind --case=smart foo      # Smart case (the default); also undoes a configured
 zfind ./src                 # Search from src (root not printed)
 zfind src/                  # The trailing slash is stripped in output paths
 zfind ./src foo             # Starting directory src, pattern foo
-zfind foo ./src             # Same, path and pattern in either order
-zfind --path src            # Explicit path, needed for a bare directory name
+zfind foo ./src             # Error: the first token must be the directory
+zfind --path src            # Explicit path for a lone bare directory name
 zfind --path=src foo        # Explicit path with a pattern
 zfind -- ./src              # Literal pattern "./src", no path detection
 zfind --path src ./other    # Literal pattern "./other" under src
@@ -243,7 +243,7 @@ Scripts need no flag: piped output is plain by default. Add `--color=never` only
 ### Pattern Matching & Smart Case
 
 - **Literal Substrings:** `PATTERN` is checked directly against directory and file basenames. Glob patterns (`*`, `?`) and regular expressions are treated as raw literal bytes.
-- **Path Candidates Win First:** Before matching, a positional token containing `/`, or the exact token `.` or `..`, is tested as a starting directory. A successful directory open makes it the root; `ENOENT` and `ENOTDIR` turn it back into a pattern, while other open errors are reported. Use `--` to force a path-like token to be a pattern.
+- **Path Candidates Win First:** With a single positional argument, a token containing `/`, or the exact token `.` or `..`, is tested as a starting directory. A successful directory open makes it the root; `ENOENT` and `ENOTDIR` turn it back into a pattern, while other open errors are reported. Use `--` to force a path-like token to be a pattern. With two positional arguments no detection happens: the first token is the `PATH` and must open as a directory, and the second is the `PATTERN`.
 - **Smart Case (Default):** Matching is ASCII case-insensitive unless the query string contains at least one uppercase ASCII character (`A`–`Z`), in which case matching becomes case-sensitive.
 - **Explicit Modes:**
   - `--case=smart` (the default) applies smart case as described above.
