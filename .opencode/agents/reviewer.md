@@ -36,10 +36,19 @@ the result.
 
 ## Findings
 
-Report in severity order: critical, high, medium, low. For each finding give
-the file and line, the requirement or invariant it violates, a concrete
-failure scenario, and a concise recommendation. Separate confirmed defects
-from questions that need more evidence.
+Classify each finding as `major` or `minor`.
 
-If you find no substantive issue, say so and state the scope of the review.
-Never claim a test passed unless you saw it run.
+- `major`: A substantive problem that must be fixed before approval.
+- `minor`: A cosmetic or optional improvement that does not block approval.
+
+For each finding give the file and line, explain the problem, describe
+a concrete failure scenario where applicable, and recommend a fix.
+
+List major findings first, followed by minor findings. Do not request
+another review solely for minor findings.
+
+Finish with an explicit verdict:
+- APPROVED: no major findings.
+- CHANGES REQUIRED: one or more major findings.
+
+Separate confirmed defects from questions that need more evidence.
