@@ -583,7 +583,9 @@ class TestConfigErrors:
             b"zfind: invalid limit (expected a whole number or none)\n"
         )
         assert cfg("--bogus", "config") == failure(b"zfind: unknown option\n")
-        assert cfg("config", "extra") == failure(b"zfind: unexpected argument 'extra'\n")
+        assert cfg("config", "extra", "more") == failure(
+            b"zfind: unexpected argument 'more'\n"
+        )
 
     def test_opposing_modes_on_the_command_line_still_conflict(self, cfg: ConfigRunner):
         cfg.write("--no-hidden\n")
