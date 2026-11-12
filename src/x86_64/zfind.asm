@@ -1,19 +1,21 @@
 default rel                     ; x86-64: address labels RIP-relative, not via implicit ABS
 
 ; zfind, "simple search" use case only:
-;   zfind [--help] [--separator STR] [--case smart|sensitive|insensitive]
+;   zfind [OPTIONS] [PATH] [PATTERN]
+;         [--help] [--separator STR] [--case smart|sensitive|insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
 ;         [--exclude-name NAME] [--exclude-type f|d|l|b] [--limit N|none]
 ;         [--type f|d|l|b] [--color auto|always|never]
-;         [--config PATH | --no-config] [--path DIR] [--] [PATH] [PATTERN]
-; PATH is an optional starting directory. Without --path, a positional token
-; containing '/' or the exact tokens . and .. is an automatic path candidate:
-; if it opens as a directory it is the root, and ENOENT/ENOTDIR turn it back
-; into a pattern. At most one automatic candidate and one PATTERN are
-; accepted, in either order; any other positional token is an error. --path
-; DIR (or --path=DIR) selects the root explicitly, never falls back, rejects
-; repeats and an empty value, and accepts a literal pattern after it. Options
-; and -- must precede all positionals. The selected root is opened with
+;         [--config PATH | --no-config] [--path DIR] [--]
+; PATH is an optional starting directory and must come before PATTERN. Without
+; --path, a lone positional token containing '/' or the exact tokens . and ..
+; is an automatic path candidate: if it opens as a directory it is the root,
+; and ENOENT/ENOTDIR turn it back into a pattern. With two positionals the
+; first token is always the root and must open as a directory; the second is
+; the pattern. More than two positional tokens are an error. --path DIR (or
+; --path=DIR) selects the root explicitly, never falls back, rejects repeats
+; and an empty value, and accepts a literal pattern after it. Options and --
+; must precede all positionals. The selected root is opened with
 ; O_DIRECTORY and followed if it is a symlink, before traversal and before the
 ; --limit 0 exit, and its descriptor is consumed by the root worker; open and
 ; read failures are errors. Its display spelling is kept (redundant trailing
@@ -341,8 +343,6 @@ section .rodata
     e_path_resolve_e:
     e_unexp_arg db "zfind: unexpected argument '"
     e_unexp_arg_e:
-    e_unexp_path db "zfind: unexpected path argument '"
-    e_unexp_path_e:
     e_start_path db "zfind: starting path '"
     e_start_path_e:
     e_start_path_mid db " starting path '"
@@ -534,7 +534,7 @@ section .rodata
     cfg_sfx_xdg_e:
     cfg_sfx_home db "/.config/zfind/config", 0
     cfg_sfx_home_e:
-    help_msg    db "usage: zfind [OPTIONS] [--path DIR] [--] [PATH] [PATTERN]", 10
+    help_msg    db "usage: zfind [OPTIONS] [PATH] [PATTERN]", 10
                db "  options: [--help] [--separator STR] [--case smart|sensitive|insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
                db "             [--exclude-name NAME]... [--exclude-type f|d|l|b]", 10
@@ -555,16 +555,19 @@ section .rodata
                db "any following argument is treated as PATTERN. --help prints this help", 10
                db "and exits 0 anywhere before --, including after PATTERN or where an", 10
                db "option value is expected.", 10, 10
-               db "PATH is an optional starting directory. A positional token containing", 10
-               db "'/' and the exact tokens . and .. are automatic path candidates: a", 10
+               db "PATH must come before PATTERN. When both are given, the first token is", 10
+               db "always the starting directory and the second is the pattern; more than", 10
+               db "two positional arguments are an error. The directory must exist, or", 10
+               db "zfind reports a starting-path error. A lone positional token containing", 10
+               db "'/' and the exact tokens . and .. is an automatic path candidate: a", 10
                db "token that names a directory becomes the starting directory, while a", 10
-               db "missing or non-directory one is searched as a pattern. At most one", 10
-               db "PATTERN is accepted. --path DIR selects the starting directory", 10
-               db "explicitly and accepts a literal PATTERN of any spelling. Output paths", 10
-               db "keep the spelling given for PATH; redundant trailing slashes are", 10
-               db "removed. The starting directory itself is never printed, and --type,", 10
-               db "--no-hidden and --exclude-name apply to descendants only. An", 10
-               db "explicitly selected symlink is followed; output keeps its spelling.", 10, 10
+               db "missing or non-directory one is searched as a pattern. --path DIR", 10
+               db "selects the starting directory explicitly and accepts a literal PATTERN", 10
+               db "of any spelling. Output paths keep the spelling given for PATH;", 10
+               db "redundant trailing slashes are removed. The starting directory itself", 10
+               db "is never printed, and --type, --no-hidden and --exclude-name apply to", 10
+               db "descendants only. An explicitly selected symlink is followed; output", 10
+               db "keeps its spelling.", 10, 10
                db "Settings are also read from $XDG_CONFIG_HOME/zfind/config, else", 10
                db "~/.config/zfind/config: one option per line, # starts a comment line.", 10
                db "Command-line options override the file, except --exclude-name, which adds", 10
@@ -652,10 +655,9 @@ section .bss
     limit_given: resq 1               ; read-only after parsing: 1 = a numeric --limit is in force
     limit_mode:  resq 1               ; read-only after startup: 1 = frame results
     parsed_pat:  resq 1               ; CLI/parser: pattern candidate
-    parsed_auto: resq 1               ; CLI/parser: automatic path candidate
+    parsed_auto: resq 1               ; CLI/parser: starting-directory candidate
+    auto_strict: resq 1               ; parser: candidate is the PATH of two positionals
     pos_seq:     resq 1               ; parser: ordinal of the last positional token
-    pat_seq:     resq 1               ; parser: ordinal of the pattern candidate
-    auto_seq:    resq 1               ; parser: ordinal of the automatic candidate
     opts_ended:  resq 1               ; parser: saw "--" before any positional
     path_given:  resq 1               ; parser: --path was supplied
     path_value:  resq 1               ; parser: its value
@@ -1127,9 +1129,8 @@ parse_args:
     xor r13d, r13d
     mov qword [parsed_pat], 0
     mov qword [parsed_auto], 0
+    mov qword [auto_strict], 0
     mov qword [pos_seq], 0
-    mov qword [pat_seq], 0
-    mov qword [auto_seq], 0
     mov qword [opts_ended], 0
     mov qword [path_given], 0
     mov qword [path_value], 0
@@ -1549,7 +1550,6 @@ parse_args:
 
 .bad_after_positional:
     mov rdi, [rbp+r12*8]
-    xor esi, esi
     call die_unexpected
 
 .positional:                          ; rdi = the token, r8 keeps it
@@ -1559,6 +1559,12 @@ parse_args:
     jne .pos_pattern
     cmp qword [path_given], 0
     jne .pos_pattern                  ; --path: positionals are literal patterns
+    cmp qword [pos_seq], 1
+    je .pos_first
+    cmp qword [pos_seq], 2
+    je .pos_second
+    jmp .bad_two_patterns
+.pos_first:
     mov rsi, r8
 .scan_slash:
     mov al, [rsi]
@@ -1577,29 +1583,27 @@ parse_args:
     jne .pos_pattern
     cmp byte [r8+2], 0
     je .pos_auto                      ; ".."
+    jmp .pos_pattern
+.pos_second:                          ; two positionals: always PATH, then PATTERN
+    test r13, r13
+    jz .pos_second_auto
+    mov [parsed_auto], r13            ; the first token was not path-like
+    xor r13d, r13d
+.pos_second_auto:
+    mov qword [auto_strict], 1        ; validate the first token as the root
+    jmp .pos_pattern
 .pos_pattern:
     test r13, r13
     jnz .bad_two_patterns
     mov r13, r8
-    mov rax, [pos_seq]
-    mov [pat_seq], rax
     inc r12
     jmp .args_loop
 .pos_auto:
-    cmp qword [parsed_auto], 0
-    jne .bad_two_paths
     mov [parsed_auto], r8
-    mov rax, [pos_seq]
-    mov [auto_seq], rax
     inc r12
     jmp .args_loop
 .bad_two_patterns:
     mov rdi, r8
-    xor esi, esi
-    call die_unexpected
-.bad_two_paths:
-    mov rdi, r8
-    mov esi, 1
     call die_unexpected
 
 .args_done:
@@ -1626,9 +1630,9 @@ open_dir_follow:
 open_dir_follow.end_func:
 
 ; select_root: turn the parser's candidates into a validated starting
-; directory. An automatic candidate falls back to a pattern only for ENOENT
-; and ENOTDIR; an explicit --path is strict. On success sets sel_path_yes,
-; sel_path_ptr, sel_path_len and root_fd.
+; directory. A lone automatic candidate falls back to a pattern only for
+; ENOENT and ENOTDIR; the PATH of two positionals and an explicit --path are
+; strict. On success sets sel_path_yes, sel_path_ptr, sel_path_len and root_fd.
     global select_root:function (select_root.end_func - select_root)
 select_root:
     push rbx
@@ -1643,6 +1647,8 @@ select_root:
     mov r12, [parsed_auto]
     test r12, r12
     jz .ret
+    cmp qword [auto_strict], 0
+    jne .strict_path
     mov rdi, r12
     call strlen
     mov r13, rax
@@ -1666,24 +1672,12 @@ select_root:
     mov esi, 3
     mov edx, 36                      ; ENAMETOOLONG
     call die_start_path
-.fallback:
-    cmp qword [parsed_pat], 0
-    je .use_auto
-    mov rax, [auto_seq]
-    cmp rax, [pat_seq]
-    ja .auto_later
-    mov rdi, [parsed_pat]            ; the pattern token came later
-    xor esi, esi
-    call die_unexpected
-.auto_later:
-    mov rdi, r12                     ; the path token came later
-    xor esi, esi
-    call die_unexpected
-.use_auto:
+.fallback:                           ; a lone automatic candidate is a pattern
     mov [parsed_pat], r12
     jmp .ret
 .explicit:
     mov r12, [path_value]
+.strict_path:                        ; r12 = candidate that must be a directory
     test r12, r12
     jz .ret
     mov rdi, r12
@@ -4776,24 +4770,14 @@ fail_errbuf:
     syscall
 fail_errbuf.end_func:
 
-; die_unexpected: rdi = token, esi = 0 for "unexpected argument", 1 for
-; "unexpected path argument"; exits 1.
+; die_unexpected: rdi = token; exits 1.
     global die_unexpected:function (die_unexpected.end_func - die_unexpected)
 die_unexpected:
     push rbx
-    push r12
     mov rbx, rdi
-    mov r12d, esi
     lea rdi, [err_buf]
-    test r12d, r12d
-    jz .plain
-    lea rsi, [e_unexp_path]
-    mov ecx, e_unexp_path_e - e_unexp_path
-    jmp .copy
-.plain:
     lea rsi, [e_unexp_arg]
     mov ecx, e_unexp_arg_e - e_unexp_arg
-.copy:
     rep movsb
     mov rsi, rbx
     lea rdx, [err_buf + PATH_MAX + 512 - 32]
