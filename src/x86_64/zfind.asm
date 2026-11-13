@@ -135,6 +135,23 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ;   one may exit 0 or 1 depending on timing.
 ; Requires an x86-64-v3 CPU.
 
+; Linux x86-64 syscall numbers
+%define SYS_read              0
+%define SYS_write             1
+%define SYS_close             3
+%define SYS_mmap              9
+%define SYS_ioctl             16
+%define SYS_clone             56
+%define SYS_exit              60
+%define SYS_readlink          89
+%define SYS_getrlimit         97
+%define SYS_futex             202
+%define SYS_sched_getaffinity 204
+%define SYS_getdents64        217
+%define SYS_exit_group        231
+%define SYS_openat            257
+%define SYS_newfstatat        262
+
 %define AT_FDCWD    -100
 %define PATH_MAX    4096
 %define NAME_MAX    255               ; longest component Linux accepts
@@ -840,21 +857,21 @@ _start:
     mov edi, 1
     lea rsi, [help_msg]
     mov edx, help_msg_e - help_msg
-    mov rax, 1                       ; sys_write
+    mov rax, SYS_write
     syscall
     xor edi, edi
-    mov rax, 231                     ; exit_group
+    mov rax, SYS_exit_group
     syscall
 .exit_zero:                            ; --limit 0: nothing to print, nothing to walk
     mov rdi, [root_fd]
     test rdi, rdi
     js .ez_nofd
-    mov rax, 3                       ; close the validated starting directory
+    mov rax, SYS_close               ; close the validated starting directory
     syscall
     mov qword [root_fd], -1
 .ez_nofd:
     xor edi, edi
-    mov eax, 231                     ; exit_group
+    mov eax, SYS_exit_group
     syscall
 .pat_ready:                            ; case_mode 0 (smart) falls through to the scan
     cmp byte [case_mode], 1
@@ -946,7 +963,7 @@ _start:
     jne .norepo
     cmp qword [sel_path_yes], 0
     jne .norepo                      ; path-selected: discovered in the root worker
-    mov rax, 262                     ; newfstatat
+    mov rax, SYS_newfstatat
     mov rdi, AT_FDCWD
     lea rsi, [gitname]
     lea rdx, [statbuf0]
@@ -954,7 +971,7 @@ _start:
     syscall
     test rax, rax
     jns .found_repo
-    mov rax, 262                     ; newfstatat
+    mov rax, SYS_newfstatat
     mov rdi, AT_FDCWD
     lea rsi, [jjname]
     lea rdx, [statbuf0]
@@ -971,7 +988,7 @@ _start:
     mov r10, 0x4022                  ; MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE
     mov r8, -1
     xor r9d, r9d
-    mov eax, 9                       ; mmap
+    mov eax, SYS_mmap
     syscall
     test rax, rax
     js big
@@ -987,7 +1004,7 @@ _start:
     ; cannot be read, directories are opened by path as before.
     mov edi, 7                       ; RLIMIT_NOFILE
     lea rsi, [rl_buf]
-    mov eax, 97                      ; getrlimit
+    mov eax, SYS_getrlimit
     syscall
     mov rax, [rl_buf]
     xor ecx, ecx
@@ -1034,7 +1051,7 @@ _start:
     mov r10, 0x4022
     mov r8, -1
     xor r9d, r9d
-    mov eax, 9
+    mov eax, SYS_mmap
     syscall
     test rax, rax
     js big
@@ -1047,7 +1064,7 @@ _start:
     mov r10, 0x4022
     mov r8, -1
     xor r9d, r9d
-    mov eax, 9
+    mov eax, SYS_mmap
     syscall
     test rax, rax
     js big
@@ -1063,7 +1080,7 @@ _start:
     mov r10, 0x4022
     mov r8, -1
     xor r9d, r9d
-    mov eax, 9
+    mov eax, SYS_mmap
     syscall
     test rax, rax
     jns .scratch_ok
@@ -1097,7 +1114,7 @@ _start:
     xor edx, edx
     xor r10d, r10d
     xor r8d, r8d
-    mov eax, 56                      ; clone
+    mov eax, SYS_clone
     syscall
     test rax, rax
     jz thread_main
@@ -1106,7 +1123,7 @@ _start:
 .spawned:
     call emit_main                   ; the main thread only writes
     xor edi, edi                     ; every normal path exits 0, even no match
-    mov rax, 231                     ; exit_group
+    mov rax, SYS_exit_group
     syscall
 _start.end_func:
 
@@ -1624,7 +1641,7 @@ open_dir_follow:
     mov rdi, AT_FDCWD
     mov edx, 0x10000                 ; O_DIRECTORY
     xor r10d, r10d
-    mov eax, 257                     ; openat
+    mov eax, SYS_openat
     syscall
     ret
 open_dir_follow.end_func:
@@ -1919,7 +1936,7 @@ load_config:
     mov rax, [cfg_path]
     mov [err_path], rax
     mov qword [err_line], 0
-    mov eax, 257                     ; openat
+    mov eax, SYS_openat
     mov rdi, AT_FDCWD
     mov rsi, [cfg_path]
     xor edx, edx                     ; O_RDONLY
@@ -1940,7 +1957,7 @@ load_config:
     mov r12, rax                     ; fd
     xor r13d, r13d                   ; bytes read
 .read:
-    xor eax, eax                     ; sys_read
+    xor eax, eax                     ; SYS_read: xor is the short encoding
     mov rdi, r12
     lea rsi, [cfg_buf]
     add rsi, r13
@@ -1959,7 +1976,7 @@ load_config:
     je .read
     jmp bad_cfg_read                 ; also a directory (EISDIR)
 .eof:
-    mov eax, 3                       ; close
+    mov eax, SYS_close
     mov rdi, r12
     syscall
     lea r14, [cfg_buf]
@@ -2397,7 +2414,7 @@ resolve_color:
     cmp byte [rax+4], 0
     je .off                          ; TERM=dumb
 .tty:
-    mov eax, 16                      ; ioctl
+    mov eax, SYS_ioctl
     mov edi, 1                       ; stdout
     mov esi, 0x5401                  ; TCGETS
     lea rdx, [statbuf0]
@@ -2422,7 +2439,7 @@ cpu_count:
     mov eax, FORCE_THREADS
     ret
 %endif
-    mov eax, 204                     ; sched_getaffinity
+    mov eax, SYS_sched_getaffinity
     xor edi, edi                     ; pid 0 = this thread
     mov esi, 128                     ; cpusetsize
     lea rdx, [cpuset]                ; mask
@@ -2466,7 +2483,7 @@ thread_main:
     mov [r14+TSTATE.id], r12
     mov qword [r14+TSTATE.parent_fd], -1
     call run_workers
-    mov eax, 60                      ; SYS_exit: leave the other threads alone
+    mov eax, SYS_exit                ; leave the other threads alone
     xor edi, edi
     syscall
 thread_main.end_func:
@@ -2531,7 +2548,7 @@ notify_ev:
     lea rdi, [ev_seq]
     mov esi, FUTEX_WAKE_PRIV
     mov edx, WAKE_ALL
-    mov eax, 202
+    mov eax, SYS_futex
     syscall
 .ret:
     ret
@@ -2545,7 +2562,7 @@ ev_sleep:
     lock inc dword [ev_waiters]
     lea rdi, [ev_seq]
     mov esi, FUTEX_WAIT_PRIV
-    mov eax, 202
+    mov eax, SYS_futex
     syscall
     lock dec dword [ev_waiters]
     ret
@@ -2619,7 +2636,7 @@ root_ign_setup:
     dec ecx
     jnz .pop
     mov byte [rdi], 0
-    mov eax, 89                      ; readlink
+    mov eax, SYS_readlink
     lea rdi, [probe_buf]
     lea rsi, [real_buf]
     mov edx, PATH_MAX
@@ -2646,7 +2663,7 @@ root_ign_setup:
     mov rdx, r8
     lea rcx, [gitname]
     call join_path
-    mov rax, 262                     ; newfstatat
+    mov rax, SYS_newfstatat
     mov rdi, AT_FDCWD
     lea rsi, [probe_buf]
     lea rdx, [r14+statbuf]
@@ -2667,7 +2684,7 @@ root_ign_setup:
     mov rdx, r8
     lea rcx, [jjname]
     call join_path
-    mov rax, 262
+    mov rax, SYS_newfstatat
     mov rdi, AT_FDCWD
     lea rsi, [probe_buf]
     lea rdx, [r14+statbuf]
@@ -2967,7 +2984,7 @@ walk_group:
     mov rdi, [root_fd]
     test rdi, rdi
     js .body_done
-    mov rax, 3
+    mov rax, SYS_close
     syscall
     mov qword [root_fd], -1
 .body_done:
@@ -3265,7 +3282,7 @@ emit_group:
     lea rdi, [bp_seq]
     mov esi, FUTEX_WAKE_PRIV
     mov edx, WAKE_ALL
-    mov eax, 202
+    mov eax, SYS_futex
     syscall
 .emit:
     call emit_record
@@ -3392,7 +3409,7 @@ recycle:
     lea rdi, [bp_seq]
     mov esi, FUTEX_WAKE_PRIV
     mov edx, 1
-    mov eax, 202
+    mov eax, SYS_futex
     syscall
 .ret:
     ret
@@ -3469,7 +3486,7 @@ out_put:                                ; rdi = bytes, rsi = length
     jnz .frames
     call out_flush
     xor edi, edi
-    mov eax, 231                        ; exit_group: workers die with us
+    mov eax, SYS_exit_group          ; exit_group: workers die with us
     syscall
 
 .done:
@@ -3486,7 +3503,7 @@ out_flush:
 .loop:
     cmp rbx, [out_len]
     jae .done
-    mov rax, 1                       ; sys_write
+    mov rax, SYS_write
     mov edi, 1
     lea rsi, [out_buf]
     add rsi, rbx
@@ -3589,7 +3606,7 @@ get_block:
     mov esi, FUTEX_WAIT_PRIV
     mov edx, ebx
     xor r10d, r10d
-    mov eax, 202
+    mov eax, SYS_futex
     syscall
     lock dec dword [bp_waiters]
     jmp .admit
@@ -4697,9 +4714,9 @@ die:                                 ; rsi, rdx = message; exits 1
     sub rdx, rsi
 .write:
     mov rdi, 2
-    mov rax, 1
+    mov rax, SYS_write
     syscall
-    mov rax, 231                     ; exit_group: the workers die with us
+    mov rax, SYS_exit_group          ; exit_group: the workers die with us
     mov rdi, 1
     syscall
 die.end_func:
@@ -4763,10 +4780,10 @@ fail_errbuf:
     mov rdx, rdi
     sub rdx, rsi
     mov edi, 2
-    mov eax, 1
+    mov eax, SYS_write
     syscall
     mov edi, 1
-    mov eax, 231
+    mov eax, SYS_exit_group
     syscall
 fail_errbuf.end_func:
 
@@ -5409,7 +5426,7 @@ load_ignore:
     call join_path
     cmp rax, PATH_MAX + 15
     ja .ret                          ; cannot even name it: leave rules off
-    mov rax, 257                     ; openat
+    mov rax, SYS_openat
     mov rdi, AT_FDCWD
     lea rsi, [r14+TSTATE.ig_path]
     xor edx, edx
@@ -5421,7 +5438,7 @@ load_ignore:
     lea rsi, [r14+igbuf]
     xor r10d, r10d                   ; bytes read
 .read:
-    mov rax, 0                       ; sys_read
+    mov rax, SYS_read
     mov rdi, r8
     mov rdx, IGBUF_SZ - 1
     sub rdx, r10
@@ -5437,12 +5454,12 @@ load_ignore:
 .read_error:
     cmp rax, -4                      ; -EINTR: retry the same read
     je .read
-    mov rax, 3                       ; close; do not parse partial contents
+    mov rax, SYS_close               ; close; do not parse partial contents
     mov rdi, r8
     syscall
     jmp .ret                         ; ignore this unreadable .gitignore
 .read_done:
-    mov rax, 3                       ; close
+    mov rax, SYS_close
     mov rdi, r8
     syscall
     test r10, r10
@@ -5819,7 +5836,7 @@ type_ok:
     xor r8d, r8d                     ; b without l: only broken links
 .follow:
     push rdi                         ; syscall needs rdi, but .match is called
-    mov rax, 262                     ;   twice and edi is the entry's d_type
+    mov rax, SYS_newfstatat          ;   twice and edi is the entry's d_type
     mov rdi, AT_FDCWD
     lea rsi, [r14+path_buf]
     lea rdx, [r14+statbuf]
@@ -5872,7 +5889,7 @@ type_ok:
     jz .no
 .xfollow:
     push rdi
-    mov rax, 262
+    mov rax, SYS_newfstatat
     mov rdi, AT_FDCWD
     lea rsi, [r14+path_buf]
     lea rdx, [r14+statbuf]
@@ -5964,7 +5981,7 @@ walk_wide:
     test rbp, rbp
     js .ignored
     mov qword [rsp+48], 1
-    mov rax, 262                     ; DT_UNKNOWN: lstat without following
+    mov rax, SYS_newfstatat          ; DT_UNKNOWN: lstat without following
     mov rdi, AT_FDCWD
     lea rsi, [r14+path_buf]
     lea rdx, [r14+statbuf]
@@ -6181,7 +6198,7 @@ walk_dir:
 .by_path:
     mov rdi, AT_FDCWD
 .do_open:
-    mov rax, 257                     ; openat
+    mov rax, SYS_openat
     mov rdx, 0x10000                 ; O_DIRECTORY
     xor r10d, r10d
     syscall
@@ -6189,7 +6206,7 @@ walk_dir:
     js .fin                          ; unreadable child: fd skips it
     mov [rsp+40], rax
 .opened:
-    mov rax, 217                     ; getdents64
+    mov rax, SYS_getdents64
     mov rdi, [rsp+40]
     lea rsi, [r14+ent_buf]
     mov rdx, ENT_BUF
@@ -6336,7 +6353,7 @@ walk_dir:
     test r13d, r13d
     jnz .collected                   ; the last batch was short: no EOF call
 .collect:
-    mov rax, 217                     ; getdents64
+    mov rax, SYS_getdents64
     mov rdi, [rsp+40]
     lea rsi, [r14+ent_buf]
     mov rdx, ENT_BUF
@@ -6358,7 +6375,7 @@ walk_dir:
 .collected:
     cmp r12, [fd_keep]               ; r12 = this directory's depth in the walk
     jb .keep_open                    ; subdirectories will open relative to it
-    mov rax, 3                       ; close
+    mov rax, SYS_close
     mov rdi, [rsp+40]
     syscall
     mov qword [rsp+40], -1
@@ -6456,7 +6473,7 @@ walk_dir:
     call .mkpath                     ; DT_UNKNOWN: lstat, do not follow links
     test rbp, rbp
     js .next
-    mov rax, 262
+    mov rax, SYS_newfstatat
     mov rdi, AT_FDCWD
     lea rsi, [r14+path_buf]
     lea rdx, [r14+statbuf]
@@ -6661,7 +6678,7 @@ walk_dir:
     mov rdi, [rsp+40]
     test rdi, rdi
     js .closed
-    mov rax, 3                       ; close
+    mov rax, SYS_close
     syscall
 .closed:
     dec qword [r14+f_deep]
@@ -6715,7 +6732,7 @@ walk_range:
     call walk_dir.mkpath
     test rbp, rbp
     js .next
-    mov rax, 262
+    mov rax, SYS_newfstatat
     mov rdi, AT_FDCWD
     lea rsi, [r14+path_buf]
     lea rdx, [r14+statbuf]
