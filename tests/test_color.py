@@ -634,6 +634,137 @@ class TestRenderExamples:
 
 
 # -----------------------------------------------------------------------------
+# SIMD match scan
+# -----------------------------------------------------------------------------
+
+# Patterns made only of letters that never appear in the 'z' filler, so each
+# generated name holds exactly one occurrence.
+SIMD_PATTERNS = {
+    1: "a",
+    2: "ab",
+    8: "abcdefgh",
+    15: "abcdefghijklmno",
+    16: "abcdefghijklmnop",
+    17: "abcdefghijklmnopq",
+}
+SIMD_NAME_LENGTHS = (14, 15, 16, 17, 31, 32, 33)
+SIMD_CASES = [
+    pytest.param(name_len, pat_len, id=f"name{name_len}-pat{pat_len}")
+    for name_len in SIMD_NAME_LENGTHS
+    for pat_len in SIMD_PATTERNS
+    if pat_len <= name_len
+]
+
+
+def simd_offsets(name_len: int, pat_len: int) -> list[int]:
+    """Starts covering start, middle, end and every 16-byte window edge."""
+    last = name_len - pat_len
+    offsets = {0, last // 2, last}
+    if pat_len <= 16:
+        step = 17 - pat_len
+        start = step
+        while start <= last:
+            offsets.update((start - 1, start))
+            start += step
+    return sorted(offsets)
+
+
+def simd_name(name_len: int, pat_len: int, offset: int) -> bytes:
+    pattern = SIMD_PATTERNS[pat_len].encode()
+    return b"z" * offset + pattern + b"z" * (name_len - offset - pat_len)
+
+
+def expected_highlight(name: bytes, start: int, end: int) -> bytes:
+    """The rendered basename without its trailing newline."""
+    return name[:start] + MATCH + name[start:end] + RESET + name[end:]
+
+
+class TestSimdScan:
+    @pytest.mark.parametrize(
+        "args",
+        [
+            pytest.param((), id="smart"),
+            pytest.param(("--case=sensitive",), id="sensitive"),
+        ],
+    )
+    @pytest.mark.parametrize(("name_len", "pat_len"), SIMD_CASES)
+    def test_highlight_every_window_edge(
+        self,
+        binary: Path,
+        tmp_path: Path,
+        home: Path,
+        name_len: int,
+        pat_len: int,
+        args: tuple[str, ...],
+    ):
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        expected: dict[bytes, bytes] = {}
+        for offset in simd_offsets(name_len, pat_len):
+            name = simd_name(name_len, pat_len, offset)
+            (tree / os.fsdecode(name)).write_bytes(b"")
+            expected[name] = expected_highlight(name, offset, offset + pat_len)
+
+        res = run_env(
+            binary, tree, "--color=always", *args, SIMD_PATTERNS[pat_len],
+            env=base_env(home),
+        )
+        assert res.status == 0 and res.err == b""
+        lines = res.out.split(b"\n")[:-1]
+        got = {strip_color(line): line for line in lines}
+        assert len(got) == len(lines), "each rendered line must be a distinct name"
+        assert got == expected
+
+    @pytest.mark.parametrize(
+        ("args", "name", "pattern", "start"),
+        [
+            pytest.param((), b"z" * 10 + b"Ba" + b"z" * 20, "ba", 10,
+                         id="smart-folds-name"),
+            pytest.param((), b"z" * 6 + b"MATCH" + b"z" * 21, "match", 6,
+                         id="smart-folds-uppercase-name"),
+            pytest.param(("--case=insensitive",), b"z" * 6 + b"mAtCh" + b"z" * 21,
+                         "MATCH", 6, id="forced-insensitive"),
+            pytest.param(("--case=insensitive",), b"z" * 9 + b"ABCDEFGH" + b"z" * 15,
+                         "abcdefgh", 9, id="folded-window-edge"),
+            pytest.param(("--case=insensitive",), b"z" * 5 + b"ABCDEFGHIJKLMNOP" + b"z" * 5,
+                         "abcdefghijklmnop", 5, id="folded-pat16"),
+            pytest.param(("--case=insensitive",),
+                         b"z" * 5 + b"ABCDEFGHIJKLMNOPQ" + b"z" * 5,
+                         "abcdefghijklmnopq", 5, id="folded-scalar-pat17"),
+            pytest.param(("--case=sensitive",), b"z" * 6 + b"MATCH" + b"z" * 21,
+                         "MATCH", 6, id="forced-sensitive"),
+            # The match ends inside a UTF-8 sequence: the entry prints but the
+            # run is skipped rather than split.
+            pytest.param((), b"caf\xc3\xa9", os.fsdecode(b"\xc3"), None,
+                         id="utf8-tail-is-skipped"),
+        ],
+    )
+    def test_case_modes(
+        self,
+        binary: Path,
+        tmp_path: Path,
+        home: Path,
+        args: tuple[str, ...],
+        name: bytes,
+        pattern: str,
+        start: Optional[int],
+    ):
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        (tree / os.fsdecode(name)).write_bytes(b"")
+
+        res = run_env(
+            binary, tree, "--color=always", *args, pattern, env=base_env(home)
+        )
+        assert res.status == 0 and res.err == b""
+        if start is None:
+            assert res.out == name + b"\n"  # printed, nothing highlighted
+        else:
+            end = start + len(pattern)
+            assert res.out == expected_highlight(name, start, end) + b"\n"
+
+
+# -----------------------------------------------------------------------------
 # Mode resolution
 # -----------------------------------------------------------------------------
 
