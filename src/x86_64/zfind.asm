@@ -4205,6 +4205,12 @@ sort_table.end_func:
 ; match whose first or last byte is a UTF-8 continuation byte is skipped: it
 ; could only come from a non-UTF-8 pattern, and highlighting it would split a
 ; multibyte sequence. The entry is still printed, just not highlighted there.
+; patlen 1..16 uses the same PCMPISTRI scan as name_match: 16-byte windows
+; stepped by S = 17 - patlen, imm8 0x0C, so each start is examined exactly
+; once. patlen > 16 keeps the scalar loop below. The windows read at most 15
+; bytes past the name's NUL, as name_match does; path_buf is followed by other
+; TSTATE fields, so that load stays mapped. Clobbers rax, rcx, rdx, rsi, rdi,
+; r8, r9, r11 and xmm0-xmm6.
     global match_next:function (match_next.end_func - match_next)
 match_next:
     push rbx
@@ -4222,8 +4228,102 @@ match_next:
     ja .none
     mov r15, r12
     sub r15, rbp                     ; highest start that can match
+    cmp r13, r15
+    ja .none                         ; the common "no room left" call
     mov rsi, [pat_ptr]
-.loop:
+    cmp rbp, 16
+    ja .scalar
+    ; pat_ptr is pat_buf here: NUL-terminated at patlen and zero-padded, and
+    ; already folded when pat_ci. PCMPISTRI's implicit pattern length reads it.
+    movdqu xmm3, [rsi]
+    mov edx, 17
+    sub edx, ebp                     ; window step S
+    xor r9d, r9d                     ; 0 = case-sensitive, 1 = folded
+    cmp qword [pat_ci], 0
+    jne .ci_setup
+.cs_loop:
+    cmp r13, r15
+    ja .none
+    movdqu xmm0, [rbx+r13]
+    pcmpistri xmm3, xmm0, 0x0c
+    jc .cs_hit
+    jz .none                         ; the window holds the name's NUL
+    add r13, rdx
+    jmp .cs_loop
+.cs_hit:
+    jz .cs_hit_nul
+    cmp ecx, edx                     ; first match must start in this window
+    jb .cs_found
+    add r13, rdx
+    jmp .cs_loop
+.cs_hit_nul:
+    cmp ecx, edx
+    jae .none                        ; a later window can only start later
+.cs_found:
+    lea r8, [r13+rcx]                ; candidate start
+    cmp r8, r15
+    ja .none
+    jmp .check
+
+.ci_setup:
+    movdqa xmm4, [c_upper_hi]
+    movdqa xmm5, [c_upper_lo]
+    movdqa xmm6, [c_fold]
+    mov r9d, 1
+.ci_loop:
+    cmp r13, r15
+    ja .none
+    movdqu xmm0, [rbx+r13]
+    movdqa xmm1, xmm4
+    pcmpgtb xmm1, xmm0               ; 0x5b > x
+    movdqa xmm2, xmm0
+    pcmpgtb xmm2, xmm5               ; x > 0x40
+    pand xmm1, xmm2
+    pand xmm1, xmm6
+    por xmm0, xmm1                   ; tolower(x), as .verify_ci
+    pcmpistri xmm3, xmm0, 0x0c
+    jc .ci_hit
+    jz .none
+    add r13, rdx
+    jmp .ci_loop
+.ci_hit:
+    jz .ci_hit_nul
+    cmp ecx, edx
+    jb .ci_found
+    add r13, rdx
+    jmp .ci_loop
+.ci_hit_nul:
+    cmp ecx, edx
+    jae .none
+.ci_found:
+    lea r8, [r13+rcx]
+    cmp r8, r15
+    ja .none
+    jmp .check
+
+; Both SIMD paths arrive here with r8 = candidate start.
+.check:
+    movzx r11d, byte [rbx+r8]
+    and r11d, 0xc0
+    cmp r11d, 0x80
+    je .resume
+    lea rcx, [r8+rbp]
+    cmp rcx, r12
+    jae .found
+    movzx r11d, byte [rbx+rcx]
+    and r11d, 0xc0
+    cmp r11d, 0x80
+    je .resume
+.found:
+    mov rax, r8
+    jmp .ret
+.resume:
+    lea r13, [r8+1]
+    test r9d, r9d
+    jnz .ci_loop
+    jmp .cs_loop
+
+.scalar:
     cmp r13, r15
     ja .none
     lea rdi, [rbx+r13]
@@ -4260,7 +4360,7 @@ match_next:
     jmp .ret
 .next:
     inc r13
-    jmp .loop
+    jmp .scalar
 .none:
     mov rax, -1
 .ret:
