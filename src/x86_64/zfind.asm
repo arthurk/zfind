@@ -3415,6 +3415,81 @@ recycle:
     ret
 recycle.end_func:
 
+; copy_run: rdi = dst, rsi = src, rdx = n. Copies n bytes from src to dst.
+; A run of at most 64 bytes is copied with overlapping SSE2 stores: rep movsb
+; costs a fixed startup of ~30 cycles, which dominates a short run, while a
+; pair of 16-byte stores costs about 5. Longer runs keep rep movsb, which
+; moves many bytes per cycle. Every store and every load stays inside
+; [dst, dst+n) and [src, src+n), so a copy never touches a byte it was not
+; given; the overlapping windows are the reason the runs may be short.
+; rdi ends at dst+n, so a caller can write on after the run.
+; Clobbers rax, rcx, rsi, rdi, xmm0; keeps rdx, rbx, r12-r15.
+    global copy_run:function (copy_run.end_func - copy_run)
+copy_run:
+    cmp rdx, 64
+    ja .long
+    cmp rdx, 32
+    jae .w32
+    cmp rdx, 16
+    jae .w16
+    cmp rdx, 8
+    jae .w8
+    test rdx, rdx
+    jz .done
+    mov rcx, rdx                        ; 4/2/1 ladder
+    cmp rcx, 4
+    jb .lad2
+    mov eax, [rsi]
+    mov [rdi], eax
+    add rsi, 4
+    add rdi, 4
+    sub rcx, 4
+.lad2:
+    cmp rcx, 2
+    jb .lad1
+    mov ax, [rsi]
+    mov [rdi], ax
+    add rsi, 2
+    add rdi, 2
+    sub rcx, 2
+.lad1:
+    test rcx, rcx
+    jz .done                           ; rdi is already at dst+n
+    mov al, [rsi]
+    mov [rdi], al
+    inc rdi
+    jmp .done
+.w8:
+    mov rax, [rsi]
+    mov [rdi], rax
+    mov rax, [rsi+rdx-8]
+    mov [rdi+rdx-8], rax
+    jmp .advance
+.w16:
+    movdqu xmm0, [rsi]
+    movdqu [rdi], xmm0
+    movdqu xmm0, [rsi+rdx-16]
+    movdqu [rdi+rdx-16], xmm0
+    jmp .advance
+.w32:
+    movdqu xmm0, [rsi]
+    movdqu [rdi], xmm0
+    movdqu xmm0, [rsi+16]
+    movdqu [rdi+16], xmm0
+    movdqu xmm0, [rsi+rdx-32]
+    movdqu [rdi+rdx-32], xmm0
+    movdqu xmm0, [rsi+rdx-16]
+    movdqu [rdi+rdx-16], xmm0
+.advance:
+    add rdi, rdx
+.done:
+    ret
+.long:
+    mov rcx, rdx
+    rep movsb
+    ret
+copy_run.end_func:
+
 ; out_put: rdi = bytes, rsi = length. One buffered write() per OUT_SZ, so a
 ; 1.5M-line search is a few hundred syscalls instead of one per line.
 ; Without a limit, copy the bytes unchanged. With --limit, the bytes are frames
@@ -3450,8 +3525,7 @@ out_put:                                ; rdi = bytes, rsi = length
     lea rdi, [out_buf]
     add rdi, rcx
     mov rsi, rbx
-    mov rcx, rdx                        ; bytes for this run
-    rep movsb
+    call copy_run                       ; rdx = bytes for this run
     add [out_len], rdx
     sub r12, rdx
     add rbx, rdx
@@ -3477,8 +3551,8 @@ out_put:                                ; rdi = bytes, rsi = length
     lea rdi, [out_buf]
     add rdi, rcx
     mov rsi, rbx
-    mov rcx, r13
-    rep movsb
+    mov rdx, r13
+    call copy_run
     add [out_len], r13
     add rbx, r13
     sub r12, r13
@@ -4669,8 +4743,8 @@ print_entry:
     cmp byte [color_on], 0
     jne .colored
     lea rsi, [r14+path_buf]
-    mov rcx, rbx
-    rep movsb
+    mov rdx, rbx
+    call copy_run                       ; rdi ends at the end of the path
     test r13, r13
     jz .sep
     mov byte [rdi], '/'
@@ -4691,8 +4765,8 @@ print_entry:
     jmp .publish
 .sep_multi:
     lea rsi, [sep_buf]
-    mov rcx, rax
-    rep movsb
+    mov rdx, rax
+    call copy_run
 .publish:
     mov rcx, r12
     cmp qword [limit_mode], 0
