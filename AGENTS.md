@@ -201,8 +201,7 @@ are present, stop and ask; never mix them into the issue. Branch with
    Fix what it confirms.
 8. Stage only the files you changed (never `git add -A`), commit in small
    units (`zfind:`, `tests:`, `docs:`, `tools:`, `build:`, `ci:`), push, and
-   open one PR whose body contains `Closes #N`. Check CI before the issue
-   comment.
+   open one PR whose body contains `Closes #N`. 
 9. Finish with one issue comment: the commands run and their actual results,
    failures included, with long output inside `<details>`. Then stop.
 
