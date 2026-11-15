@@ -3944,54 +3944,47 @@ name_match.end_func:
 ; need the names themselves (tie_cmp).
 
 ; tie_cmp: rdi, rsi = two names with equal keys -> eax = -1 / 0 / 1 (unsigned
-; bytes). Compares 8 bytes at a time from offset 8 and only looks at single
-; bytes once a word differs. Distinct names in one directory differ at or
-; before the NUL of the shorter one, so bytes past a NUL never decide.
-; Equal keys mean the first 8 name bytes match, so the word at +8 starts inside
-; both names; the loop advances only while neither word holds a NUL, so every
-; later read starts inside both names. A read runs at most 7 bytes past the
-; shorter name's NUL, still inside the record: arena_put pads every record by 16
-; bytes and zeroes the word at name+8 for names of up to 8 bytes, so the
-; unreachable case of two equal short names reads zeros, returns 0 and does not
-; scan on.
-; Clobbers rax, rcx, rdx, xmm0, xmm1.
+; bytes). pcmpistri with equal-each and negative polarity stops at the first
+; mismatching byte of a 16-byte window, and its implicit NUL handling makes a
+; name that is a prefix of the other mismatch at its own NUL, so the shorter one
+; sorts first. CF reports a mismatch at ecx, ZF reports a NUL in the second
+; operand, and SF one in the first: a NUL in rdi alone is still a mismatch and
+; takes the CF path, so CF must be tested before ZF. No mismatch and ZF mean
+; both names ended there and are equal.
+; A load at offset k is only reached while both names have non-NUL bytes through
+; k-1, so it starts at or before the shorter name's NUL. arena_put pads every
+; record by 16 bytes after the NUL, so a window that starts at or before the NUL
+; and runs at most 15 bytes past it stays inside the record, even for a short
+; name in the first window at offset 0.
+; Clobbers rax, rcx, rdx, xmm0.
     global tie_cmp:function (tie_cmp.end_func - tie_cmp)
 tie_cmp:
-    mov ecx, 8
-.word:
-    mov rax, [rdi+rcx]
-    mov rdx, [rsi+rcx]
-    cmp rax, rdx
-    jne .diff
-    movq xmm0, rax
-    pxor xmm1, xmm1
-    pcmpeqb xmm0, xmm1
-    pmovmskb edx, xmm0
-    test dl, dl
-    jnz .same                        ; equal words holding the NUL: same name
-    add ecx, 8
-    jmp .word
-.same:
-    xor eax, eax
-    ret
+    xor edx, edx
+.loop:
+    movdqu xmm0, [rdi+rdx]
+    pcmpistri xmm0, [rsi+rdx], 0x18
+    jc .diff
+    jz .same                         ; equal through a NUL: same name
+    add edx, 16
+    jmp .loop
 .diff:
-    xor rax, rdx
-    bsf rax, rax
-    shr eax, 3                       ; first differing byte (memory order)
-    add rax, rcx
-    movzx ecx, byte [rdi+rax]
-    movzx edx, byte [rsi+rax]
-    cmp ecx, edx
+    add rdx, rcx
+    movzx eax, byte [rdi+rdx]
+    movzx ecx, byte [rsi+rdx]
+    cmp eax, ecx
     ja .gt
     mov eax, -1
     ret
 .gt:
     mov eax, 1
     ret
+.same:
+    xor eax, eax
+    ret
 tie_cmp.end_func:
 
 ; isort: insertion-sort the entries in [r8, r9). Clobbers rax, rcx, rdx, rsi,
-; rdi, r10, r11, rbp, r12, xmm0, xmm1.
+; rdi, r10, r11, rbp, r12, xmm0.
     global isort:function (isort.end_func - isort)
 isort:
     lea r10, [r8+16]                 ; next entry to insert
@@ -4030,7 +4023,7 @@ isort:
 isort.end_func:
 
 ; merge: left run [r8, r9) and right run [r10, r11) -> ascending at rbp.
-; Clobbers rax, rcx, rdx, rsi, rdi, r8, r10, rbp, xmm0, xmm1.
+; Clobbers rax, rcx, rdx, rsi, rdi, r8, r10, rbp, xmm0.
     global merge:function (merge.end_func - merge)
 merge:
 .cmp:
@@ -5639,11 +5632,11 @@ load_ignore.end_func:
 ; padding, using packed metadata in rdi.
 ; rdi = d_type | (matched << 8), r15 = d_name -> rax = record, rdx = sort key
 ; (first 8 name bytes, big-endian, zero after the NUL).
-; The padding is 16 bytes, so the 8-byte key read at +2 and tie_cmp's 8-byte
-; reads at +10 and up stay inside the record for every name length: with only
-; the two metadata bytes, the name and its NUL, salloc's rounding to 8 leaves a
-; name of 1 to 5 bytes in an 8-byte block, and the key read takes 2 bytes of the
-; next record.
+; The padding is 16 bytes, so the 8-byte key read at +2 and tie_cmp's 16-byte
+; windows stay inside the record for every name length: with only the two
+; metadata bytes, the name and its NUL, salloc's rounding to 8 leaves a name of
+; 1 to 5 bytes in an 8-byte block, and the key read takes 2 bytes of the next
+; record. tie_cmp reads at most 15 bytes past the NUL, which the padding covers.
 ; The length pass could be avoided by allocating d_reclen, but that wastes
 ; ~27 bytes per entry (~80 MB on /nix/store).
 ; Clobbers rax, rcx, rdx, rsi, rdi - not r8-r11/r14/r15, which the directory
@@ -5672,12 +5665,7 @@ arena_put:
     mov rdx, [rax+2]                ; the key, from the copy; the padding keeps
                                     ; the 8-byte read inside the record
     cmp r13, 8
-    ja .whole
-    mov qword [rax+10], 0           ; tie_cmp's first word is name+8: for a name
-                                    ; of 8 bytes it starts at the NUL, and for a
-                                    ; shorter one it is padding. Zero it, so an
-                                    ; equal short name reads zeros and ties.
-    je .whole
+    jae .whole
     mov ecx, r13d
     shl ecx, 3
     mov esi, 1
