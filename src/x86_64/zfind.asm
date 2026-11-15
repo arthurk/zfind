@@ -1104,7 +1104,8 @@ _start:
     add rax, [scratch_map]           ; its scratch region
     mov [r13+TSTATE.sc_top], rax
     add rax, [scratch_sz]
-    sub rax, 16                      ; tail guard: sort reads 8 bytes past a name
+    sub rax, 16                      ; tail guard: name_match reads 15 bytes
+                                     ; past a name's NUL
     mov [r13+TSTATE.sc_end], rax
     mov rsi, r12
     inc rsi
@@ -3946,7 +3947,13 @@ name_match.end_func:
 ; bytes). Compares 8 bytes at a time from offset 8 and only looks at single
 ; bytes once a word differs. Distinct names in one directory differ at or
 ; before the NUL of the shorter one, so bytes past a NUL never decide.
-; Reads up to 7 bytes past a name: scratch regions keep a 16-byte tail guard.
+; Equal keys mean the first 8 name bytes match, so the word at +8 starts inside
+; both names; the loop advances only while neither word holds a NUL, so every
+; later read starts inside both names. A read runs at most 7 bytes past the
+; shorter name's NUL, still inside the record: arena_put pads every record by 16
+; bytes and zeroes the word at name+8 for names of up to 8 bytes, so the
+; unreachable case of two equal short names reads zeros, returns 0 and does not
+; scan on.
 ; Clobbers rax, rcx, rdx, xmm0, xmm1.
     global tie_cmp:function (tie_cmp.end_func - tie_cmp)
 tie_cmp:
@@ -5628,13 +5635,19 @@ load_ignore:
     ret
 load_ignore.end_func:
 
-; arena_put: append [d_type][matched][name,0] with a three-byte header, using
-; packed metadata in rdi.
+; arena_put: append the record [d_type][matched][name,0], followed by tail
+; padding, using packed metadata in rdi.
 ; rdi = d_type | (matched << 8), r15 = d_name -> rax = record, rdx = sort key
-; (first 8 name bytes, big-endian, zero after the NUL). The length pass could be
-; avoided by allocating d_reclen, but that wastes ~27 bytes per entry (~80 MB on
-; /nix/store). Clobbers rax, rcx, rdx, rsi, rdi - not r8-r11/r14/r15, which the
-; directory loop is holding.
+; (first 8 name bytes, big-endian, zero after the NUL).
+; The padding is 16 bytes, so the 8-byte key read at +2 and tie_cmp's 8-byte
+; reads at +10 and up stay inside the record for every name length: with only
+; the two metadata bytes, the name and its NUL, salloc's rounding to 8 leaves a
+; name of 1 to 5 bytes in an 8-byte block, and the key read takes 2 bytes of the
+; next record.
+; The length pass could be avoided by allocating d_reclen, but that wastes
+; ~27 bytes per entry (~80 MB on /nix/store).
+; Clobbers rax, rcx, rdx, rsi, rdi - not r8-r11/r14/r15, which the directory
+; loop is holding.
     global arena_put:function (arena_put.end_func - arena_put)
 arena_put:
     push rbx
@@ -5649,16 +5662,22 @@ arena_put:
     inc r13
     jmp .len
 .lend:
-    lea rdi, [r13+3]
+    lea rdi, [r13+19]               ; record, then 16 bytes of tail padding
     call salloc
     mov [rax], r12w
     lea rdi, [rax+2]
     mov rsi, rbx
     lea rcx, [r13+1]
     rep movsb
-    mov rdx, [rax+2]                ; the key, from the copy (a guard follows it)
+    mov rdx, [rax+2]                ; the key, from the copy; the padding keeps
+                                    ; the 8-byte read inside the record
     cmp r13, 8
-    jae .whole
+    ja .whole
+    mov qword [rax+10], 0           ; tie_cmp's first word is name+8: for a name
+                                    ; of 8 bytes it starts at the NUL, and for a
+                                    ; shorter one it is padding. Zero it, so an
+                                    ; equal short name reads zeros and ties.
+    je .whole
     mov ecx, r13d
     shl ecx, 3
     mov esi, 1
