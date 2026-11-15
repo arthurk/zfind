@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -144,6 +145,38 @@ class TestSortOrder:
         ]
         for name in names:
             (tree / name.decode()).write_bytes(b"")
+
+        res = run_in(binary, tree)
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == sorted(names)
+
+    def test_byte_order_across_the_simd_tie_break_window(
+        self, binary: Path, tmp_path: Path
+    ):
+        """Lengths 1 to 16, prefixes and high-bit bytes decide in raw byte order.
+
+        tie_cmp scans 16 bytes at a time, so differences and terminators fall in
+        and out of a single window at every offset; high-bit bytes check that the
+        comparison stays unsigned, and the 17- and 31-byte differences force a
+        second window.
+        """
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        names = [b"x" * length for length in range(1, 17)]
+        names += [
+            b"abcdefgh", b"abcdefgh0", b"abcdefgh1", b"abcdefghZ",
+            b"abcdefgh" + b"a" * 8, b"abcdefgh" + b"a" * 9,
+            b"abcdefgh\x80", b"abcdefgh\xff",
+            b"\x80abcdefgh", b"\xfeabcdefgh", b"\xffabcdefgh",
+            b"\x80abcdefgh0", b"\xffabcdefgh0",
+            b"pre", b"prefix", b"prefix\xff",
+            b"y" * 32, b"y" * 33,
+            b"y" * 17 + b"0", b"y" * 17 + b"1",
+            b"y" * 31 + b"0", b"y" * 31 + b"1",
+        ]
+        for name in names:
+            (tree / os.fsdecode(name)).write_bytes(b"")
 
         res = run_in(binary, tree)
         assert res.status == 0, f"Command failed: {res}"
