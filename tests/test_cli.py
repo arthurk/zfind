@@ -122,6 +122,34 @@ class TestSortOrder:
         assert len({name[:8] for name in listing}) < len(listing)
         assert listing == sorted(listing)
 
+    def test_short_names_and_equal_prefixes_sort_in_byte_order(
+        self, binary: Path, tmp_path: Path
+    ):
+        """Names of 1 to 8 bytes, names equal through byte 8 or 16, and prefixes.
+
+        The sort key is the first 8 name bytes; everything else is decided by
+        tie_cmp. Short names and names sharing a long prefix exercise the
+        record padding and the tie-break path together.
+        """
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        names = [
+            b"a", b"ab", b"abc", b"abcd", b"abcde", b"abcdef", b"abcdefg",
+            b"abcdefgh", b"abcdefghI", b"abcdefghJ",
+            b"sharedprefix", b"sharedprefix0", b"sharedprefixZ",
+            b"sharedprefixa",
+            b"0123456789abcdef", b"0123456789abcdefZ",
+            b"0123456789abcdefghij", b"0123456789abcdefghik",
+            b"Z", b"z", b"A", b"0", b"_",
+        ]
+        for name in names:
+            (tree / name.decode()).write_bytes(b"")
+
+        res = run_in(binary, tree)
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == sorted(names)
+
 
 class TestPatternMatching:
     def test_pattern_matches_basename_not_relative_path(
