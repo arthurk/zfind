@@ -733,3 +733,65 @@ class TestExcludeTypeAcrossTreeShapes:
     def test_the_oracle_agrees(self, binary: Path, links_tree: Path, drop: set[str]):
         args = [arg for kind in sorted(drop) for arg in ("--exclude-type", kind)]
         assert listing(binary, links_tree, *args) == excluded_model(links_tree, drop)
+
+
+class TestTypeResolutionAcrossBuilds:
+    """The lstat fallback resolves the same types as the dirent field.
+
+    The unknown build lstats every entry and the range build does so inside
+    walk_range; the plain build normally reads d_type.  Over the shared trees
+    and the links fixture all three must print the same bytes, with and
+    without a type filter.
+    """
+
+    CASES = [
+        pytest.param((), id="all"),
+        pytest.param(("--type", "f"), id="files"),
+        pytest.param(("--type", "d"), id="dirs"),
+        pytest.param(("--type", "l"), id="links"),
+        pytest.param(("--type", "f", "--type", "d"), id="files-and-dirs"),
+    ]
+
+    def assert_variants_match(
+        self,
+        zfind_path: Path,
+        unknown_zfind_path: Path,
+        range_zfind_path: Path,
+        cwd: Path,
+        args: tuple[str, ...],
+    ):
+        expected = run_in(zfind_path, cwd, *args)
+        assert expected.status == 0, f"plain build failed: {expected}"
+        for variant in (unknown_zfind_path, range_zfind_path):
+            got = run_in(variant, cwd, *args)
+            assert got == expected, f"{variant.name} diverged on {cwd} {args}"
+
+    @pytest.mark.parametrize(
+        "tree", ["tiny", "hidden", "ignores", "weird", "camera", "tree2"]
+    )
+    @pytest.mark.parametrize("args", CASES)
+    def test_shared_trees_list_like_the_plain_build(
+        self,
+        zfind_path: Path,
+        unknown_zfind_path: Path,
+        range_zfind_path: Path,
+        testdata: Path,
+        tree: str,
+        args: tuple[str, ...],
+    ):
+        self.assert_variants_match(
+            zfind_path, unknown_zfind_path, range_zfind_path, testdata / tree, args
+        )
+
+    @pytest.mark.parametrize("args", CASES)
+    def test_the_links_tree_lists_like_the_plain_build(
+        self,
+        zfind_path: Path,
+        unknown_zfind_path: Path,
+        range_zfind_path: Path,
+        links_tree: Path,
+        args: tuple[str, ...],
+    ):
+        self.assert_variants_match(
+            zfind_path, unknown_zfind_path, range_zfind_path, links_tree, args
+        )

@@ -6036,6 +6036,108 @@ type_ok:
     ret
 type_ok.end_func:
 
+; resolve_type: read the type of the entry whose full path is in path_buf,
+; without following links.  The caller's mkpath has already built the path.
+; Returns eax = DT_DIR, DT_REG or DT_LNK; any other type, and a failed lstat,
+; returns 0 (DT_UNKNOWN) and discards the error.  Never changes path_buf.
+    global resolve_type:function (resolve_type.end_func - resolve_type)
+resolve_type:
+    mov rax, SYS_newfstatat
+    mov rdi, AT_FDCWD
+    lea rsi, [r14+path_buf]
+    lea rdx, [r14+statbuf]
+    mov r10, 0x100                   ; AT_SYMLINK_NOFOLLOW
+    syscall
+    test rax, rax
+    js .other
+    mov eax, [r14+statbuf+24]        ; st_mode
+    and eax, 0xF000
+    cmp eax, 0x4000                  ; S_IFDIR
+    je .dir
+    cmp eax, 0x8000                  ; S_IFREG
+    je .reg
+    cmp eax, 0xA000                  ; S_IFLNK
+    je .lnk
+.other:
+    xor eax, eax
+    ret
+.dir:
+    mov eax, DT_DIR
+    ret
+.reg:
+    mov eax, DT_REG
+    ret
+.lnk:
+    mov eax, DT_LNK
+    ret
+resolve_type.end_func:
+
+; entry_pipeline: run one entry through the ignore rules, the cached or
+; pattern name match, the type filter and print_entry.  r12 = name record,
+; edi = resolved d_type, r13 = is-dir flag, rbx = base path length and rbp =
+; path length (current only when the path has been built).  mkpath runs only
+; when a check or the print needs the path: before ig_ignored when the ignore
+; chain is non-empty, before type_ok for a link, and before print_entry.  A
+; directory's path must already be current, because the caller descends with
+; rbp.  On return r13 is 0 when the entry was ignored or its path overflowed,
+; so the caller skips it; otherwise r13 is still the is-dir flag, and a
+; nonzero value means the caller may descend.  Preserves rbx, r12, r14 and
+; r15; rbp is left holding mkpath's entry length (-1 on overflow).
+    global entry_pipeline:function (entry_pipeline.end_func - entry_pipeline)
+entry_pipeline:
+    push rdi                         ; resolved type; calls below eat edi
+    mov rax, [r14+ig_chain]
+    test rax, rax
+    jz .check_match
+    call walk_dir.mkpath             ; ig_ignored() wants the match path
+    test rbp, rbp
+    js .skip
+    mov rdi, r12
+    lea rsi, [r14+ign_buf]
+    mov rdx, r13
+    call ig_ignored
+    test al, al
+    jnz .skip
+.check_match:
+    test byte [r12-1], 1             ; parse-time cached name match
+    jnz .name_ok
+    mov rdx, [pat_len]
+    test rdx, rdx
+    jz .name_ok                      ; no pattern still needs the type gate
+    mov rdi, r12
+    mov rsi, [pat_ptr]
+    call name_match                  ; directories and unknown types only
+    test al, al
+    jz .proceed
+.name_ok:
+    cmp byte [type_filter], 0
+    je .matched
+    cmp byte [rsp], DT_LNK
+    jne .gate_call
+    call walk_dir.mkpath             ; type_ok follows the link via path_buf
+    test rbp, rbp
+    js .skip
+.gate_call:
+    mov edi, [rsp]
+    call type_ok
+    test al, al
+    jz .proceed
+.matched:
+    call walk_dir.mkpath             ; print_entry() wants the path
+    test rbp, rbp
+    js .skip
+    mov rdi, rbp
+    mov rsi, r13
+    call print_entry
+.proceed:
+    add rsp, 8
+    ret
+.skip:
+    xor r13d, r13d                   ; the caller's descent test skips it
+    add rsp, 8
+    ret
+entry_pipeline.end_func:
+
 ; walk_wide: rdi = sorted table, rsi = N.  Prepass resolves types and filters,
 ; creating and pushing a group for every non-ignored directory before any of
 ; them is linked.  Publish then walks the table in order, prints the matching
@@ -6088,33 +6190,8 @@ walk_wide:
     test rbp, rbp
     js .ignored
     mov qword [rsp+48], 1
-    mov rax, SYS_newfstatat          ; DT_UNKNOWN: lstat without following
-    mov rdi, AT_FDCWD
-    lea rsi, [r14+path_buf]
-    lea rdx, [r14+statbuf]
-    mov r10, 0x100
-    syscall
-    test rax, rax
-    js .type_unknown
-    mov eax, [r14+statbuf+24]
-    and eax, 0xF000
-    cmp eax, 0x4000
-    je .type_dir
-    cmp eax, 0x8000
-    je .type_file
-    cmp eax, 0xA000                  ; S_IFLNK
-    je .type_lnk
-.type_unknown:
-    mov byte [r12-2], DT_UNKNOWN
-    jmp .have_type
-.type_lnk:
-    mov byte [r12-2], DT_LNK
-    jmp .have_type
-.type_dir:
-    mov byte [r12-2], DT_DIR
-    jmp .have_type
-.type_file:
-    mov byte [r12-2], DT_REG
+    call resolve_type                ; DT_UNKNOWN: lstat without following
+    mov byte [r12-2], al             ; write the resolved type back
 .have_type:
     movzx r13d, byte [r12-2]
     mov [rsp+40], r13
@@ -6580,87 +6657,21 @@ walk_dir:
     call .mkpath                     ; DT_UNKNOWN: lstat, do not follow links
     test rbp, rbp
     js .next
-    mov rax, SYS_newfstatat
-    mov rdi, AT_FDCWD
-    lea rsi, [r14+path_buf]
-    lea rdx, [r14+statbuf]
-    mov r10, 0x100                   ; AT_SYMLINK_NOFOLLOW
-    syscall
-    test rax, rax
-    js .notdir
-    mov eax, [r14+statbuf+24]        ; st_mode
-    and eax, 0xF000
-    cmp eax, 0x4000                  ; S_IFDIR
-    je .unknown_dir
-    cmp eax, 0x8000                  ; S_IFREG
-    je .unknown_file
-    cmp eax, 0xA000                  ; S_IFLNK
-    je .unknown_lnk
-    jmp .notdir                      ; special entries remain type 0
-.unknown_lnk:
-    mov byte [rsp+56], DT_LNK        ; not a directory: no descent
-    jmp .notdir
-.unknown_dir:
-    mov byte [rsp+56], DT_DIR
-    jmp .isdir
-.unknown_file:
-    mov byte [rsp+56], DT_REG
-    jmp .notdir
+    call resolve_type
+    mov [rsp+56], rax
+    cmp al, DT_DIR
+    je .isdir
+.notdir:
+    xor r13d, r13d
+    jmp .resolved
 .isdir:
     mov r13d, 1
     call .mkpath
     test rbp, rbp
     js .next
-    jmp .resolved
-.notdir:
-    xor r13d, r13d
 .resolved:
-    mov rax, [r14+ig_chain]
-    test rax, rax
-    jz .check_match
-.ig_check:
-    call .mkpath                     ; ig_ignored() wants the match path
-    test rbp, rbp
-    js .next
-    mov rdi, r12
-    lea rsi, [r14+ign_buf]
-    mov rdx, r13
-    call ig_ignored
-    test al, al
-    jnz .next
-.check_match:
-    test byte [r12-1], 1             ; parse-time cached name match
-    jnz .name_ok
-    mov rdx, [pat_len]
-    test rdx, rdx
-    jz .name_ok                      ; no pattern still needs the type gate
-    mov rdi, r12
-    mov rsi, [pat_ptr]
-    call name_match                  ; directories and unknown types only
-    test al, al
-    jz .descend
-.name_ok:
-    cmp byte [type_filter], 0
-    je .matched
     movzx edi, byte [rsp+56]
-    cmp edi, DT_LNK
-    jne .gate_call
-    call .mkpath                     ; type_ok follows the link via path_buf
-    test rbp, rbp
-    js .next
-.gate_call:
-    movzx edi, byte [rsp+56]
-    call type_ok
-    test al, al
-    jz .descend
-.matched:
-    call .mkpath                     ; print_entry() wants the path
-    test rbp, rbp
-    js .next
-    mov rdi, rbp
-    mov rsi, r13
-    call print_entry
-.descend:
+    call entry_pipeline
     test r13, r13
     jz .next
     mov [r14+path_len], rbp
@@ -6839,35 +6850,11 @@ walk_range:
     call walk_dir.mkpath
     test rbp, rbp
     js .next
-    mov rax, SYS_newfstatat
-    mov rdi, AT_FDCWD
-    lea rsi, [r14+path_buf]
-    lea rdx, [r14+statbuf]
-    mov r10, 0x100
-    syscall
-    test rax, rax
-    js .unknown_other
-    mov eax, [r14+statbuf+24]
-    and eax, 0xF000
-    cmp eax, 0x4000
-    je .unknown_dir
-    cmp eax, 0x8000
-    je .unknown_file
-    cmp eax, 0xA000                  ; S_IFLNK
-    je .unknown_lnk
-.unknown_other:
-    xor r13d, r13d
-    jmp .resolved
-.unknown_lnk:
-    mov byte [rsp+0], DT_LNK
-    xor r13d, r13d
-    jmp .resolved
-.unknown_dir:
-    mov byte [rsp+0], DT_DIR
-    mov r13d, 1
-    jmp .resolved
-.unknown_file:
-    mov byte [rsp+0], DT_REG
+    call resolve_type
+    mov [rsp+0], rax
+    cmp al, DT_DIR
+    je .isdir
+.notdir:
     xor r13d, r13d
     jmp .resolved
 .isdir:
@@ -6875,46 +6862,9 @@ walk_range:
     test rbp, rbp
     js .next
     mov r13d, 1
-    mov byte [rsp+0], DT_DIR
-    jmp .resolved
-.notdir:
-    call walk_dir.mkpath
-    test rbp, rbp
-    js .next
-    xor r13d, r13d
 .resolved:
-    mov rax, [r14+ig_chain]
-    test rax, rax
-    jz .check_match
-    mov rdi, r12
-    lea rsi, [r14+ign_buf]
-    mov rdx, r13
-    call ig_ignored
-    test al, al
-    jnz .next
-.check_match:
-    test byte [r12-1], 1
-    jnz .name_ok
-    mov rdx, [pat_len]
-    test rdx, rdx
-    jz .name_ok
-    mov rdi, r12
-    mov rsi, [pat_ptr]
-    call name_match
-    test al, al
-    jz .descend
-.name_ok:
-    cmp byte [type_filter], 0
-    je .matched
     movzx edi, byte [rsp+0]
-    call type_ok
-    test al, al
-    jz .descend
-.matched:
-    mov rdi, rbp
-    mov rsi, r13
-    call print_entry
-.descend:
+    call entry_pipeline
     test r13, r13
     jz .next
     mov [r14+path_len], rbp
