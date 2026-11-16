@@ -171,6 +171,12 @@ def zfind_path(pytestconfig: pytest.Config) -> Path:
 
 
 @pytest.fixture(scope="session")
+def testdata() -> Path:
+    """Root of the generated fixture trees, one subdirectory per tree."""
+    return DATA_DIR
+
+
+@pytest.fixture(scope="session")
 def serial_binary_path(pytestconfig: pytest.Config) -> Path:
     """Configured serial binary path; unlike serial_zfind_path, it need not exist.
 
