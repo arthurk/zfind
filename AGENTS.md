@@ -10,33 +10,33 @@ Assembly filesystem searcher.
   comment of `zfind.asm`, `help_msg` in `.rodata` (every line at most 80
   columns, checked in `tests/test_cli.py`), and `README.md`.
 
-## Reading the source
-
+## Finding code
+ 
 `src/x86_64/zfind.asm` is over 5,000 lines with long comment blocks. Never read
-it whole and never `grep -C` it. Look things up with `scripts/xref.py`, then
-read a small window: set the `limit` of a read to 80 lines or less.
-
-- `scripts/xref.py SYMBOL` lists the *code* references to a symbol (comments are
-  ignored), one per line as `line<TAB>function<TAB>source`. The line whose
-  source is `SYMBOL:` is the definition. It works for functions, data labels,
-  `%define` constants, struc fields (`TSTATE.tab_ptr`) and local labels, either
-  as written (`.opt_limit_next`) or qualified as nm and objdump print them
-  (`walk_dir.mkpath`). The file defaults to `src/x86_64/zfind.asm`.
-- More than 25 hits are cut off with a count. Use `-c SYMBOL` for just the
-  functions that use it, with counts, or `--all` for every line.
-- `scripts/xref.py -d SYMBOL` shows where it is defined. For a function it gives
-  the line range, from the comment above it to its `.end_func` label:
-  `NAME: lines FIRST-LAST (N lines); label at LINE`.
-- Do not read a whole function that is over 100 lines: find the part you need
-  through one of its local labels, then read around it.
-- xref skips comments. For prose (the header comment, help text), or to locate
-  a hunk of an issue's diff, grep a distinctive phrase from it:
-  `grep -nF 'which add to it' src/x86_64/zfind.asm | head -20`. Then read about
-  10 lines around the hit.
-- If an issue includes a verified diff, apply it and let the tests verify; do
-  not re-derive what it already states.
+it whole and never `grep -C` it unbounded.
+ 
+- A symbol (function, label, `%define` constant, struc field, local label such
+  as `.opt_limit_next` or `walk_dir.mkpath`):
+  - `scripts/xref.py SYM [SYM...]` lists the code references (comments are
+    ignored) as `line<TAB>function<TAB>source`. More than 25 are cut off with a
+    count; `--all` lifts it.
+  - `scripts/xref.py -C 3 SYM` adds 3 lines of context around each hit
+    (`N:` a hit, `N-` context): usually a replacement for a Read.
+  - `scripts/xref.py -c SYM` lists only the functions that use it, with counts.
+  - `scripts/xref.py -d SYM` shows where it is defined; for a function, its
+    line range from the comment above it to its `.end_func`.
+- A pattern (an instruction, an immediate): start with the mnemonic so the
+  `db "...", 10` help-text lines do not match, skip comments, and bound it:
+  `grep -nE -C2 '^\s*(cmp|mov)\b[^;]*, (4|8|10)\b' FILE | head -80`
+  (FILE is `src/x86_64/zfind.asm`)
+- Prose (the header comment, help text, a hunk of an issue's diff):
+  `grep -nF 'a distinctive phrase' FILE | head -20`, then read about 10
+  lines around the hit.
+- Do not read a whole function over 100 lines: use `xref.py -C 5 .label` on
+  one of its local labels.
 - `res_type` is indexed by `d_type`; use `TYPE_*` for masks and `DT_*` for
   values.
+- If an issue includes a verified diff, apply it and let the tests verify.
 
 ## Tests
 
@@ -117,7 +117,7 @@ changed. Remove the temporary worktree when finished.
   not select files by extension. Use a substring known to occur in a basename
   when testing matching.
 - Each shell call is a fresh shell: set variables and use them in the same call.
-- End experiments with `| head` or `| wc -l`, and write their output files
+- Bound every experiment with `| head -40` or `| wc -l`, and write output files
   outside the tree zfind searches.
 
 ## Autonomous debugging and profiling
@@ -206,8 +206,6 @@ are present, stop and ask; never mix them into the issue. Branch with
    failures included, with long output inside `<details>`. Then stop.
 
 The comment is evidence, not a summary: one line per command and its result.
-
-Do not create `PLAN.md`, `IMPLEMENTATION.md` or `JOURNAL.md`.
 
 ## Commits and issues
 

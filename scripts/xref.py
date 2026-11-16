@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
-"""Find where an assembly symbol is defined and used, without reading the file.
+"""Find where assembly symbols are defined and used, without reading the file.
 
-    xref.py SYMBOL [FILE]       references: line number, function, source line
-    xref.py -c SYMBOL [FILE]    only the functions that use it, with counts
-    xref.py -d SYMBOL [FILE]    the definition; for a function, its line range
+    xref.py SYMBOL... [FILE]       references: line number, function, source line
+    xref.py -c SYMBOL... [FILE]    only the functions that use it, with counts
+    xref.py -d SYMBOL... [FILE]    the definition; for a function, its line range
+    xref.py -C N SYMBOL...         show N lines of context around each hit
 
 Comments are ignored, so a symbol mentioned only in prose never shows up (use
 grep -n for that). SYMBOL can be a function, a data label, a %define constant,
 a local label (.opt_limit_next), a local label qualified by its function the way
 nm and objdump print it (walk_dir.mkpath), or a struc field (TSTATE.tab_ptr).
-A long reference list is cut after --max lines: use -c, or --all.
+Output is capped (see --max and MAX_CONTEXT_LINES); the last line says what was
+left out and how to get it.
 
 Self-test:  python3 -m doctest scripts/xref.py
 """
 import argparse
+import os
 import re
+import signal
 import sys
 from collections import Counter
 
 DEFAULT_FILE = "src/x86_64/zfind.asm"
-DEFAULT_MAX = 25
+DEFAULT_MAX = 25  # references listed per symbol
+MAX_CONTEXT = 15  # lines of context on each side of a hit, at most
+MAX_CONTEXT_LINES = 120  # lines printed per symbol in context mode
 
 # Lines that change "where we are" in the file.
 SECTION = re.compile(r"^\s*section\s+(\S+)")  # section .text
@@ -200,61 +206,149 @@ def function_extent(lines, name):
     return first + 1, label + 1, last + 1
 
 
-def show_definition(lines, symbol, path):
+def merge_windows(hit_numbers, context, total):
+    """Line ranges of `context` lines around each hit, overlapping ones merged.
+
+    >>> merge_windows([10, 12, 40], 2, 100)
+    [(8, 14), (38, 42)]
+    >>> merge_windows([1, 99], 3, 100)
+    [(1, 4), (96, 100)]
+    >>> merge_windows([5, 9], 1, 100)  # 4-6 and 8-10 do not touch, so no merge
+    [(4, 6), (8, 10)]
+    >>> merge_windows([5, 8], 1, 100)  # 4-6 and 7-9 are adjacent
+    [(4, 9)]
+    """
+    windows = []
+    for n in sorted(hit_numbers):
+        start, end = max(1, n - context), min(total, n + context)
+        if windows and start <= windows[-1][1] + 1:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+    return windows
+
+
+def print_rows(rows, limit):
+    """One `line<TAB>function<TAB>source` row per hit, cut off at `limit`."""
+    for number, function, text in rows[:limit]:
+        print(f"{number}\t{function}\t{text}")
+    if limit is not None and len(rows) > limit:
+        print(f"... {len(rows) - limit} more; use -c for the functions, --all for every line")
+
+
+def print_windows(lines, rows, context, line_cap):
+    """Print grep -n -C style windows around the hits: `N:` a hit, `N-` context.
+
+    Each window starts with `-- FUNCTION`. Stops before a window that would push
+    the output past `line_cap` lines (the first window is always printed).
+    Returns how many hits were shown.
+    """
+    function_at = {number: function for number, function, _ in rows}
+    hits = set(function_at)
+    printed = shown_hits = 0
+    for start, end in merge_windows(hits, context, len(lines)):
+        if printed and line_cap is not None and printed + (end - start + 2) > line_cap:
+            break
+        first_hit = min(n for n in hits if start <= n <= end)
+        print(f"-- {function_at[first_hit]}")
+        for n in range(start, end + 1):
+            print(f"{n}{':' if n in hits else '-'}{lines[n - 1]}")
+        printed += end - start + 2
+        shown_hits += sum(1 for n in hits if start <= n <= end)
+    return shown_hits
+
+
+def report_missing(args, message):
+    """With several symbols the message must sit under its `== SYMBOL ==` header."""
+    print(message, file=sys.stdout if len(args.symbols) > 1 else sys.stderr)
+
+
+def show_definition(lines, symbol, args):
     extent = function_extent(lines, symbol)
     if extent:
         first, label, last = extent
         print(f"{symbol}: lines {first}-{last} ({last - first + 1} lines); label at {label}")
-        return 0
-    found = list(definitions(lines, symbol))
-    if not found:
-        print(f"no definition of {symbol!r} in {path}", file=sys.stderr)
-        return 1
-    for number, function, text in found:
-        print(f"{number}\t{function}\t{text}")
-    return 0
+        return True
+    rows = list(definitions(lines, symbol))
+    if not rows:
+        report_missing(args, f"no definition of {symbol!r} in {args.file}")
+        return False
+    show_hits(lines, rows, args)
+    return True
 
 
-def main():
+def show_hits(lines, rows, args):
+    limit = None if args.all else args.max
+    if args.context:
+        line_cap = None if args.all else MAX_CONTEXT_LINES
+        shown = print_windows(lines, rows[:limit], min(args.context, MAX_CONTEXT), line_cap)
+        if shown < len(rows):
+            print(f"... {len(rows) - shown} more hits not shown; use -c for the functions, "
+                  "--all, or a smaller -C")
+    else:
+        print_rows(rows, limit)
+
+
+def show_symbol(lines, symbol, args):
+    """Print the answer for one symbol; False when there was nothing to show."""
+    if args.definition:
+        return show_definition(lines, symbol, args)
+
+    rows = list(references(lines, symbol))
+    if not rows:
+        report_missing(args, f"no code references to {symbol!r} in {args.file}")
+        return False
+    if args.callers:
+        # Counter keeps first-seen order, so this reads top-to-bottom through the file.
+        for function, count in Counter(fn for _, fn, _ in rows).items():
+            print(f"{function} ({count})")
+    else:
+        show_hits(lines, rows, args)
+    return True
+
+
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("symbol")
-    parser.add_argument("file", nargs="?", default=DEFAULT_FILE)
+    parser.add_argument("symbols", nargs="+", metavar="SYMBOL", help="then optionally FILE")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
-        "-c", "--callers", action="store_true", help="only list functions, with counts"
-    )
+    mode.add_argument("-c", "--callers", action="store_true", help="only list functions, with counts")
     mode.add_argument(
         "-d", "--definition", action="store_true",
-        help="where SYMBOL is defined; for a function, its line range",
+        help="where each SYMBOL is defined; for a function, its line range",
+    )
+    parser.add_argument(
+        "-C", "--context", type=int, default=0, metavar="N",
+        help=f"print N lines around each hit (at most {MAX_CONTEXT})",
     )
     parser.add_argument(
         "--max", type=int, default=DEFAULT_MAX, metavar="N",
-        help=f"cut the reference list after N lines (default {DEFAULT_MAX})",
+        help=f"cut the reference list after N hits per symbol (default {DEFAULT_MAX})",
     )
-    parser.add_argument("--all", action="store_true", help="do not cut the list")
-    args = parser.parse_args()
+    parser.add_argument("--all", action="store_true", help="do not cut the output")
+    args = parser.parse_intermixed_args()  # options may sit between the symbols and the file
 
+    # The last argument is the file when it names one; otherwise every argument is a symbol.
+    args.file = DEFAULT_FILE
+    if len(args.symbols) > 1 and os.path.isfile(args.symbols[-1]):
+        args.file = args.symbols.pop()
+    elif os.path.isfile(args.symbols[0]) and len(args.symbols) == 1:
+        parser.error(f"{args.symbols[0]} is a file; give a symbol to look up in it")
+    if args.callers and args.context:
+        parser.error("-c and -C cannot be combined")
+    return args
+
+
+def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `| head` must not raise
+    args = parse_args()
     lines = read_lines(args.file)
-    if args.definition:
-        return show_definition(lines, args.symbol, args.file)
 
-    hits = list(references(lines, args.symbol))
-    if not hits:
-        print(f"no code references to {args.symbol!r} in {args.file}", file=sys.stderr)
-        return 1
-
-    if args.callers:
-        # Counter keeps first-seen order, so this reads top-to-bottom through the file.
-        for function, count in Counter(fn for _, fn, _ in hits).items():
-            print(f"{function} ({count})")
-        return 0
-
-    limit = None if args.all else args.max
-    for number, function, text in hits[:limit]:
-        print(f"{number}\t{function}\t{text}")
-    if limit is not None and len(hits) > limit:
-        print(f"... {len(hits) - limit} more; use -c for the functions, --all for every line")
-    return 0
+    found_any = False
+    for symbol in args.symbols:
+        if len(args.symbols) > 1:
+            print(f"== {symbol} ==")
+        found_any |= show_symbol(lines, symbol, args)
+    return 0 if found_any else 1
 
 
 if __name__ == "__main__":
