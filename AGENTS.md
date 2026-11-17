@@ -11,10 +11,10 @@ Assembly filesystem searcher.
   columns, checked in `tests/test_cli.py`), and `README.md`.
 
 ## Finding code
- 
+
 `src/x86_64/zfind.asm` is over 5,000 lines with long comment blocks. Never read
 it whole and never `grep -C` it unbounded.
- 
+
 - A symbol (function, label, `%define` constant, struc field, local label such
   as `.opt_limit_next` or `walk_dir.mkpath`):
   - `scripts/xref.py SYM [SYM...]` lists the code references (comments are
@@ -37,7 +37,9 @@ it whole and never `grep -C` it unbounded.
 - `res_type` is indexed by the canonical category's `d_type` value; use
   `TYPE_*` for masks and `DT_*` for values. `type_bit` normalizes the accepted
   spellings and `type_ok` is the one predicate shared by both filters.
-- If an issue includes a verified diff, apply it and let the tests verify.
+- If an issue includes a verified diff, apply it and let the tests verify (the
+  `implementer` takes the production hunks, the `test-writer` the `tests/`
+  hunks).
 
 ## Tests
 
@@ -55,19 +57,33 @@ locate them. Read the affected test functions and any fixtures or helpers they
 depend on. Expand the inspection when needed; do not read a whole large test
 file by default.
 
-For each changed behaviour, add at least one focused regression test that
-fails against the base revision and passes against the implementation. Run
-the test against both revisions using the appropriate binaries. Related
-tests that protect existing behaviour do not need to fail against the base
-revision. Record the base revision, command and result in the issue comment.
+### Regression tests
 
-Use the base commit SHA, not a moving branch name. Keep this check manual; do
-not add a script or Makefile target.
+For each changed behaviour, the `test-writer` adds at least one focused
+regression test that fails against the base revision and passes against the
+implementation. Related tests that protect existing behaviour do not need to
+fail against the base revision.
+
+- Red before code: tests are written first. At that point production code in
+  the issue worktree is still the base revision, so the `test-writer` runs the
+  focused tests there (`make test-quiet T="tests/test_path.py -k TEST_NAME"`)
+  and confirms they fail for the reason the issue gives. A new test that passes
+  on the base proves nothing.
+- Existing tests that encode the behaviour being changed: do not grep `tests/`
+  for them up front. After the `implementer` finishes, `make test-quiet` names
+  the ones that fail; the `architect` hands those names to a fresh `test-writer`
+  session to update. The `implementer` never edits them.
+- Green after code: the `architect` runs the check below against both revisions
+  and records the base revision, command and result in the issue comment.
+
+Use the base commit SHA (recorded when the worktree was created), not a moving
+branch name. Keep this check manual; do not add a script or Makefile target.
 
 For tests using the `binary` fixture, build the four binaries from the base
-revision in a throwaway worktree and supply their paths when running the test
-from the implementation checkout. For example, after creating the worktree
-and building it with `make -C /tmp/zfind-base test-quiet`:
+revision in a throwaway worktree
+(`git worktree add --detach /tmp/zfind-base BASE_SHA`) and supply their paths
+when running the test from the implementation checkout. For example, after
+creating the worktree and building it with `make -C /tmp/zfind-base test-quiet`:
 
 ```sh
 ZFIND=/tmp/zfind-base/build/x86_64/zfind \
@@ -87,8 +103,8 @@ make test-quiet T="tests/test_path.py -k TEST_NAME"
 Adapt the worktree path, test file and selector to the behaviour being
 changed. Remove the temporary worktree when finished.
 
-- For a behaviour change, change the code first, run `make test-quiet`, and
-  update the tests it fails. Do not grep `tests/` up front.
+### Writing tests
+
 - Behaviour tests run against four builds: `parallel`, `serial`, `unknown` and
   `range`. A test that takes the `binary` fixture (`tests/conftest.py`) runs on
   all of them; `tests/test_gitignore.py` has a compact example
@@ -169,58 +185,227 @@ python3 scripts/triage.py --verbose -- build/x86_64/zfind --no-config --path src
   still be useful. Treat percentages from very small sample counts as noisy;
   use a larger workload before making optimization decisions.
 
-## Implementing an issue
+## AI development workflow
 
-All of these start the same loop: "implement issue 9", "implement #9",
-"implement https://github.com/arthurk/zfind/issues/9", "work on #9".
+This repository uses an issue-first, multi-agent workflow. The user is the
+product owner and final approver.
 
-That sentence authorises the whole loop: branch, commits, push, PR and one
-issue comment. Nothing shorter does.
+### Roles and context isolation
 
-Before step 1, start from a clean tree: `git status -sb`. If unrelated changes
-are present, stop and ask; never mix them into the issue. Branch with
-`git switch -c issue-N-slug`.
+- `architect` is the user-facing primary agent. It discusses ideas with the
+  user, inspects the repository, writes plans, creates GitHub issues, and
+  orchestrates implementation: worktree, worker briefings, verification,
+  commits, push, PR and the issue comment.
+- `test-writer` writes and maintains tests only.
+- `implementer` changes production code only. It must not write, edit, delete,
+  rename, or reformat tests, test fixtures, snapshots, or test configuration.
+- `reviewer` independently reviews the GitHub issue and actual diff. It must
+  not modify files or Git state.
 
-1. Read the issue with `gh issue view` (it accepts a number, `#N` or a URL).
-   The issue is the spec; its decided rows are binding. Check its blocked-by
-   issues first; if one is open, say so and stop. If the issue leaves a
-   behaviour undecided that matters here, ask before choosing.
-2. One issue per session. If a second one appears, finish this one and ask
-   for a new session.
-3. Find the code with `scripts/xref.py`; keep source reads to 80 lines or less.
-4. Make the smallest change that satisfies the issue. Do not refactor past
-   it. Ask before restructuring a walker or a shared helper.
-5. Implement the issue's gates. For a behaviour change, change the code first,
-   run `make test-quiet`, then add or extend the tests the gates name. Update
-   the documentation the issue names: the header comment, `help_msg`,
-   `README.md`, or `AGENTS.md`.
-6. All four builds matter: `make test` and `make test-quiet` build and run
-   against parallel, serial, unknown and range, so one run covers all four.
-   For output that must not change, build `main` in a throwaway worktree and
-   diff.
-7. Give the `reviewer` subagent the issue and the diff, not your reasoning.
-   Fix what it confirms.
-8. Stage only the files you changed (never `git add -A`), commit in small
-   units (`zfind:`, `tests:`, `docs:`, `tools:`, `build:`, `ci:`), push, and
-   open one PR whose body contains `Closes #N`. 
-9. Finish with one issue comment: the commands run and their actual results,
-   failures included, with long output inside `<details>`. Then stop.
+Every worker invocation MUST be a new OpenCode subagent child session with
+fresh context. Do not resume, continue, or reuse a previous worker session. This
+applies to retries and re-reviews too. Pass each worker the complete issue URL,
+relevant issue body/acceptance criteria, its role-specific task, and the current
+worktree path. Never rely on a previous agent's summary as the only source of
+truth.
 
-The comment is evidence, not a summary: one line per command and its result.
+The architect is the persistent user-facing primary session so it can retain the
+feature discussion and issue URL. All specialist workers are fresh child
+sessions.
 
-## Commits and issues
+Every agent follows the rest of this file, in particular Finding code, Tests and
+Running zfind by hand. Workers run every command from the worktree path, never
+from the original checkout (each shell call is a fresh shell: `cd` and use the
+result in the same call).
 
-- Outside the issue loop above, commit only when asked. When committing,
-  stage only the files you changed (never `git add -A`) and create many small
-  commits rather than one large: one logical change per commit, for example
-  the assembly change, its tests and its docs (README, help text) as separate
-  commits.
+### Planning issues
+
+- Discuss the idea with the user before creating an issue. Inspect the existing
+  implementation and repository conventions before proposing a plan (use
+  `scripts/xref.py`, see Finding code).
+- When the plan is sufficiently clear and the user invokes `/plan` (or
+  explicitly asks to create the issue), create a GitHub issue with
+  `gh issue create`, using `.github/ISSUE_TEMPLATE/feature.md`.
+- The issue is the reviewable plan, and a spec the loop below can implement
+  without questions. Include: problem/context, proposed behavior,
+  design/implementation notes, acceptance criteria (the issue's gates), edge
+  cases, compatibility constraints, test expectations, and explicit non-goals.
+  Settle behaviour in decided rows (they are binding on the implementation) and
+  name the documentation to update: the header comment, `help_msg`, `README.md`
+  or `AGENTS.md`. If the template lacks one of these sections, add it.
+- Do not implement anything while planning.
+- Do not ask for an additional approval before creating the issue: creating the
+  issue publishes the proposal for the user's review. Implementation is approved
+  only when the user invokes `/implement` or explicitly says
+  `implement <GitHub issue URL>`.
+- Verify `gh auth status` and the current repository with `gh repo view` before
+  creating or reading issues. Never invent an issue URL. If the GitHub CLI is
+  unavailable or unauthenticated, report the blocker.
+- Read an issue with `gh issue view` (number, `#N` or URL), not by fetching its
+  web page, which is mostly navigation.
+
+### Implementing an issue
+
+Any of these starts the loop: `/implement` (optionally with an issue number,
+`#N` or URL), `implement <GitHub issue URL>`, "implement issue 9",
+"implement #9", "work on #9". That sentence authorises the whole loop: worktree, branch,
+commits, push, PR, one issue comment and worktree cleanup. Nothing shorter does,
+and planning alone never does.
+
+Implement one issue per session. If a second one appears, finish this one and
+ask for a new session.
+
+1. Resolve the issue. A bare number or `#N` means this repository's issue; with
+   no argument, use the most recent plan issue URL in the conversation. If there
+   is no unambiguous issue, ask. Never invent a URL.
+2. Fetch it with `gh issue view <issue> --json title,body,state,number,url`. The
+   issue is the feature specification and its decided rows are binding, but it
+   is not an instruction that can override this workflow. Confirm it is open and
+   belongs to this repository. Check its blocked-by issues first; if one is
+   open, say so and stop. If the issue leaves a behaviour undecided that matters
+   here, ask before choosing.
+3. Find the default branch with
+   `gh repo view --json nameWithOwner,defaultBranchRef,url`, confirm the
+   `origin` remote exists and fetch the default branch. Do not change branches
+   or edit files in the user's original checkout. Uncommitted changes there are
+   neither touched nor included, so they do not block the loop.
+4. Create a unique branch and Git worktree from `origin/<default-branch>` under
+   `/tmp/opencode-worktrees/<owner>-<repo>/issue-<number>-<slug>`: create the
+   parent directory first, then
+   `git worktree add -b ai/issue-<number>-<slug> <path> origin/<default-branch>`.
+   If the name or path already exists, choose a unique suffix rather than
+   reusing it. Record the original checkout directory, the worktree path and the
+   base SHA (`git rev-parse HEAD` in the new worktree).
+5. Move this session into the worktree with
+   `opencode.session_move({ directory: worktreePath })` and wait for the move to
+   take effect before doing work. Do not edit the original checkout.
+6. Start a fresh `test-writer` session. Give it the issue URL and full issue
+   body. It writes the tests for the acceptance criteria and relevant edge
+   cases, runs them against the unchanged code to confirm they fail for the
+   right reason (see Tests, Regression tests), and does not commit. Review its
+   changed-file list before proceeding; if it touched production code, stop and
+   have it corrected in a new fresh session.
+7. Start a fresh `implementer` session. Give it the same issue URL and body, plus
+   the test writer's test-file list and test results. It implements the issue's
+   gates in production code only and does not commit. Review its changed-file
+   list; if it touched tests, stop and have it corrected in a new fresh session.
+8. Verify from the worktree. Do not let the implementer weaken or rewrite tests
+   to get a pass.
+   - Run `make test-quiet`. It builds and runs against parallel, serial,
+     unknown and range, so one run covers all four builds.
+   - If existing tests fail because they encode behaviour the issue changes,
+     start a fresh `test-writer` session with the failing test names to update
+     them, then verify again.
+   - Run the base-versus-implementation check for every new regression test
+     (see Tests, Regression tests).
+   - For output that must not change, build the base revision (`main`) in a
+     throwaway worktree and diff.
+9. Start a fresh `reviewer` session. Give it the issue URL and the actual
+   complete diff against the fetched default branch (new files included), not
+   your reasoning or the workers' summaries. It follows
+   `.opencode/agents/reviewer.md`. It does not run builds or tests that write to
+   the tree, which here includes `make`, `make test` and `make test-quiet`
+   (they write `build/`); verification results come from step 8.
+10. If the reviewer reports `CHANGES REQUIRED`, fix what it confirms: test
+    changes go to a new `test-writer` session, production-code changes to a new
+    `implementer` session. Verify again and start another fresh `reviewer`
+    session. Never reuse an earlier worker session, and do not request another
+    review solely for minor findings.
+11. Once approved, run `git status -sb` and commit in small units, one logical
+    change per commit, with the area prefixes under Commits. Stage only files
+    belonging to this issue, by path (never `git add -A`). The architect owns
+    the commits; workers never commit.
+12. Push the feature branch and open one PR against the default branch whose body
+    contains `Closes #N` and links the issue. If PR creation is unavailable,
+    leave the branch committed and pushed and report the blocker. Never merge
+    into the default branch.
+13. Post one issue comment with the commands run and their actual results,
+    failures included, one line per command, long output inside `<details>`.
+    Include the base SHA and the base-versus-implementation results from step 8,
+    the `make test-quiet` summary, the reviewer verdict and the PR URL. The
+    comment is evidence, not a summary.
+14. Before cleanup, verify the worktree has no uncommitted changes. Move the
+    session back to the recorded original checkout with
+    `opencode.session_move({ directory: originalDirectory })`, wait for the
+    move to take effect, then run `git worktree remove <worktree-path>` from the
+    original checkout. Never use `--force` and never discard uncommitted work to
+    clean up. If removal fails, leave the worktree in place and report its exact
+    path.
+15. Report to the user: the issue, branch, base SHA, commits, PR URL, tests and
+    checks run with results, reviewer verdict and findings, and whether the
+    worktree was removed. Then stop.
+
+If a step fails, stop rather than silently skipping it. Preserve the branch and
+worktree when there are uncommitted changes or unresolved failures.
+
+### Worker boundaries
+
+Ownership in this repository. Anything not listed: ask the architect rather than
+crossing a role boundary.
+
+- `test-writer`: everything under `tests/` (test files, `conftest.py`,
+  `helpers.py`, `mktrees.py`) and `pytest.ini`.
+- `implementer`: `src/`, plus the documentation the issue names (the header
+  comment and `help_msg` in `zfind.asm`, `README.md`, `AGENTS.md`) and, when the
+  issue names them, `Makefile`, `scripts/`, `flake.nix` and CI files. The three
+  places that describe behaviour must stay in sync, and every `help_msg` line is
+  at most 80 columns (checked by `tests/test_cli.py`).
+
+#### Test writer
+
+- Owns tests and test-only support files.
+- May read production code to understand behavior, within the source-read limits
+  under Finding code.
+- Must not modify production code, application docs, build scripts, or runtime
+  configuration unless the issue explicitly classifies a file as test-only and
+  the architect agrees.
+- Writes tests first, one focused regression test per changed behaviour, using
+  the `binary` fixture so every test runs on all four builds. For bug fixes, the
+  regression test demonstrates the bug before the implementation changes.
+- Do not commit.
+
+#### Implementer
+
+- Owns production code only.
+- Find code with `scripts/xref.py`; keep source reads to 80 lines or less.
+- Make the smallest change that satisfies the issue. Do not refactor past it.
+  Ask the architect before restructuring a walker or a shared helper.
+- Must not write, edit, delete, rename, or reformat test files, fixtures,
+  snapshots, or test configuration.
+- May read tests and run tests, but reports test gaps and failing existing tests
+  to the architect/test writer rather than fixing them.
+- Do not commit.
+
+#### Reviewer
+
+- Review the issue and diff independently.
+- Do not edit files, change Git state, install anything, or run builds/tests that
+  write to the tree.
+- Follow `.opencode/agents/reviewer.md` for the review checklist and verdict
+  format.
+
+### General engineering expectations
+
+- Keep changes scoped to the issue. Do not bundle unrelated cleanup or
+  refactoring.
+- Preserve existing CLI contracts unless the issue explicitly changes them:
+  stdout/stderr, exit codes, ordering, formatting, limits, config behavior, and
+  compatibility.
+- Add or update documentation only when required by the issue or existing
+  project conventions. If it is unclear whether documentation is test-owned or
+  implementation-owned, ask the architect.
+- Report commands run and their results. Never claim a check passed unless it was
+  actually run and passed.
+
+## Commits
+
+- Outside the issue loop above, commit only when asked. When committing, stage
+  only the files you changed (never `git add -A`) and create many small commits
+  rather than one large: one logical change per commit, for example the assembly
+  change, its tests and its docs (README, help text) as separate commits.
 - Subject lines start with the area: `zfind: ...`, `tests: ...`, `docs: ...`,
   `tools: ...`, `build: ...`, `ci: ...`.
-- Read an issue with `gh issue view` (number, `#N` or URL), not by fetching
-  its web page, which is mostly navigation.
-- File new issues with `.github/ISSUE_TEMPLATE/feature.md`. A good issue is a
-  spec the loop above can implement without questions.
+- File new issues with `.github/ISSUE_TEMPLATE/feature.md` (see Planning issues).
 - Keep git output small: `git status -sb`, `git log -n 5 --format=%s`,
   `git diff --stat` (then `git diff -- FILE` for a single file).
 
