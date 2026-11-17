@@ -34,8 +34,9 @@ it whole and never `grep -C` it unbounded.
   lines around the hit.
 - Do not read a whole function over 100 lines: use `xref.py -C 5 .label` on
   one of its local labels.
-- `res_type` is indexed by `d_type`; use `TYPE_*` for masks and `DT_*` for
-  values.
+- `res_type` is indexed by the canonical category's `d_type` value; use
+  `TYPE_*` for masks and `DT_*` for values. `type_bit` normalizes the accepted
+  spellings and `type_ok` is the one predicate shared by both filters.
 - If an issue includes a verified diff, apply it and let the tests verify.
 
 ## Tests
