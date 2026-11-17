@@ -16,12 +16,15 @@ Self-test:  python3 -m doctest scripts/cqa.py
 """
 import argparse
 import csv
-import hashlib
 import os
 import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
+
+from report_common import (
+    commit_from, display_path, error, git_describe, report_stem, sha256, table,
+)
 
 CQA_DIR = "build/bench/cqa"
 TOP = 20
@@ -161,23 +164,6 @@ def target_processor(text):
     return "n/a"
 
 
-def table(rows):
-    """Pad ROWS into columns two spaces apart.
-
-    >>> print(table([["function", "dispatch"], ["walk_dir", "16.00"]]))
-    function  dispatch
-    walk_dir  16.00
-    """
-    widths = [
-        max(len(row[i]) for row in rows if i < len(row))
-        for i in range(max(map(len, rows)))
-    ]
-    return "\n".join(
-        "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip()
-        for row in rows
-    )
-
-
 def report_table(rows):
     """The report columns for ROWS.
 
@@ -201,36 +187,6 @@ def report_table(rows):
     return columns
 
 
-def commit_from(describe):
-    """The commit part of `git describe --dirty` output.
-
-    >>> commit_from("v0.0.3-3-gabc-dirty")
-    'v0.0.3-3-gabc'
-    """
-    return describe.removesuffix("-dirty")
-
-
-def report_stem(describe):
-    """Report filename stem: `git describe` output without its slashes.
-
-    >>> report_stem("feature/x-3-gabc")
-    'feature_x-3-gabc'
-    """
-    return describe.replace("/", "_")
-
-
-def display_path(path, start="."):
-    """PATH relative to START when it stays inside it, else absolute.
-
-    >>> display_path("/repo/build/bench/cqa/x.md", "/repo")
-    'build/bench/cqa/x.md'
-    >>> display_path("/elsewhere/x.md", "/repo")
-    '/elsewhere/x.md'
-    """
-    relative = os.path.relpath(path, start)
-    return path if relative.startswith("..") else relative
-
-
 def cqa_csv_command(maqao, binary, csv_path):
     """The maqao argv for the CSV export.
 
@@ -249,39 +205,10 @@ def cqa_text_command(maqao, binary):
     return [maqao, "cqa", binary, "fct-loops=^$"]
 
 
-def error(message):
-    """Print MESSAGE to stderr and exit 1."""
-    print(message, file=sys.stderr)
-    sys.exit(1)
-
-
-def git_describe():
-    """`git describe --tags --always --dirty` output, or exit 1."""
-    try:
-        proc = subprocess.run(
-            ["git", "describe", "--tags", "--always", "--dirty"],
-            capture_output=True, text=True,
-        )
-    except OSError as exc:
-        error(f"cqa: git describe failed: {exc}")
-    if proc.returncode != 0:
-        error(f"cqa: git describe failed: {proc.stderr.strip()}")
-    return proc.stdout.strip()
-
-
 def run(command):
     """Run COMMAND and return (returncode, stdout, stderr)."""
     proc = subprocess.run(command, capture_output=True, text=True)
     return proc.returncode, proc.stdout, proc.stderr
-
-
-def sha256(path):
-    """SHA-256 of the file at PATH."""
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def parse_args(argv=None):
@@ -303,7 +230,7 @@ def main(argv=None):
     if maqao is None:
         error("cqa: maqao not found in PATH")
 
-    describe = git_describe()
+    describe = git_describe("cqa")
     stem = report_stem(describe)
 
     cqa_dir = os.path.abspath(CQA_DIR)

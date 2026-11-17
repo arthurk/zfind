@@ -484,4 +484,4 @@ make cqa                    # MAQAO CQA: static per-loop report (system maqao)
   instruction CV exceeds 1 %.
 - CQA is a static estimate, not an execution profile, and its numbers depend
   on the target CPU model MAQAO detects.
-- The scripts' self-test is `python3 -m doctest scripts/bench.py scripts/cqa.py scripts/triage.py`.
+- The scripts' self-test is `python3 -m doctest scripts/bench.py scripts/cqa.py scripts/triage.py scripts/report_common.py`.

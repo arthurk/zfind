@@ -16,7 +16,6 @@ skips generation.
 Self-test:  python3 -m doctest scripts/bench.py
 """
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -25,6 +24,10 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
+
+from report_common import (
+    commit_from, display_path, error, git_describe, report_stem, sha256, table,
+)
 
 BENCH_DIR = "build/bench"
 TREE = BENCH_DIR + "/tree"
@@ -319,17 +322,6 @@ def human_size(value):
     return f"{value} B"
 
 
-def commit_from(describe):
-    """The commit part of `git describe --dirty` output.
-
-    >>> commit_from("v0.0.3-3-gabc-dirty")
-    'v0.0.3-3-gabc'
-    >>> commit_from("v0.0.3")
-    'v0.0.3'
-    """
-    return describe.removesuffix("-dirty")
-
-
 def dirty_flag(describe):
     """Whether `git describe --dirty` marked the tree dirty.
 
@@ -339,46 +331,6 @@ def dirty_flag(describe):
     True
     """
     return describe.endswith("-dirty")
-
-
-def report_stem(describe):
-    """Report filename stem: `git describe` output without its slashes.
-
-    >>> report_stem("v0.0.3")
-    'v0.0.3'
-    >>> report_stem("feature/x-3-gabc-dirty")
-    'feature_x-3-gabc-dirty'
-    """
-    return describe.replace("/", "_")
-
-
-def display_path(path, start="."):
-    """PATH relative to START when it stays inside it, else absolute.
-
-    >>> display_path("/repo/build/bench/x.md", "/repo")
-    'build/bench/x.md'
-    >>> display_path("/elsewhere/x.md", "/repo")
-    '/elsewhere/x.md'
-    """
-    relative = os.path.relpath(path, start)
-    return path if relative.startswith("..") else relative
-
-
-def table(rows):
-    """Pad ROWS into columns two spaces apart.
-
-    >>> print(table([["workload", "wall min"], ["floor", "6.1 ms"]]))
-    workload  wall min
-    floor     6.1 ms
-    """
-    widths = [
-        max(len(row[i]) for row in rows if i < len(row))
-        for i in range(max(map(len, rows)))
-    ]
-    return "\n".join(
-        "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip()
-        for row in rows
-    )
 
 
 def cpu_model_from(text):
@@ -394,26 +346,6 @@ def cpu_model_from(text):
         if key.strip() == "model name":
             return value.strip()
     return "n/a"
-
-
-def error(message):
-    """Print MESSAGE to stderr and exit 1."""
-    print(message, file=sys.stderr)
-    sys.exit(1)
-
-
-def git_describe():
-    """`git describe --tags --always --dirty` output, or exit 1."""
-    try:
-        proc = subprocess.run(
-            ["git", "describe", "--tags", "--always", "--dirty"],
-            capture_output=True, text=True,
-        )
-    except OSError as exc:
-        error(f"bench: git describe failed: {exc}")
-    if proc.returncode != 0:
-        error(f"bench: git describe failed: {proc.stderr.strip()}")
-    return proc.stdout.strip()
 
 
 def marker_is_current(path):
@@ -495,15 +427,6 @@ def hyperfine_version(exe):
     return proc.stdout.splitlines()[0].strip() if proc.stdout else "n/a"
 
 
-def sha256(path):
-    """SHA-256 of the file at PATH."""
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def cpu_model():
     """The CPU model from /proc/cpuinfo, or 'n/a'."""
     try:
@@ -565,7 +488,7 @@ def main(argv=None):
     if exe is None:
         error("bench: hyperfine not found in PATH (run inside nix develop)")
 
-    describe = git_describe()
+    describe = git_describe("bench")
     stem = report_stem(describe)
 
     bench_dir = os.path.abspath(BENCH_DIR)
