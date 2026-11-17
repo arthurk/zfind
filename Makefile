@@ -90,6 +90,7 @@ run: $(BIN)
 
 clean:
 	rm -rf build
+	rm -f core.*
 
 PRESET ?= default
 ZFIND_TESTDATA ?= /tmp/zfind-testdata
