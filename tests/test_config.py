@@ -304,7 +304,7 @@ class TestConfigSelection:
             (("--separator", "--config=x", "config"), Result(b".git/config--config=x", b"", 0)),
             (("--limit", "--no-config"), failure(b"zfind: invalid limit (expected a whole number or none)\n")),
             (("--limit", "--config", "/nonexistent"), failure(b"zfind: invalid limit (expected a whole number or none)\n")),
-            (("--type", "--no-config"), failure(b"zfind: expected f, d, l or b after --type\n")),
+            (("--type", "--no-config"), failure(b"zfind: expected f, file, d, dir, directory, l, symlink or broken after --type\n")),
         ],
     )
     def test_value_options_swallow_config_option_names(
@@ -491,14 +491,15 @@ class TestConfigErrors:
             pytest.param("--exclude-name\n", 1, "missing value for --exclude-name", id="exclude-without-value"),
             pytest.param("--exclude-name=''\n", 1, "empty name for --exclude-name", id="exclude-empty-quoted"),
             pytest.param("--exclude-name=a/b\n", 1, "--exclude-name matches basenames only; '/' is not allowed", id="exclude-slash"),
-            pytest.param("--type\n", 1, "expected f, d, l or b after --type", id="type-without-value"),
-            pytest.param("--type x\n", 1, "expected f, d, l or b after --type", id="type-bad-value"),
-            pytest.param("--type=\n", 1, "expected f, d, l or b after --type", id="type-equals-without-value"),
-            pytest.param("--type=x\n", 1, "expected f, d, l or b after --type", id="type-equals-bad-value"),
-            pytest.param("--type=ff\n", 1, "expected f, d, l or b after --type", id="type-equals-two-letters"),
-            pytest.param("--type=''\n", 1, "expected f, d, l or b after --type", id="type-equals-empty-quoted"),
-            pytest.param("--type f d\n", 1, "expected f, d, l or b after --type", id="type-value-is-the-rest-of-the-line"),
-            pytest.param("--type=f d\n", 1, "expected f, d, l or b after --type", id="type-equals-value-is-the-rest-of-the-line"),
+            pytest.param("--type\n", 1, "expected f, file, d, dir, directory, l, symlink or broken after --type", id="type-without-value"),
+            pytest.param("--type x\n", 1, "expected f, file, d, dir, directory, l, symlink or broken after --type", id="type-bad-value"),
+            pytest.param("--type b\n", 1, "expected f, file, d, dir, directory, l, symlink or broken after --type", id="type-retired-broken-letter"),
+            pytest.param("--type=\n", 1, "expected f, file, d, dir, directory, l, symlink or broken after --type", id="type-equals-without-value"),
+            pytest.param("--type=x\n", 1, "expected f, file, d, dir, directory, l, symlink or broken after --type", id="type-equals-bad-value"),
+            pytest.param("--type=ff\n", 1, "expected f, file, d, dir, directory, l, symlink or broken after --type", id="type-equals-two-letters"),
+            pytest.param("--type=''\n", 1, "expected f, file, d, dir, directory, l, symlink or broken after --type", id="type-equals-empty-quoted"),
+            pytest.param("--type f d\n", 1, "expected f, file, d, dir, directory, l, symlink or broken after --type", id="type-value-is-the-rest-of-the-line"),
+            pytest.param("--type=f d\n", 1, "expected f, file, d, dir, directory, l, symlink or broken after --type", id="type-equals-value-is-the-rest-of-the-line"),
             pytest.param("--exclude-name='abc\n", 1, "malformed quotes in config value", id="quote-never-closed"),
             pytest.param("--exclude-name='a'b'\n", 1, "malformed quotes in config value", id="quote-inside-quoted"),
             pytest.param("--exclude-name='a'b\n", 1, "malformed quotes in config value", id="text-after-closing-quote"),
@@ -556,7 +557,7 @@ class TestConfigErrors:
     ):
         cfg.write("--type f\n--type q\n")
         res = cfg("--type", "d")
-        assert res == failure(cfg.error(2, "expected f, d, l or b after --type"))
+        assert res == failure(cfg.error(2, "expected f, file, d, dir, directory, l, symlink or broken after --type"))
 
     def test_nul_byte_is_an_error_not_a_truncated_line(self, cfg: ConfigRunner):
         cfg.write(b"--hidden\n--no\x00hidden\n")
@@ -704,9 +705,20 @@ class TestConfigPrecedence:
         assert cfg("--type", "f") == listing(TREE_FILES)  # a repeated value changes nothing
 
     def test_l_selects_symlinks_in_the_file_in_either_form(self, links_cfg: ConfigRunner):
-        for line in ("--type l\n", "--type=l\n"):
+        for line in ("--type l\n", "--type=symlink\n"):
             links_cfg.write(line)
             assert links_cfg() == listing([b"broken", b"dlnk", b"lnk"]), line
+
+    def test_the_file_accepts_the_long_aliases(self, links_cfg: ConfigRunner):
+        cases = [
+            ("--type file\n", [b"dir/inner", b"file"]),
+            ("--type=dir\n", [b"dir/"]),
+            ("--type directory\n", [b"dir/"]),
+            ("--exclude-type=directory\n", [b"broken", b"dir/inner", b"dlnk", b"file", b"lnk"]),
+        ]
+        for line, expected in cases:
+            links_cfg.write(line)
+            assert links_cfg() == listing(expected), line
 
     def test_command_line_type_replaces_a_configured_l(self, links_cfg: ConfigRunner):
         links_cfg.write("--type=l\n")
@@ -717,30 +729,38 @@ class TestConfigPrecedence:
         links_cfg.write("--type f\n")
         assert links_cfg("--type=l") == listing([b"broken", b"dlnk", b"lnk"])
 
-    def test_configured_b_selects_only_broken_links(self, links_cfg: ConfigRunner):
-        links_cfg.write("--type b\n")
+    def test_configured_broken_selects_only_broken_links(self, links_cfg: ConfigRunner):
+        links_cfg.write("--type broken\n")
         assert links_cfg() == listing([b"broken"])
-        assert links_cfg("--type", "b") == listing([b"broken"])  # idempotent
+        assert links_cfg("--type", "broken") == listing([b"broken"])  # idempotent
 
-    def test_command_line_b_and_l_replace_the_configured_set(self, links_cfg: ConfigRunner):
+    def test_command_line_broken_and_l_replace_the_configured_set(
+        self, links_cfg: ConfigRunner
+    ):
         links_cfg.write("--type l\n")
-        assert links_cfg("--type", "b") == listing([b"broken"])
-        links_cfg.write("--type b\n")
+        assert links_cfg("--type", "broken") == listing([b"broken"])
+        links_cfg.write("--type broken\n")
         assert links_cfg("--type", "l") == listing([b"broken", b"dlnk", b"lnk"])
 
-    def test_a_configured_combination_is_target_aware(self, links_cfg: ConfigRunner):
-        # The rule applies to the final set, whatever source supplied each
-        # value: links to the target's type, not to their own.
+    def test_a_configured_combination_keeps_symlinks_independent(
+        self, links_cfg: ConfigRunner
+    ):
+        # f is real regular files only, l is every symlink; the union keeps
+        # links to files, links to directories and broken links.
         links_cfg.write("--type f\n--type l\n")
-        assert links_cfg() == listing([b"dir/inner", b"file", b"lnk"])
+        assert links_cfg() == listing([b"broken", b"dir/inner", b"dlnk", b"file", b"lnk"])
         links_cfg.write("--type d\n--type l\n")
-        assert links_cfg() == listing([b"dir/", b"dlnk"])
+        assert links_cfg() == listing([b"broken", b"dir/", b"dlnk", b"lnk"])
 
-    def test_a_command_line_combination_is_target_aware(self, links_cfg: ConfigRunner):
+    def test_a_command_line_combination_keeps_symlinks_independent(
+        self, links_cfg: ConfigRunner
+    ):
         assert links_cfg("--type", "f", "--type", "l") == listing(
-            [b"dir/inner", b"file", b"lnk"]
+            [b"broken", b"dir/inner", b"dlnk", b"file", b"lnk"]
         )
-        assert links_cfg("--type=d", "--type=l") == listing([b"dir/", b"dlnk"])
+        assert links_cfg("--type=d", "--type=symlink") == listing(
+            [b"broken", b"dir/", b"dlnk", b"lnk"]
+        )
 
     def test_exclude_name_table_is_shared_between_layers(self, cfg: ConfigRunner):
         cfg.write("".join(f"--exclude-name=n{i}\n" for i in range(64)))
@@ -757,23 +777,27 @@ class TestConfigPrecedence:
         assert links_cfg("--exclude-type=d") == both
 
     def test_a_configured_exclude_type_accepts_both_forms(self, links_cfg: ConfigRunner):
-        expected = [b"broken", b"dir/inner", b"file", b"lnk"]
-        for line in ("--exclude-type d\n", "--exclude-type=d\n"):
+        expected = [b"broken", b"dir/inner", b"dlnk", b"file", b"lnk"]
+        for line in ("--exclude-type d\n", "--exclude-type=directory\n"):
             links_cfg.write(line)
             assert links_cfg() == listing(expected), line
 
     def test_a_post_merge_contradiction_fails_at_startup(self, links_cfg: ConfigRunner):
         expected = failure(
-            b"zfind: cannot combine --type and --exclude-type for the same value\n"
+            b"zfind: cannot combine --type and --exclude-type for the same type category\n"
         )
         links_cfg.write("--type l\n")
         assert links_cfg("--exclude-type", "l") == expected
         links_cfg.write("--exclude-type l\n")
         assert links_cfg("--type", "l") == expected
+        links_cfg.write("--type f\n")
+        assert links_cfg("--exclude-type", "file") == expected
+        links_cfg.write("--exclude-type file\n")
+        assert links_cfg("--type", "f") == expected
 
     def test_a_configured_invalid_exclude_type_names_the_line(self, cfg: ConfigRunner):
         cfg.write("--exclude-type z\n")
-        assert cfg() == failure(cfg.error(1, "expected f, d, l or b after --exclude-type"))
+        assert cfg() == failure(cfg.error(1, "expected f, file, d, dir, directory, l, symlink or broken after --exclude-type"))
 
     def test_options_the_file_does_not_set_keep_their_defaults(self, cfg: ConfigRunner):
         cfg.write("--limit 2\n")
@@ -791,6 +815,7 @@ class TestTypeFilterAcrossBuilds:
             ("--type=f\n", (), TREE_FILES),
             # any command-line --type drops the file's whole set
             ("--type f\n", ("--type", "d"), TREE_DIRS),
+            ("--type file\n", ("--type", "dir"), TREE_DIRS),
             ("--type f\n--type d\n", ("--type", "d"), TREE_DIRS),
             ("--type f\n--type d\n", ("--type", "f"), TREE_FILES),
             ("--type d\n", ("--type", "f"), TREE_FILES),
