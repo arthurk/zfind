@@ -4,8 +4,8 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ;   zfind [OPTIONS] [PATH] [PATTERN]
 ;         [--help] [--separator STR] [--case smart|sensitive|insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
-;         [--exclude-name NAME] [--exclude-type f|d|l|b] [--limit N|none]
-;         [--type f|d|l|b] [--color auto|always|never]
+;         [--exclude-name NAME] [--exclude-type TYPE] [--limit N|none]
+;         [--type TYPE] [--color auto|always|never]
 ;         [--config PATH | --no-config] [--path DIR] [--]
 ; PATH is an optional starting directory and must come before PATTERN. Without
 ; --path, a lone positional token containing '/' or the exact tokens . and ..
@@ -44,26 +44,25 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; arena_put; a matching directory is pruned. Explicit exclusions override
 ; .gitignore rules, but .gitignore detection and rule loading still happen
 ; when the .gitignore entry itself is excluded.
-; --type f|d|l|b is repeatable and selects regular files, directories,
-; symlinks and broken symlinks. A link matches --type l on its own, broken
-; links included; b selects the broken subset and needs no l. When l is
-; combined with f and/or d, a link matches by what it points to instead: a
-; selected regular file or directory, with a chain followed to its final
-; target; b then adds the broken links. Broken means resolution failed with
-; ENOENT, ENOTDIR, ELOOP or ENAMETOOLONG; any other failure is indeterminate
-; and matches b nowhere. Links to special files match no f/d combination.
-; Links are never descended into and never printed with a trailing slash,
-; whatever the mask.
-; --exclude-type f|d|l|b is repeatable, takes the same values, and drops every
-; entry the corresponding --type set would select. Inclusion and exclusion are
-; independent: a result must match --type (if given) and must not match
-; --exclude-type. Exclusion follows links for f and d even without l, so
-; --exclude-type d removes links to directories and --exclude-type f removes
-; links to files; broken links are kept under both. l drops every link with no
-; target lookup; b drops broken links and needs one lookup per link. Unlike
-; --exclude-name, --exclude-type never prunes traversal: an excluded directory
-; is still walked and its children still printed. The same value in --type and
-; --exclude-type is a usage error. Use -- before a PATTERN that starts with -.
+; --type TYPE is repeatable and selects regular files (f, file), real
+; directories (d, dir, directory), symlinks (l, symlink) and definitively
+; broken symlinks (broken). The values are independent categories and their
+; union is selected: f never matches a symlink, d never matches a link to a
+; directory, l matches every symlink whatever its target, and broken matches
+; only the subset whose target resolution failed with ENOENT, ENOTDIR, ELOOP
+; or ENAMETOOLONG; any other failure is indeterminate and matches broken
+; nowhere. Links to special files match l but no other value. Links are never
+; descended into and never printed with a trailing slash, whatever the
+; selection.
+; --exclude-type TYPE is repeatable, accepts the same values, and subtracts
+; the union of its categories from the inclusion result. Both options match
+; exactly the same entries for the same value: --exclude-type f keeps links to
+; files because f is about real regular files only. Unlike --exclude-name,
+; --exclude-type never prunes traversal: an excluded directory is still walked
+; and its children still printed. The same canonical category in --type and
+; --exclude-type is a usage error, whatever spelling each uses; overlapping
+; categories such as l and broken are not. Use -- before a PATTERN that starts
+; with -.
 ; Settings may also come from a config file: --config PATH, else
 ; $XDG_CONFIG_HOME/zfind/config (non-empty absolute path), else
 ; $HOME/.config/zfind/config. --no-config reads none. The file is one option per
@@ -238,7 +237,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define TYPE_F      DT_BIT(DT_REG)
 %define TYPE_D      DT_BIT(DT_DIR)
 %define TYPE_L      DT_BIT(DT_LNK)
-%define DT_B        11                ; not a d_type: b is the broken-link subset
+%define DT_B        11                ; not a d_type: the broken-symlink subset
 %define TYPE_B      DT_BIT(DT_B)
 
 ; per-thread state; one instance per worker plus the main thread's, all from
@@ -446,11 +445,11 @@ section .rodata
     errno_table_end:
     e_limit     db "zfind: invalid limit (expected a whole number or none)", 10
     e_limit_e:
-    e_type      db "zfind: expected f, d, l or b after --type", 10
+    e_type      db "zfind: expected f, file, d, dir, directory, l, symlink or broken after --type", 10
     e_type_e:
-    e_xtype     db "zfind: expected f, d, l or b after --exclude-type", 10
+    e_xtype     db "zfind: expected f, file, d, dir, directory, l, symlink or broken after --exclude-type", 10
     e_xtype_e:
-    e_conflict  db "zfind: cannot combine --type and --exclude-type for the same value", 10
+    e_conflict  db "zfind: cannot combine --type and --exclude-type for the same type category", 10
     e_conflict_e:
     e_flag      db "zfind: unknown option", 10
     e_flag_e:
@@ -537,6 +536,14 @@ section .rodata
     val_auto    db "auto", 0
     val_always  db "always", 0
     val_never   db "never", 0
+    tv_f        db "f", 0
+    tv_file     db "file", 0
+    tv_d        db "d", 0
+    tv_dir      db "dir", 0
+    tv_dir_long db "directory", 0
+    tv_l        db "l", 0
+    tv_symlink  db "symlink", 0
+    tv_broken   db "broken", 0
     v_none      db "none", 0
     env_no_color db "NO_COLOR=", 0   ; 9 bytes of prefix
     env_term    db "TERM=", 0        ; 5 bytes of prefix
@@ -554,8 +561,8 @@ section .rodata
     help_msg    db "usage: zfind [OPTIONS] [PATH] [PATTERN]", 10
                db "  options: [--help] [--separator STR] [--case smart|sensitive|insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
-               db "             [--exclude-name NAME]... [--exclude-type f|d|l|b]", 10
-               db "             [--limit N|none] [--type f|d|l|b]", 10
+               db "             [--exclude-name NAME]... [--exclude-type TYPE]", 10
+               db "             [--limit N|none] [--type TYPE]", 10
                db "             [--color auto|always|never]", 10
                db "             [--config PATH | --no-config]", 10, 10
                db "Search a directory tree for entries whose name contains", 10
@@ -616,14 +623,14 @@ section .rodata
                db "                      also --exclude-name=NAME; matching dirs are pruned", 10
                db "  --limit N|none      print at most N results (0 prints nothing)", 10
                db "                      none: no limit, the default; also --limit=N|none", 10
-               db "  --type f|d|l|b      repeatable; f files, d directories, l symlinks, b broken", 10
-               db "                      symlinks; with l+f/d a symlink matches by its target;", 10
-               db "                      broken links appear with l alone and b adds them to", 10
-               db "                      f/d combinations", 10
-               db "                      also --type=V", 10
-               db "  --exclude-type V    repeatable; drop entries selected by type V", 10
-               db "                      f/d follow links; b is the broken subset; no pruning", 10
-               db "                      also --exclude-type=V", 10
+               db "  --type TYPE         repeatable; f|file, d|dir|directory,", 10
+               db "                      l|symlink or broken; a union of categories;", 10
+               db "                      broken links are the symlink subset whose", 10
+               db "                      target is definitively gone", 10
+               db "                      also --type=TYPE", 10
+               db "  --exclude-type TYPE repeatable; f|file, d|dir|directory,", 10
+               db "                      l|symlink or broken; subtracts a union;", 10
+               db "                      also --exclude-type=TYPE; no pruning", 10
                db "  --color WHEN        color results: auto, always or never (default: auto)", 10
                db "                      also --color=WHEN; auto colors a terminal unless", 10
                db "                      NO_COLOR or TERM=dumb; an unset TERM is plain", 10
@@ -692,9 +699,9 @@ section .bss
     cfg_color:  resb 1                ; the config file's color mode, parked while
                                       ;   the command line is parsed (0 = not set)
     color_on:   resb 1                ; resolved once at startup: 1 = emit ANSI
-    res_type:   resb 32                ; --type bitset: bit index is the d_type
-                                       ;   value, plus TYPE_B; so TYPE_D/F/L/B are
-                                       ;   the masks
+    res_type:   resb 32                ; --type bitset: bit index is the canonical
+                                       ;   category's d_type value, plus TYPE_B;
+                                       ;   so TYPE_D/F/L/B are the masks
     type_seen:  resb 1                 ; a --type set was given
     res_excl:   resb 32                ; --exclude-type bitset, same encoding
     excl_seen:  resb 1                 ; an --exclude-type set was given
@@ -1338,30 +1345,10 @@ parse_args:
 .opt_type_eq:
     mov rdi, [rbp+r12*8]
     add rdi, 7                         ; len("--type=")
-.opt_type_value:                       ; rdi = the value: exactly one of f, d, l, b
-    movzx eax, byte [rdi]
-    test al, al
-    jz bad_type                        ; "--type=" with nothing after it
-    cmp byte [rdi+1], 0
-    jne bad_type                       ; "ff", "file", ...
-    cmp al, 'f'
-    je .type_file
-    cmp al, 'd'
-    je .type_dir
-    cmp al, 'l'
-    je .type_link
-    cmp al, 'b'
-    jne bad_type
-    bts qword [res_type], DT_B
-    jmp .type_set
-.type_link:
-    bts qword [res_type], DT_LNK
-    jmp .type_set
-.type_dir:
-    bts qword [res_type], DT_DIR
-    jmp .type_set
-.type_file:
-    bts qword [res_type], DT_REG
+.opt_type_value:                       ; rdi = the value; aliases share one bit
+    call type_bit
+    jc bad_type
+    bts qword [res_type], rax
 .type_set:
     mov byte [type_seen], 1
     inc r12
@@ -1376,30 +1363,10 @@ parse_args:
 .opt_xtype_eq:
     mov rdi, [rbp+r12*8]
     add rdi, 15                        ; len("--exclude-type=")
-.opt_xtype_value:                      ; rdi = the value: exactly one of f, d, l, b
-    movzx eax, byte [rdi]
-    test al, al
-    jz bad_xtype                       ; "--exclude-type=" with nothing after it
-    cmp byte [rdi+1], 0
-    jne bad_xtype                      ; "ff", "file", ...
-    cmp al, 'f'
-    je .xtype_file
-    cmp al, 'd'
-    je .xtype_dir
-    cmp al, 'l'
-    je .xtype_link
-    cmp al, 'b'
-    jne bad_xtype
-    bts qword [res_excl], DT_B
-    jmp .xtype_set
-.xtype_link:
-    bts qword [res_excl], DT_LNK
-    jmp .xtype_set
-.xtype_dir:
-    bts qword [res_excl], DT_DIR
-    jmp .xtype_set
-.xtype_file:
-    bts qword [res_excl], DT_REG
+.opt_xtype_value:                      ; rdi = the value; aliases share one bit
+    call type_bit
+    jc bad_xtype
+    bts qword [res_excl], rax
 .xtype_set:
     mov byte [excl_seen], 1
     inc r12
@@ -2240,6 +2207,57 @@ streq:
 .ret:
     ret
 streq.end_func:
+
+; type_bit: rdi = NUL-terminated --type/--exclude-type value -> eax = the
+; canonical category's d_type bit number, CF=1 when the spelling is not one of
+; f, file, d, dir, directory, l, symlink or broken. Aliases map to one bit, so
+; every later step -- storage, merging, deduplication, conflict checks and
+; matching -- sees only the canonical category.
+    global type_bit:function (type_bit.end_func - type_bit)
+type_bit:
+    lea rsi, [tv_f]
+    call streq
+    je .file
+    lea rsi, [tv_file]
+    call streq
+    je .file
+    lea rsi, [tv_d]
+    call streq
+    je .dir
+    lea rsi, [tv_dir]
+    call streq
+    je .dir
+    lea rsi, [tv_dir_long]
+    call streq
+    je .dir
+    lea rsi, [tv_l]
+    call streq
+    je .link
+    lea rsi, [tv_symlink]
+    call streq
+    je .link
+    lea rsi, [tv_broken]
+    call streq
+    jne .bad
+    mov eax, DT_B
+    clc
+    ret
+.link:
+    mov eax, DT_LNK
+    clc
+    ret
+.dir:
+    mov eax, DT_DIR
+    clc
+    ret
+.file:
+    mov eax, DT_REG
+    clc
+    ret
+.bad:
+    stc
+    ret
+type_bit.end_func:
 
 ; parse_u64: rdi = NUL-terminated decimal -> rax = value, CF=1 on error
     global parse_u64:function (parse_u64.end_func - parse_u64)
@@ -5892,19 +5910,17 @@ try_range_split.end_func:
 
 ; type_ok: does the entry of resolved d_type edi survive the type filters?
 ; Called only when type_filter is set.  Inclusion (--type, when given) and
-; exclusion (--exclude-type, when given) are evaluated with the same core:
-; a non-link is selected by its own bit; a symlink is selected by its own bit
-; (l) unless l is combined with f and/or d, when the link matches only when
-; what it points to is a selected regular file or directory; b selects a link
-; whose target definitively does not exist (ENOENT, ENOTDIR, ELOOP,
-; ENAMETOOLONG), with or without l.  Any other resolution failure is
-; indeterminate: it matches b nowhere, l alone, and no f/d combination.
-; Exclusion is the union of its values: l drops every link without a lookup,
-; b drops the broken ones, and f/d drop what the entry behaves like, so
-; --exclude-type d drops links to directories even without l and f drops links
-; to files; broken links survive both.  type_ok returns 1 when inclusion
-; selects the entry and exclusion does not.  The lookup follows the chain but
-; never makes the walk descend.  path_buf must hold the entry's full path.
+; exclusion (--exclude-type, when given) use the same predicate, so a category
+; matches exactly the same entries whichever option names it.  A real regular
+; file matches TYPE_F and a real directory matches TYPE_D; a symlink matches
+; neither, whatever its target.  TYPE_L matches every symlink.  TYPE_B matches
+; only symlinks whose target definitively does not exist (ENOENT, ENOTDIR,
+; ELOOP, ENAMETOOLONG), so broken is a subset of l; any other resolution
+; failure is indeterminate ("when in doubt, not broken").  Inclusion is the
+; union of its values and exclusion is the union it subtracts, so type_ok
+; returns 1 when inclusion selects the entry and exclusion does not.  The
+; lookup follows the chain but never makes the walk descend.  path_buf must
+; hold the entry's full path.
     global type_ok:function (type_ok.end_func - type_ok)
 type_ok:
     cmp byte [type_seen], 0
@@ -5917,7 +5933,7 @@ type_ok:
     cmp byte [excl_seen], 0
     je .yes
     lea rsi, [res_excl]
-    call .xmatch
+    call .match
     test al, al
     jnz .no
 .yes:
@@ -5926,22 +5942,15 @@ type_ok:
 .no:
     xor eax, eax
     ret
-.match:                              ; rsi = inclusion mask; edi is preserved
+.match:                              ; rsi = category mask; edi is preserved
     mov r9, rsi                      ; mask; syscall preserves r9
     movzx ecx, dil
     cmp ecx, DT_LNK
     jne .plain
     test qword [r9], TYPE_L
-    jz .broken_only
-    test qword [r9], TYPE_F | TYPE_D
-    jz .yes                          ; l on its own: every link, broken included
-    mov r8d, 1                       ; l + f/d: the target decides
-    jmp .follow
-.broken_only:
+    jnz .yes                         ; every symlink; the target is not consulted
     test qword [r9], TYPE_B
-    jz .no
-    xor r8d, r8d                     ; b without l: only broken links
-.follow:
+    jz .no                           ; f and d never match a symlink
     push rdi                         ; syscall needs rdi, but .match is called
     mov rax, SYS_newfstatat          ;   twice and edi is the entry's d_type
     mov rdi, AT_FDCWD
@@ -5951,86 +5960,20 @@ type_ok:
     syscall
     pop rdi
     test rax, rax
-    js .resolution_failed
-    test r8d, r8d
-    jz .no                           ; b alone: a resolving link never matches
-    mov eax, [r14+statbuf+24]        ; st_mode
-    and eax, 0xF000
-    cmp eax, 0x8000                  ; S_IFREG
-    je .reg
-    cmp eax, 0x4000                  ; S_IFDIR
-    jne .no                          ; fifo/socket/device have no target meaning
-    mov ecx, DT_DIR
-    jmp .plain
-.reg:
-    mov ecx, DT_REG
-    jmp .plain
-.resolution_failed:
+    jns .no                          ; the target resolves: not broken
     ; stat returns -errno.  Only definitive absence counts; EACCES, EIO,
     ; ESTALE and friends are indeterminate ("when in doubt, not broken").
     neg eax
     cmp eax, 2                       ; ENOENT
-    je .broken
+    je .yes
     cmp eax, 20                      ; ENOTDIR
-    je .broken
+    je .yes
     cmp eax, 40                      ; ELOOP
-    je .broken
+    je .yes
     cmp eax, 36                      ; ENAMETOOLONG
-    jne .no
-.broken:
-    test qword [r9], TYPE_B
-    jz .no
-    jmp .yes
+    je .yes
+    jmp .no
 .plain:
-    bt qword [r9], rcx
-    setc al
-    ret
-.xmatch:                             ; rsi = exclusion mask; union of values
-    mov r9, rsi
-    movzx ecx, dil
-    cmp ecx, DT_LNK
-    jne .xplain
-    test qword [r9], TYPE_L
-    jnz .yes                         ; l tests the link itself: no lookup
-    test qword [r9], TYPE_F | TYPE_D | TYPE_B
-    jz .no
-.xfollow:
-    push rdi
-    mov rax, SYS_newfstatat
-    mov rdi, AT_FDCWD
-    lea rsi, [r14+path_buf]
-    lea rdx, [r14+statbuf]
-    xor r10d, r10d
-    syscall
-    pop rdi
-    test rax, rax
-    js .xresolution_failed
-    mov eax, [r14+statbuf+24]        ; st_mode
-    and eax, 0xF000
-    cmp eax, 0x8000                  ; S_IFREG: behaves like a file
-    je .xreg
-    cmp eax, 0x4000                  ; S_IFDIR: behaves like a directory
-    jne .no                          ; special files match no f/d exclusion
-    mov ecx, DT_DIR
-    jmp .xplain
-.xreg:
-    mov ecx, DT_REG
-    jmp .xplain
-.xresolution_failed:
-    neg eax
-    cmp eax, 2                       ; ENOENT
-    je .xbroken
-    cmp eax, 20                      ; ENOTDIR
-    je .xbroken
-    cmp eax, 40                      ; ELOOP
-    je .xbroken
-    cmp eax, 36                      ; ENAMETOOLONG
-    jne .no
-.xbroken:
-    test qword [r9], TYPE_B
-    jz .no
-    jmp .yes
-.xplain:
     bt qword [r9], rcx
     setc al
     ret

@@ -118,14 +118,14 @@ The starting directory is a traversal root, not a result. It is never printed, a
 #### Filter entry types
 
 ```sh
-zfind --type f                   # Regular files
-zfind --type d                   # Directories (output paths end in /)
-zfind --type l                   # Symlinks, including dangling links
-zfind --type b                   # Broken symlinks only
+zfind --type f                   # Real regular files only
+zfind --type d                   # Real directories (output paths end in /)
+zfind --type l                   # Every symlink, including dangling links
+zfind --type broken              # Definitively broken symlinks only
 zfind --type f --type d          # Regular files and directories, but no symlinks
-zfind --type f --type l          # Regular files and symlinks to regular files
-zfind --exclude-type d           # Everything except directories and links to directories
-zfind --type l --exclude-type d  # Symlinks except links to directories
+zfind --type f --type l          # Regular files and every symlink
+zfind --exclude-type d           # Everything except real directories
+zfind --type l --exclude-type broken  # Symlinks that are not broken
 ```
 
 See [Symlinks and type filters](#symlinks-and-type-filters) for the exact rules.
@@ -181,8 +181,8 @@ All options must appear before the positional arguments, except `--help`, which 
 | `--hidden` / `--no-hidden` | — | Hidden entries included | Include hidden entries or prune them from traversal. The flags conflict if both are given in the same source. |
 | `--gitignore` / `--no-gitignore` | — | Off | Enable or disable `.gitignore` processing. The flags conflict if both are given in the same source. |
 | `--path` | `DIR` | Current directory | Set the starting directory. Accepts `--path DIR` or `--path=DIR`; may be used only once. The value must be non-empty and name an accessible directory. |
-| `--type` | `f`, `d`, `l`, `b` | All entry types | Include regular files, directories, symlinks, or broken symlinks. Repeatable; accepts `--type=VALUE`. See [Symlinks and type filters](#symlinks-and-type-filters). |
-| `--exclude-type` | `f`, `d`, `l`, `b` | None | Exclude selected types from output. Repeatable and additive across the config file and command line. Accepts `--exclude-type=VALUE`. |
+| `--type` | `f`, `file`, `d`, `dir`, `directory`, `l`, `symlink`, `broken` | All entry types | Include regular files, real directories, symlinks, or broken symlinks. Repeatable; accepts `--type=VALUE`. See [Symlinks and type filters](#symlinks-and-type-filters). |
+| `--exclude-type` | `f`, `file`, `d`, `dir`, `directory`, `l`, `symlink`, `broken` | None | Exclude selected types from output. Repeatable and additive across the config file and command line. Accepts `--exclude-type=VALUE`. |
 | `--exclude-name` | `NAME` | None | Prune entries with this exact basename. Repeatable; up to 64 unique values across the config file and command line. |
 | `--separator` | `STR` | `\n` | Terminate each result with the decoded separator, from 1 to 64 bytes. Supports `\n`, `\t`, `\r`, `\0`, and `\\`. |
 | `--limit` | `N` or `none` | `none` | Print at most `N` results. `0` prints no results; `none` means unlimited. `N` may be any whole number up to `18446744073709551615`. |
@@ -211,35 +211,33 @@ Hidden entries are included by default. An entry is hidden when its name begins 
 
 `zfind` does not descend into symlinked directories found during traversal. A symlink explicitly supplied as the starting directory is followed; output retains the symlink's spelling, while repository discovery and ignore matching use its physical filesystem location.
 
-Without `--type`, all entry types are listed, including special files. When `--type` is used, the values combine as a set:
+Without `--type`, all entry types are listed, including special files. The four categories are independent, and repeating `--type` selects their union:
 
 | Type | Meaning |
 | :--- | :--- |
-| `f` | Regular files. When `l` is also selected, includes symlinks whose final target is a regular file. |
-| `d` | Directories. When `l` is also selected, includes symlinks whose final target is a directory. Directory results end with `/`. |
-| `l` | All symlinks when used alone. When combined with `f` and/or `d`, the selected target types determine which symlinks are included. Symlinks are printed without a trailing slash and are never traversed. |
-| `b` | Broken symlinks. This value does not require `l`; it adds broken links to `f` and/or `d` results. |
+| `f`, `file` | Real regular-file entries. A symlink to a regular file does not match. |
+| `d`, `dir`, `directory` | Real directory entries. A symlink to a directory does not match. Directory results end with `/`. |
+| `l`, `symlink` | Every symlink, whatever its target: links to files, links to directories, dangling links, and links whose target cannot be checked. Symlinks are printed without a trailing slash and are never traversed. |
+| `broken` | Symlinks whose target is definitively broken. This is a subset of `l`, not a separate entry kind. |
 
-With `--type l` alone, every symlink is selected, including dangling links. When `l` is combined with `f` and/or `d`, symlinks are included only when their final target matches one of those selected types. For example, `--type f --type l` includes regular files and links to regular files; it does not include links to directories. `--type f --type d --type l` includes files, directories, and links to either. Links to sockets, FIFOs, or devices do not match `f` or `d`. A chain is followed to its final target for this check.
+Adding a value never removes an entry an earlier value selected. `--type f --type l` includes real regular files and every symlink, including links to directories and dangling links; `--type f --type d` selects real files and real directories and no symlinks. A link to a socket, FIFO, or device matches `l` but no other category.
 
-A link is classified as broken only when its target is known not to exist: for example, the target is missing (`ENOENT`), a path component is not a directory (`ENOTDIR`), the link chain loops (`ELOOP`), or the target path is too long (`ENAMETOOLONG`). A link that cannot be checked because of permissions, I/O errors, or a stale mount is not considered broken. A link to a device, socket, or FIFO that resolves is not broken either.
+A link is classified as broken only when its target is known not to exist: the target is missing (`ENOENT`), a path component is not a directory (`ENOTDIR`), the link chain loops (`ELOOP`), or the target path is too long (`ENAMETOOLONG`). A link that cannot be checked because of permissions, I/O errors, or a stale mount is not considered broken, and a link to a device, socket, or FIFO that resolves is not broken either. Because a missing target cannot be classified as a file or a directory, `zfind` does not try to guess whether a broken link once pointed to one: `broken` matches all definitively broken symlinks.
 
-`--type b` combined with `--type l` is equivalent to `--type l`, because `l` already includes every symlink. Adding `b` to `f` and/or `d` adds broken links to those results. For example, `--type f --type b` selects regular files plus broken symlinks.
-
-Repeating a type has no additional effect. A type can be written as `--type f` or `--type=f`. Values must be a single lowercase letter from `f`, `d`, `l`, or `b`; invalid or empty values are usage errors. The option consumes the next argument as its value, even when it begins with `-`.
+Every broken symlink is a symlink, so `--type l --type broken` is equivalent to `--type l`; `--type f --type broken` adds broken links to the regular-file results. Values are lowercase and exact. A value can be written as `--type VALUE` or `--type=VALUE`, and the accepted spellings are exactly `f`, `file`, `d`, `dir`, `directory`, `l`, `symlink`, and `broken`; `b`, empty values, uppercase variants, and other words are usage errors. The option consumes the next argument as its value, even when it begins with `-`.
 
 ### Type exclusions
 
 `--exclude-type` removes matching entries from the output after the inclusion filter is applied. If no `--type` is specified, it filters the default set of all entry types.
 
-It uses the same meanings as `--type`, with these consequences:
+It accepts the same values and matches exactly the same entries as `--type`, with these consequences:
 
-- `--exclude-type f` removes regular files and symlinks to regular files.
-- `--exclude-type d` removes directories and symlinks to directories.
-- `--exclude-type l` removes every symlink.
-- `--exclude-type b` removes broken symlinks. Broken links are neither files nor directories, so they are not removed by `f` or `d` alone.
+- `--exclude-type f` removes real regular files. It does not remove symlinks to regular files.
+- `--exclude-type d` removes real directories. It does not remove symlinks to directories.
+- `--exclude-type l` removes every symlink, including broken symlinks.
+- `--exclude-type broken` removes only definitively broken symlinks; all other symlinks remain.
 
-Repeated values accumulate. A value present in both `--type` and `--exclude-type` is a usage error. Unlike `--exclude-name`, `--exclude-type` does not prune traversal: an excluded directory is still traversed, and its children can still be printed.
+`--type symlink --exclude-type broken` selects the symlinks that are not broken. `--type broken --exclude-type symlink` is valid and returns no results. Repeated values accumulate and form a union. The same canonical category in both `--type` and `--exclude-type` is a usage error, even when different spellings are used (`--type f --exclude-type file`); overlapping but different categories such as `l` and `broken` are not a conflict. Unlike `--exclude-name`, `--exclude-type` does not prune traversal: an excluded directory is still traversed, and its children can still be printed.
 
 ### Basename exclusions
 
@@ -418,9 +416,9 @@ Options are evaluated in this order: **built-in defaults → configuration file 
 | Hidden and Gitignore modes | CLI overrides config | Conflicting flags in the same source are errors. A CLI mode replaces the configured mode. |
 | Scalar options: `--case`, `--separator`, `--limit`, `--color` | Last value wins | A command-line value replaces the configured value. Use `--case=smart` or `--limit=none` to undo a configured setting. `--limit=0` still means no results. |
 | `--type` | CLI set replaces config set | If the CLI specifies any `--type`, all configured `--type` values are ignored for that run. Repeated values within one source accumulate. |
-| `--exclude-name` and `--exclude-type` | Cumulative set union | Config and CLI values are combined; duplicates are removed. The combined set can contain at most 64 unique `--exclude-name` values. A value present in both the merged `--type` and `--exclude-type` sets is an error. |
+| `--exclude-name` and `--exclude-type` | Cumulative set union | Config and CLI values are combined; duplicates are removed. The combined set can contain at most 64 unique `--exclude-name` values. A canonical type category present in both the merged `--type` and `--exclude-type` sets is an error. |
 
-`--exclude-type` values accumulate across the configuration file and command line. For example, a configured `--exclude-type l` and a command-line `--exclude-type d` exclude both symlinks and directories (including links to directories).
+`--exclude-type` values accumulate across the configuration file and command line. For example, a configured `--exclude-type l` and a command-line `--exclude-type directory` exclude every symlink and every real directory. Values are normalized to their canonical category before merging, so a configured `--type f` and a command-line `--exclude-type file` conflict even though the spellings differ.
 
 Use `--no-config` when a command must ignore all configured defaults, including exclusions.
 
