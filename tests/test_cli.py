@@ -184,6 +184,32 @@ class TestSortOrder:
         assert entries(res.out) == sorted(names)
 
 
+class TestNameLengthScan:
+    def test_lengths_across_the_32_byte_scan_boundaries(
+        self, binary: Path, tmp_path: Path
+    ):
+        """Every name-length edge of the 32-byte aligned scan yields its exact name.
+
+        Lengths 1, 2, 31, 32, 33, 63, 64 and 65 sit on both sides of the first
+        mask, a full block and a block advance; the 255-byte name is the longest
+        component a local filesystem accepts. All names share a prefix, so the
+        sort decides them by length, and 16 entries reach RANGE_MIN on the range
+        build, where this directory can be split into ranges.
+        """
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        names = [b"a" * length for length in (1, 2, 31, 32, 33, 63, 64, 65, 255)]
+        names += [b"z%02d" % index for index in range(1, 8)]
+        assert len(names) == 16
+        for name in names:
+            (tree / name.decode()).write_bytes(b"")
+
+        res = run_in(binary, tree)
+        assert res.status == 0, f"Command failed: {res}"
+        assert res.err == b""
+        assert entries(res.out) == sorted(names)
+
+
 class TestPatternMatching:
     def test_pattern_matches_basename_not_relative_path(
         self, zfind_path: Path, tmp_path: Path

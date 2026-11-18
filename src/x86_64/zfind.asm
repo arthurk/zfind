@@ -2179,16 +2179,41 @@ cfg_unquote:
     ret
 cfg_unquote.end_func:
 
-; strlen: rdi = str -> rax = len
+; strlen: rdi = str -> rax = len.  Scans 32 bytes per AVX2 load rather than one
+; byte per iteration.  The first load rounds rdi down to a 32-byte block and the
+; leading bytes are masked out of the compare mask, so measuring starts at rdi
+; while the load itself stays aligned: an aligned 32-byte load never crosses a
+; page, which keeps argv/environ strings (unknown allocation) from faulting
+; past their terminator page.  Every later load advances by 32 from an aligned
+; address and is equally page-safe.
+; Clobbers rax, rcx, rdx, rdi, ymm0, ymm1; keeps rsi, r8-r11, r14, r15.
     global strlen:function (strlen.end_func - strlen)
 strlen:
-    xor rax, rax
+    mov rdx, rdi
+    and rdx, -32                     ; first block, rounded down
+    mov ecx, edi
+    and ecx, 31                      ; bytes of that block before the string
+    vpxor ymm1, ymm1, ymm1
+    vmovdqa ymm0, [rdx]
+    vpcmpeqb ymm0, ymm0, ymm1
+    vpmovmskb eax, ymm0
+    shr eax, cl                      ; drop the bytes preceding rdi
+    test eax, eax
+    jz .loop
+    bsf eax, eax                     ; first block: already rdi-relative, the length
+    vzeroupper                       ; the rest of the code is legacy SSE/scalar
+    ret
 .loop:
-    cmp byte [rdi+rax], 0
-    je .done
-    inc rax
-    jmp .loop
-.done:
+    add rdx, 32
+    vmovdqa ymm0, [rdx]
+    vpcmpeqb ymm0, ymm0, ymm1
+    vpmovmskb eax, ymm0
+    test eax, eax
+    jz .loop
+    bsf eax, eax                     ; NUL offset within this unshifted block
+    add rax, rdx                     ; NUL address
+    sub rax, rdi                     ; minus the string start
+    vzeroupper                       ; the rest of the code is legacy SSE/scalar
     ret
 strlen.end_func:
 
@@ -5656,9 +5681,9 @@ load_ignore.end_func:
 ; 1 to 5 bytes in an 8-byte block, and the key read takes 2 bytes of the next
 ; record. tie_cmp reads at most 15 bytes past the NUL, which the padding covers.
 ; The length pass could be avoided by allocating d_reclen, but that wastes
-; ~27 bytes per entry (~80 MB on /nix/store).
+; ~27 bytes per entry (~80 MB on /nix/store), so the length comes from strlen.
 ; Clobbers rax, rcx, rdx, rsi, rdi - not r8-r11/r14/r15, which the directory
-; loop is holding.
+; loop is holding - and, through strlen, ymm0/ymm1 and the upper ymm halves.
     global arena_put:function (arena_put.end_func - arena_put)
 arena_put:
     push rbx
@@ -5666,13 +5691,9 @@ arena_put:
     push r13
     mov rbx, r15
     mov r12, rdi                    ; packed metadata
-    xor r13d, r13d
-.len:
-    cmp byte [rbx+r13], 0
-    je .lend
-    inc r13
-    jmp .len
-.lend:
+    mov rdi, rbx
+    call strlen                     ; rax = name length
+    mov r13, rax
     lea rdi, [r13+19]               ; record, then 16 bytes of tail padding
     call salloc
     mov [rax], r12w
