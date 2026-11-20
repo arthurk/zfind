@@ -23,11 +23,13 @@ TREES = ["tiny", "hidden", "ignores", "weird", "camera", "tree2"]
 
 # A crashing binary must not write a multi-gigabyte core into a test tree. 1, not 0:
 # fs/coredump.c v6.17 refuses a file dump when limit < binfmt->min_coredump (ELF uses
-# ELF_EXEC_PAGESIZE = 4096), so 0 and 1 both suppress it, but a pipe pattern refuses
-# only at exactly 1 (the recursive-crash marker) and pipes at 0. A socket pattern (@)
-# ignores RLIMIT_CORE entirely; the crash test skips on that. A caller may already have
-# capped the hard limit; that cannot be raised without CAP_SYS_RESOURCE, and 0 already
-# suppresses a file dump, so leave it inherited.
+# ELF_EXEC_PAGESIZE = 4096), so 0 and 1 both suppress it. A pipe pattern refuses only
+# at exactly 1 (coredump_pipe's recursive-crash marker) and ignores 0, which it turns
+# into RLIM_INFINITY, and a socket pattern (@) sets RLIM_INFINITY too, so neither
+# honours the limit; the crash test skips on a socket pattern. 1 is the only value
+# that suppresses both a file and a pipe dump. A caller may already have capped the
+# hard limit; that cannot be raised without CAP_SYS_RESOURCE, and 0 already suppresses
+# a file dump, so leave it inherited.
 _, _hard = resource.getrlimit(resource.RLIMIT_CORE)
 if _hard != 0:
     resource.setrlimit(resource.RLIMIT_CORE, (1, 1))
