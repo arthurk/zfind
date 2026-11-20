@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from helpers import Result, entries, run_in
+from helpers import SLOW_TIMEOUT, Result, entries, run_in
 
 STRACE = shutil.which("strace")
 requires_strace = pytest.mark.skipif(STRACE is None, reason="requires strace")
@@ -37,7 +37,7 @@ def run_injected(binary: Path, cwd: Path, *args: str, inject: str) -> Result:
             str(binary), *args,
         ],
         cwd=cwd,
-        timeout=60,
+        timeout=SLOW_TIMEOUT,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )

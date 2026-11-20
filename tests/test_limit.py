@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 import pytest
-from helpers import Result, ZfindRunner, entries, joined, run_in, words
+from helpers import SLOW_TIMEOUT, Result, ZfindRunner, entries, joined, run_in, words
 from expected import IGNORES
 
 DEV_FULL = Path("/dev/full")
@@ -38,7 +38,7 @@ def nul_entries(out: bytes) -> list[bytes]:
 
 
 def run_repeated(
-    binary: Path, cwd: Path, *args: str, runs: int = 3, timeout: int = 60
+    binary: Path, cwd: Path, *args: str, runs: int = 3, timeout: int = SLOW_TIMEOUT
 ) -> Result:
     first = run_in(binary, cwd, *args, timeout=timeout)
     for run in range(2, runs + 1):

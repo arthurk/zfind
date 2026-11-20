@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import resource
 import subprocess
 import sys
 from pathlib import Path
@@ -12,13 +13,24 @@ from typing import IO, Iterator, Optional
 ZFIND_TESTDATA = os.environ.get("ZFIND_TESTDATA", "/tmp/zfind-testdata")
 
 import pytest
-from helpers import Result, ZfindRunner
+from helpers import Result, SPAWN_TIMEOUT, ZfindRunner
 
 TESTS_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(ZFIND_TESTDATA)
 
 # Trees required by the smoke/flags test suite (see tests/mktrees.py)
 TREES = ["tiny", "hidden", "ignores", "weird", "camera", "tree2"]
+
+# A crashing binary must not write a multi-gigabyte core into a test tree. 1, not 0:
+# fs/coredump.c v6.17 refuses a file dump when limit < binfmt->min_coredump (ELF uses
+# ELF_EXEC_PAGESIZE = 4096), so 0 and 1 both suppress it, but a pipe pattern refuses
+# only at exactly 1 (the recursive-crash marker) and pipes at 0. A socket pattern (@)
+# ignores RLIMIT_CORE entirely; the crash test skips on that. A caller may already have
+# capped the hard limit; that cannot be raised without CAP_SYS_RESOURCE, and 0 already
+# suppresses a file dump, so leave it inherited.
+_, _hard = resource.getrlimit(resource.RLIMIT_CORE)
+if _hard != 0:
+    resource.setrlimit(resource.RLIMIT_CORE, (1, 1))
 
 collect_ignore = ["testdata"]
 
@@ -136,7 +148,7 @@ def make_zfind_runner(binary: Path) -> ZfindRunner:
         done = subprocess.run(
             [str(binary), *args],
             cwd=DATA_DIR / tree,
-            timeout=10,
+            timeout=SPAWN_TIMEOUT,
             stdout=stdout if stdout is not None else subprocess.PIPE,
             stderr=subprocess.PIPE,
         )

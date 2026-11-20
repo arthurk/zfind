@@ -2,9 +2,33 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import time
 from pathlib import Path
 from typing import IO, NamedTuple, Optional, Protocol
+
+# Time bounds for every spawn. At about 2 GiB/s of runaway growth these allow
+# roughly 10 GiB and 30 GiB: they bound time, not memory.
+SPAWN_TIMEOUT = 5
+SLOW_TIMEOUT = 15
+RUNAWAY_TIMEOUT = 1
+
+_raw = os.environ.get("ZFIND_TEST_TIMEOUT_SCALE", "").strip()
+if not _raw:
+    SCALE = 1
+else:
+    try:
+        _value = int(_raw)
+    except ValueError:
+        _value = None
+    if _value is None or _value < 1:
+        raise SystemExit(
+            f"ZFIND_TEST_TIMEOUT_SCALE must be an integer >= 1, not {_raw!r}"
+        )
+    SCALE = _value
+SPAWN_TIMEOUT *= SCALE
+SLOW_TIMEOUT *= SCALE          # RUNAWAY_TIMEOUT is a damage bound: never scaled
 
 
 class Result(NamedTuple):
@@ -46,9 +70,16 @@ def entries(out: bytes) -> list[bytes]:
     return out.split(b"\n")[:-1]
 
 
-def run_in(binary: Path, cwd: Path, *args: str, timeout: int = 60) -> Result:
-    done = subprocess.run(
-        [str(binary), *args], cwd=cwd, timeout=timeout,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
+def run_in(binary: Path, cwd: Path, *args: str, timeout: int = SPAWN_TIMEOUT) -> Result:
+    started = time.monotonic()
+    try:
+        done = subprocess.run(
+            [str(binary), *args], cwd=cwd, timeout=timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - started
+        raise TimeoutError(
+            f"zfind exceeded {timeout}s (elapsed {elapsed:.1f}s, scale {SCALE})"
+        ) from exc
     return Result(out=done.stdout or b"", err=done.stderr or b"", status=done.returncode)

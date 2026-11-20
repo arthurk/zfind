@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 import pytest
-from helpers import Result, entries, joined
+from helpers import SPAWN_TIMEOUT, Result, entries, joined
 
 CFG_MAX = 65536  # config file size limit (CFG_MAX in zfind.asm)
 
@@ -64,7 +64,7 @@ def run_cfg(
         [str(binary), *args],
         cwd=cwd,
         env=dict(env or {}),
-        timeout=10,
+        timeout=SPAWN_TIMEOUT,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
