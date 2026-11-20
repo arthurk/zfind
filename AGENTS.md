@@ -57,6 +57,44 @@ locate them. Read the affected test functions and any fixtures or helpers they
 depend on. Expand the inspection when needed; do not read a whole large test
 file by default.
 
+### Bounds and hostile builds
+
+- `arena_put` checks a `d_name` against the entry's `d_reclen`; `alloc` and
+  `salloc` refuse a request larger than `ARENA_SZ` as defence in depth. A corrupt
+  length prints one line and exits 1 instead of touching pages. All run in every
+  build.
+- The mutant binaries (`build/x86_64-mutant/zfind-mutant-{len,shr,over,size,alloc}`)
+  are test fixtures produced by `scripts/inject_fault.sh`; they are not zfind
+  builds and must never be run against a real tree or shipped.
+- The suite limits cores to 1 for every subprocess: a file pattern refuses a dump
+  at 0 and 1, a pipe pattern only at 1, and a socket pattern not at all
+  (`fs/coredump.c`, kernel v6.17). A SIGBUS with cores enabled wrote 7.0 GB during
+  this issue's analysis.
+- Every zfind spawn has a named timeout from `tests/helpers.py`:
+  `SPAWN_TIMEOUT` 5 s, `SLOW_TIMEOUT` 15 s (the 131,072-entry range-split runs,
+  the pty and strace helpers, and the `run_repeated`/`run_injected` helpers),
+  `RUNAWAY_TIMEOUT` 1 s (the runaway mutant runs).
+  `ZFIND_TEST_TIMEOUT_SCALE` multiplies the first two and never the third. These
+  are time bounds, not memory bounds: a runaway can touch ~10 GiB inside 5 s and
+  ~30 GiB inside 15 s, which is more than a 16 GB CI runner, so the only real
+  memory bound is a cgroup cap (#45). CI runs at scale 1 and prints
+  `--durations=10`: if a slowest spawn exceeds about 1.5 s, set
+  `ZFIND_TEST_TIMEOUT_SCALE: 2` in that workflow.
+- The single-file recipe needs the mutant paths too:
+
+  ```sh
+  ZFIND=build/x86_64/zfind \
+  ZFIND_SERIAL=build/x86_64-serial/zfind \
+  ZFIND_UNKNOWN=build/x86_64-unknown/zfind \
+  ZFIND_RANGE=build/x86_64-range/zfind \
+  ZFIND_MUTANT_LEN=build/x86_64-mutant/zfind-mutant-len \
+  ZFIND_MUTANT_SHR=build/x86_64-mutant/zfind-mutant-shr \
+  ZFIND_MUTANT_OVER=build/x86_64-mutant/zfind-mutant-over \
+  ZFIND_MUTANT_SIZE=build/x86_64-mutant/zfind-mutant-size \
+  ZFIND_MUTANT_ALLOC=build/x86_64-mutant/zfind-mutant-alloc \
+      python3 -m pytest tests/test_bounds.py -k negative_length
+  ```
+
 ### Regression tests
 
 For each changed behaviour, the `test-writer` adds at least one focused
