@@ -66,20 +66,24 @@ file by default.
 - The mutant binaries (`build/x86_64-mutant/zfind-mutant-{len,shr,over,size,alloc}`)
   are test fixtures produced by `scripts/inject_fault.sh`; they are not zfind
   builds and must never be run against a real tree or shipped.
-- The suite limits cores to 1 for every subprocess: a file pattern refuses a dump
+- The suite caps cores at 1 for every subprocess: a file pattern refuses a dump
   at 0 and 1, a pipe pattern only at 1, and a socket pattern not at all
   (`fs/coredump.c`, kernel v6.17). A SIGBUS with cores enabled wrote 7.0 GB during
   this issue's analysis.
 - Every zfind spawn has a named timeout from `tests/helpers.py`:
   `SPAWN_TIMEOUT` 5 s, `SLOW_TIMEOUT` 15 s (the 131,072-entry range-split runs,
   the pty and strace helpers, and the `run_repeated`/`run_injected` helpers),
-  `RUNAWAY_TIMEOUT` 1 s (the runaway mutant runs).
-  `ZFIND_TEST_TIMEOUT_SCALE` multiplies the first two and never the third. These
-  are time bounds, not memory bounds: a runaway can touch ~10 GiB inside 5 s and
-  ~30 GiB inside 15 s, which is more than a 16 GB CI runner, so the only real
+  `RUNAWAY_TIMEOUT` 1 s (the runaway mutant runs, 3-21 ms idle and 20 ms with the
+  spawn and a spinner on one core, so 1 s is at least 50x headroom).
+  `ZFIND_TEST_TIMEOUT_SCALE` multiplies the first two and never the third: raise a
+  `SPAWN_TIMEOUT` or `SLOW_TIMEOUT` spawn with the variable, but the only way to
+  loosen `RUNAWAY_TIMEOUT` is to edit the constant in `tests/helpers.py`, because
+  it is the damage bound and scaling it would widen the damage at the same time.
+  These are time bounds, not memory bounds: a runaway can touch ~10 GiB inside 5 s
+  and ~30 GiB inside 15 s, which is more than a 16 GB CI runner, so the only real
   memory bound is a cgroup cap (#45). CI runs at scale 1 and prints
-  `--durations=10`: if a slowest spawn exceeds about 1.5 s, set
-  `ZFIND_TEST_TIMEOUT_SCALE: 2` in that workflow.
+  `--durations=10`: if a slowest `SPAWN_TIMEOUT`/`SLOW_TIMEOUT` spawn exceeds
+  about 1.5 s, set `ZFIND_TEST_TIMEOUT_SCALE: 2` in that workflow.
 - The single-file recipe needs the mutant paths too:
 
   ```sh
