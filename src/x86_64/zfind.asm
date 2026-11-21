@@ -459,6 +459,8 @@ section .rodata
     e_big_e:
     e_scratch   db "zfind: directory too large", 10
     e_scratch_e:
+    e_name_len  db "zfind: internal: directory entry name too long", 10
+    e_name_len_e:
     e_case      db "zfind: expected smart, sensitive or insensitive after --case", 10
     e_case_e:
     e_hid       db "zfind: cannot combine --hidden and --no-hidden", 10
@@ -3575,6 +3577,8 @@ out_flush.end_func:
 ; chunk reservation that clobbered r8 corrupted them).
     global alloc:function (alloc.end_func - alloc)
 alloc:
+    cmp rdi, ARENA_SZ                ; no single block can exceed the arena, and
+    ja big                           ; a wrapped request would pass the checks
     ; round the request up: tagged item pointers use bit 0, so every block has
     ; to start 8-aligned (the arena base and every chunk are, being page sizes)
     add rdi, 7
@@ -3616,6 +3620,8 @@ alloc.end_func:
 ; and rules die with its frame. Clobbers rax, rcx, rdi.
     global salloc:function (salloc.end_func - salloc)
 salloc:
+    cmp rdi, ARENA_SZ                ; as above: a size near 2^64 arrives here if
+    ja scratch_full                  ; strlen ever returns one, and wraps the top
     add rdi, 7
     and rdi, -8
     mov rax, [r14+TSTATE.sc_top]
@@ -5208,6 +5214,11 @@ scratch_full:
     mov rdx, e_scratch_e - e_scratch
     jmp die
 
+bad_name_len:
+    lea rsi, [e_name_len]
+    mov rdx, e_name_len_e - e_name_len
+    jmp die
+
 
 ; globmatch: rdi = pattern, rsi = string (both NUL-terminated) -> al = 1 on a
 ; whole-string match. gitignore syntax: '*' stops at '/', "**/" spans any
@@ -5682,6 +5693,10 @@ load_ignore.end_func:
 ; record. tie_cmp reads at most 15 bytes past the NUL, which the padding covers.
 ; The length pass could be avoided by allocating d_reclen, but that wastes
 ; ~27 bytes per entry (~80 MB on /nix/store), so the length comes from strlen.
+; in: r9 = this entry's d_reclen (loaded by walk_dir at the getdents64 batch);
+; the length must fit it, so r9 has to stay live across the strlen call, and it
+; is: strlen keeps r8-r11 by contract. The two-instruction check costs
+; about 4 instructions per entry (about +1 %), and it is in every build.
 ; Clobbers rax, rcx, rdx, rsi, rdi - not r8-r11/r14/r15, which the directory
 ; loop is holding - and, through strlen, ymm0/ymm1 and the upper ymm halves.
     global arena_put:function (arena_put.end_func - arena_put)
@@ -5694,6 +5709,8 @@ arena_put:
     mov rdi, rbx
     call strlen                     ; rax = name length
     mov r13, rax
+    cmp r13, r9                     ; d_reclen of this entry: the name and its
+    ja bad_name_len                 ; NUL fit; a corrupt length wraps above it
     lea rdi, [r13+19]               ; record, then 16 bytes of tail padding
     call salloc
     mov [rax], r12w

@@ -26,7 +26,7 @@
           git         # `git describe` in bench.py and cqa.py
         ];
 
-        shellHook = "ulimit -c 0";   # debug live under gdb, don't litter core dumps
+        shellHook = "ulimit -S -c 0";   # debug live under gdb, don't litter core dumps
       };
     };
 }

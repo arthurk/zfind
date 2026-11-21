@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 import pytest
-from helpers import Result, ZfindRunner, entries
+from helpers import SLOW_TIMEOUT, Result, ZfindRunner, entries
 
 ESC = b"\x1b"
 CYAN = ESC + b"[36m"
@@ -49,7 +49,7 @@ def run_env(
         [str(binary), *args],
         cwd=cwd,
         env=dict(env or {}),
-        timeout=60,
+        timeout=SLOW_TIMEOUT,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -87,14 +87,14 @@ def run_pty(
     # Read while the child runs. Waiting for subprocess.run to finish first
     # deadlocks once the output fills the pty buffer, so drain it here.
     chunks: list[bytes] = []
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + SLOW_TIMEOUT
     try:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 proc.kill()
                 proc.wait()
-                raise subprocess.TimeoutExpired([str(binary), *args], 60)
+                raise subprocess.TimeoutExpired([str(binary), *args], SLOW_TIMEOUT)
             ready, _, _ = select.select([master], [], [], min(remaining, 0.1))
             if ready:
                 try:

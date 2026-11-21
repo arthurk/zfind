@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from helpers import Result, entries, run_in
+from helpers import SLOW_TIMEOUT, Result, entries, run_in
 
 STRACE = shutil.which("strace")
 requires_strace = pytest.mark.skipif(STRACE is None, reason="requires strace")
@@ -20,7 +20,7 @@ def run_injected(
     *args: str,
     inject: str,
     stdout=None,
-    timeout: int = 60,
+    timeout: int = SLOW_TIMEOUT,
 ) -> Result:
     """Run zfind under strace with one injected syscall fault.
 

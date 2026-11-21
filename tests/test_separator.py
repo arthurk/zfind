@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-from helpers import Result, ZfindRunner, joined, run_in
+from helpers import SLOW_TIMEOUT, Result, ZfindRunner, joined, run_in
 
 BLK_DATA = 49152 - 32  # src/x86_64/zfind.asm: BLK_SZ - BLK_HDR
 TINY = [word.encode() for word in "a b ca cb dir/ dir/c dir/d e".split()]
@@ -25,7 +25,7 @@ def nul_entries(out: bytes) -> list[bytes]:
 
 
 def run_repeated(
-    binary: Path, cwd: Path, *args: str, runs: int = 3, timeout: int = 60
+    binary: Path, cwd: Path, *args: str, runs: int = 3, timeout: int = SLOW_TIMEOUT
 ) -> Result:
     """Run zfind several times and assert that every run is identical."""
     first = run_in(binary, cwd, *args, timeout=timeout)
@@ -425,7 +425,7 @@ class TestSeparatorRangeGroups:
             )
 
         names = [f"f{i:06d}".encode() for i in range(131072)]
-        full = run_in(zfind_path, flat_131072, "--separator=XY", timeout=120)
+        full = run_in(zfind_path, flat_131072, "--separator=XY", timeout=SLOW_TIMEOUT)
         assert full.status == 0, f"Full run failed: {full}"
         assert full.err == b""
         assert full.out.endswith(b"XY")
@@ -441,9 +441,9 @@ class TestSeparatorRangeGroups:
         for n in (2047, 2048, 2049, 4096, 131071, 131072):
             args = ("--separator=XY", "--limit", str(n))
             if n == 2048:
-                res = run_repeated(zfind_path, flat_131072, *args, timeout=120)
+                res = run_repeated(zfind_path, flat_131072, *args, timeout=SLOW_TIMEOUT)
             else:
-                res = run_in(zfind_path, flat_131072, *args, timeout=120)
+                res = run_in(zfind_path, flat_131072, *args, timeout=SLOW_TIMEOUT)
             assert res.status == 0, f"Limited run at {n} failed: {res}"
             assert res.err == b"", f"Limited run at {n} wrote stderr: {res}"
             expected = full.out[:n * (7 + len(b"XY"))]
@@ -452,7 +452,7 @@ class TestSeparatorRangeGroups:
 
         serial = run_in(
             serial_binary_path, flat_131072,
-            "--separator=XY", "--limit", "131072", timeout=120,
+            "--separator=XY", "--limit", "131072", timeout=SLOW_TIMEOUT,
         )
         assert serial.status == 0, f"Serial run failed: {serial}"
         assert serial.err == b"", f"Serial run wrote stderr: {serial}"

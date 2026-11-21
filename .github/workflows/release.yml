@@ -37,7 +37,7 @@ jobs:
 
       - name: Test and build
         run: |
-          nix develop -c make test release
+          nix develop -c make test PYTEST_ARGS="--durations=10" release
           install -D -m 755 build/x86_64/zfind.release dist/zfind-linux-x86_64-v3
           (cd dist && sha256sum zfind-linux-x86_64-v3 > zfind-linux-x86_64-v3.sha256)
 
