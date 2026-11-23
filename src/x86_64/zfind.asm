@@ -2,7 +2,8 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 
 ; zfind, "simple search" use case only:
 ;   zfind [OPTIONS] [PATH] [PATTERN]
-;         [--help] [--separator STR] [--case smart|sensitive|insensitive]
+;         [--help] [--show-config] [--separator STR]
+;         [--case smart|sensitive|insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
 ;         [--exclude-name NAME] [--exclude-type TYPE] [--limit N|none]
 ;         [--type TYPE] [--color auto|always|never] [--quote auto|always|never]
@@ -77,8 +78,10 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; line (--name, --name=value or --name value, # comment lines, matching quotes
 ; around a value) and is read by the same parser as the command line
 ; (parse_args), so each line is checked exactly like its flag. --help,
-; --config, --no-config, --path and "--" are command-line only, and a
-; positional PATH or PATTERN is rejected in the file. The layers are
+; --show-config, --config, --no-config, --path and "--" are command-line only,
+; and a positional PATH or PATTERN is rejected in the file. --show-config
+; prints the effective resolved configuration and loaded configuration file
+; path to stdout, then exits 0 without traversing the filesystem. The layers are
 ; the built-in defaults, then the file, then the command line: a mode
 ; (hidden, gitignore) set on the command line replaces the file's, a scalar
 ; (--separator, --limit, --case) is overwritten, a command-line --type replaces
@@ -568,6 +571,28 @@ section .rodata
     cfg_long    db "--config", 0
     cfg_eq      db "--config=", 0    ; 9 bytes of prefix
     nocfg_long  db "--no-config", 0
+    showcfg_long db "--show-config", 0
+    sc_hdr_pfx   db "# Configuration source: ", 0
+    sc_hdr_none  db "none (built-in defaults)", 10, 0
+    sc_hdr_nocfg db "none (--no-config)", 10, 0
+    sc_case_smart db "--case=smart", 10, 0
+    sc_case_sens db "--case=sensitive", 10, 0
+    sc_case_insens db "--case=insensitive", 10, 0
+    sc_col_auto  db "--color=auto", 10, 0
+    sc_col_always db "--color=always", 10, 0
+    sc_col_never db "--color=never", 10, 0
+    sc_lim_pfx   db "--limit=", 0
+    sc_lim_none  db "--limit=none", 10, 0
+    sc_sep_pfx   db "--separator=", 0
+    sc_hid       db "--hidden", 10, 0
+    sc_nohid     db "--no-hidden", 10, 0
+    sc_git       db "--gitignore", 10, 0
+    sc_nogit     db "--no-gitignore", 10, 0
+    sc_abs       db "--absolute", 10, 0
+    sc_rel       db "--relative", 10, 0
+    sc_type_pfx  db "--type=", 0
+    sc_xtype_pfx db "--exclude-type=", 0
+    sc_xname_pfx db "--exclude-name=", 0
     color_long  db "--color", 0
     color_eq    db "--color=", 0     ; 8 bytes of prefix
     quote_long  db "--quote", 0
@@ -599,7 +624,8 @@ section .rodata
     cfg_sfx_home db "/.config/zfind/config", 0
     cfg_sfx_home_e:
     help_msg    db "usage: zfind [OPTIONS] [PATH] [PATTERN]", 10
-               db "  options: [--help] [--separator STR] [--case smart|sensitive|insensitive]", 10
+               db "  options: [--help] [--show-config] [--separator STR]", 10
+               db "             [--case smart|sensitive|insensitive]", 10
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
                db "             [--exclude-name NAME]... [--exclude-type TYPE]", 10
                db "             [--limit N|none] [--type TYPE]", 10
@@ -640,7 +666,7 @@ section .rodata
                db "Command-line options override the file, except --exclude-name, which adds", 10
                db "to it, and --exclude-type, which also adds; a command-line --type replaces", 10
                db "the file's --type values.", 10
-               db "--config, --no-config and --path are command-line only.", 10, 10
+               db "--config, --no-config, --show-config and --path are command-line only.", 10, 10
                db "Hidden entries are searched like any other, .git and .jj included; --no-hidden", 10
                db "skips entries whose name starts with . and everything inside them.", 10
                db "--hidden states the default explicitly; combining the two is an error.", 10
@@ -696,6 +722,7 @@ section .rodata
                db "  --config PATH       read settings from PATH instead of the default file", 10
                db "                      (also --config=PATH); the file must exist", 10
                db "  --no-config         read no config file", 10
+               db "  --show-config       show effective resolved configuration and exit", 10
                db "  --                  end options; following arguments are PATTERN", 10
     help_msg_e:
     align 8
@@ -795,6 +822,8 @@ section .bss
     cfg_hid:    resb 1                ; the config file's modes, parked while the
                                       ;   command line is parsed (0 = not set)
     cfg_abs:    resb 1                ; the config file's --absolute/--relative mode
+    flag_show_config: resb 1          ; 1 = --show-config was given
+    cfg_loaded: resb 1                ; 1 = a config file was successfully loaded
     alignb 8
     cfg_ig:     resq 1
     cfg_type:   resq 1                ; the config file's --type bits (first qword of res_type)
@@ -947,6 +976,8 @@ _start:
     mov al, [cfg_quote]
     mov [quote_mode], al
 .have_args:
+    cmp byte [flag_show_config], 0
+    jne .do_show_config
     call select_root                 ; validate/open the starting directory
     call abs_root_setup              ; --absolute: prefix the display root
     mov r13, [parsed_pat]
@@ -962,6 +993,9 @@ _start:
 .no_pat:
     mov qword [pat_len], 0
     jmp .pat_ready
+
+.do_show_config:
+    call show_config
 
 .help:                                 ; write the usage, then leave: no walk
     mov edi, 1
@@ -1385,6 +1419,10 @@ parse_args:
     lea rsi, [nocfg_long]
     call streq
     je .opt_cfg_skip
+    mov rdi, [rbp+r12*8]
+    lea rsi, [showcfg_long]
+    call streq
+    je .opt_show_config
 
     mov rdi, [rbp+r12*8]
     cmp byte [rdi+1], '-'
@@ -1694,6 +1732,11 @@ parse_args:
     cmp r12, rbx
     jae bad_cfg_missing
 .opt_cfg_skip:                         ; --config=PATH, --no-config: nothing to do here
+    inc r12
+    jmp .args_loop
+
+.opt_show_config:
+    mov byte [flag_show_config], 1
     inc r12
     jmp .args_loop
 
@@ -2193,6 +2236,7 @@ load_config:
     mov qword [err_path], 0          ; no default config: nothing to load
     jmp .ret
 .opened:
+    mov byte [cfg_loaded], 1
     mov r12, rax                     ; fd
     xor r13d, r13d                   ; bytes read
 .read:
@@ -2339,6 +2383,9 @@ cfg_line:
     call streq
     je bad_cfg_cli
     lea rsi, [nocfg_long]
+    call streq
+    je bad_cfg_cli
+    lea rsi, [showcfg_long]
     call streq
     je bad_cfg_cli
     lea rsi, [path_long]
@@ -2644,6 +2691,509 @@ parse_sep:
     mov [sep_len], rcx
     ret
 parse_sep.end_func:
+
+; strcmp: rdi = str1, rsi = str2 -> flags / eax difference
+    global strcmp:function (strcmp.end_func - strcmp)
+strcmp:
+.loop:
+    movzx eax, byte [rdi]
+    movzx edx, byte [rsi]
+    cmp al, dl
+    jne .diff
+    test al, al
+    jz .diff
+    inc rdi
+    inc rsi
+    jmp .loop
+.diff:
+    sub eax, edx
+    ret
+strcmp.end_func:
+
+; show_byte: al = byte to append to out_buf
+    global show_byte:function (show_byte.end_func - show_byte)
+show_byte:
+    push rbx
+    sub rsp, 8
+    mov rbx, [out_len]
+    cmp rbx, OUT_SZ - 8
+    jb .no_flush
+    push rax
+    sub rsp, 8
+    call out_flush
+    add rsp, 8
+    pop rax
+    xor ebx, ebx
+.no_flush:
+    mov [out_buf + rbx], al
+    inc qword [out_len]
+    add rsp, 8
+    pop rbx
+    ret
+show_byte.end_func:
+
+; show_str: rsi = pointer, rdx = length
+    global show_str:function (show_str.end_func - show_str)
+show_str:
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+    mov r12, rsi
+    mov r13, rdx
+.loop:
+    test r13, r13
+    jz .done
+    mov rbx, [out_len]
+    cmp rbx, OUT_SZ - 8
+    jb .fits
+    call out_flush
+    xor ebx, ebx
+.fits:
+    mov rax, OUT_SZ - 8
+    sub rax, rbx
+    cmp r13, rax
+    jbe .copy_all
+    mov rcx, rax
+    jmp .do_copy
+.copy_all:
+    mov rcx, r13
+.do_copy:
+    lea rdi, [out_buf + rbx]
+    mov rsi, r12
+    push rcx
+    rep movsb
+    pop rcx
+    add [out_len], rcx
+    add r12, rcx
+    sub r13, rcx
+    jmp .loop
+.done:
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    ret
+show_str.end_func:
+
+; show_cstr: rsi = NUL-terminated string
+    global show_cstr:function (show_cstr.end_func - show_cstr)
+show_cstr:
+    push rsi
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    pop rsi
+    jmp show_str
+show_cstr.end_func:
+
+; show_u64: rax = number to format in decimal
+    global show_u64:function (show_u64.end_func - show_u64)
+show_u64:
+    push rbx
+    push r12
+    xor ebx, ebx
+    mov r12, 10
+.dig:
+    xor edx, edx
+    div r12
+    add dl, '0'
+    push rdx
+    inc ebx
+    test rax, rax
+    jnz .dig
+.pop:
+    pop rax
+    call show_byte
+    dec ebx
+    jnz .pop
+    pop r12
+    pop rbx
+    ret
+show_u64.end_func:
+
+; show_type_opt: rdi = prefix (e.g. sc_type_pfx), rsi = type name (e.g. tv_file)
+    global show_type_opt:function (show_type_opt.end_func - show_type_opt)
+show_type_opt:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12, rsi
+    mov rsi, rbx
+    call show_cstr
+    mov rsi, r12
+    call show_cstr
+    mov al, 10
+    call show_byte
+    pop r12
+    pop rbx
+    ret
+show_type_opt.end_func:
+
+; show_config: format resolved configuration and exit 0
+    global show_config:function (show_config.end_func - show_config)
+show_config:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    ; 1. Configuration source header
+    cmp byte [cfg_mode], 2
+    je .hdr_nocfg
+    cmp byte [cfg_loaded], 1
+    je .hdr_file
+    lea rsi, [sc_hdr_pfx]
+    call show_cstr
+    lea rsi, [sc_hdr_none]
+    call show_cstr
+    jmp .show_case
+.hdr_nocfg:
+    lea rsi, [sc_hdr_pfx]
+    call show_cstr
+    lea rsi, [sc_hdr_nocfg]
+    call show_cstr
+    jmp .show_case
+.hdr_file:
+    lea rsi, [sc_hdr_pfx]
+    call show_cstr
+    mov rsi, [cfg_path]
+    call show_cstr
+    mov al, 10
+    call show_byte
+
+.show_case:
+    ; 2. Scalar: --case
+    cmp byte [case_mode], 1
+    je .case_1
+    cmp byte [case_mode], 2
+    je .case_2
+    lea rsi, [sc_case_smart]
+    call show_cstr
+    jmp .show_color
+.case_1:
+    lea rsi, [sc_case_sens]
+    call show_cstr
+    jmp .show_color
+.case_2:
+    lea rsi, [sc_case_insens]
+    call show_cstr
+
+.show_color:
+    ; 3. Scalar: --color
+    cmp byte [color_mode], 2
+    je .col_2
+    cmp byte [color_mode], 3
+    je .col_3
+    lea rsi, [sc_col_auto]
+    call show_cstr
+    jmp .show_limit
+.col_2:
+    lea rsi, [sc_col_always]
+    call show_cstr
+    jmp .show_limit
+.col_3:
+    lea rsi, [sc_col_never]
+    call show_cstr
+
+.show_limit:
+    ; 4. Scalar: --limit
+    cmp qword [limit_given], 0
+    jne .lim_num
+    lea rsi, [sc_lim_none]
+    call show_cstr
+    jmp .show_sep
+.lim_num:
+    lea rsi, [sc_lim_pfx]
+    call show_cstr
+    mov rax, [lim_left]
+    call show_u64
+    mov al, 10
+    call show_byte
+
+.show_sep:
+    ; 5. Scalar: --separator
+    lea rsi, [sc_sep_pfx]
+    call show_cstr
+    mov r12, [sep_len]
+    xor ebx, ebx
+    xor r14d, r14d
+    xor r13, r13
+.sep_check:
+    cmp r13, r12
+    jae .sep_check_done
+    movzx eax, byte [sep_buf + r13]
+    cmp al, 0
+    je .sep_needs_quote
+    cmp al, 9
+    je .sep_needs_quote
+    cmp al, 10
+    je .sep_needs_quote
+    cmp al, 13
+    je .sep_needs_quote
+    cmp al, 92
+    je .sep_needs_quote
+    cmp al, 32
+    je .sep_needs_quote
+    cmp al, "'"
+    je .sep_has_sq
+    inc r13
+    jmp .sep_check
+.sep_has_sq:
+    mov r14d, 1
+.sep_needs_quote:
+    mov ebx, 1
+    inc r13
+    jmp .sep_check
+.sep_check_done:
+    test ebx, ebx
+    jz .sep_no_quote
+    mov r15b, "'"
+    test r14d, r14d
+    jz .sep_quote_char_ready
+    mov r15b, '"'
+.sep_quote_char_ready:
+    mov al, r15b
+    call show_byte
+    xor r13, r13
+.sep_emit_quoted:
+    cmp r13, r12
+    jae .sep_emit_quoted_done
+    movzx eax, byte [sep_buf + r13]
+    cmp al, 0
+    je .esc_0
+    cmp al, 9
+    je .esc_t
+    cmp al, 10
+    je .esc_n
+    cmp al, 13
+    je .esc_r
+    cmp al, 92
+    je .esc_slash
+    call show_byte
+    inc r13
+    jmp .sep_emit_quoted
+.esc_0:
+    mov al, 92
+    call show_byte
+    mov al, '0'
+    call show_byte
+    inc r13
+    jmp .sep_emit_quoted
+.esc_t:
+    mov al, 92
+    call show_byte
+    mov al, 't'
+    call show_byte
+    inc r13
+    jmp .sep_emit_quoted
+.esc_n:
+    mov al, 92
+    call show_byte
+    mov al, 'n'
+    call show_byte
+    inc r13
+    jmp .sep_emit_quoted
+.esc_r:
+    mov al, 92
+    call show_byte
+    mov al, 'r'
+    call show_byte
+    inc r13
+    jmp .sep_emit_quoted
+.esc_slash:
+    mov al, 92
+    call show_byte
+    mov al, 92
+    call show_byte
+    inc r13
+    jmp .sep_emit_quoted
+.sep_emit_quoted_done:
+    mov al, r15b
+    call show_byte
+    mov al, 10
+    call show_byte
+    jmp .show_modes
+.sep_no_quote:
+    lea rsi, [sep_buf]
+    mov rdx, r12
+    call show_str
+    mov al, 10
+    call show_byte
+
+.show_modes:
+    ; 6. Mode: --hidden / --no-hidden
+    cmp byte [hid_mode], 2
+    je .hid_no
+    lea rsi, [sc_hid]
+    call show_cstr
+    jmp .show_git
+.hid_no:
+    lea rsi, [sc_nohid]
+    call show_cstr
+
+.show_git:
+    ; 7. Mode: --gitignore / --no-gitignore
+    cmp qword [res_ig], 1
+    je .git_yes
+    lea rsi, [sc_nogit]
+    call show_cstr
+    jmp .show_abs
+.git_yes:
+    lea rsi, [sc_git]
+    call show_cstr
+
+.show_abs:
+    ; 8. Mode: --relative / --absolute
+    cmp byte [abs_mode], 1
+    je .abs_yes
+    lea rsi, [sc_rel]
+    call show_cstr
+    jmp .emit_types
+.abs_yes:
+    lea rsi, [sc_abs]
+    call show_cstr
+
+.emit_types:
+    ; 9. Result type filters
+    cmp byte [type_seen], 0
+    jz .emit_xnames
+    test qword [res_type], TYPE_F
+    jz .t_d
+    lea rdi, [sc_type_pfx]
+    lea rsi, [tv_file]
+    call show_type_opt
+.t_d:
+    test qword [res_type], TYPE_D
+    jz .t_l
+    lea rdi, [sc_type_pfx]
+    lea rsi, [tv_dir_long]
+    call show_type_opt
+.t_l:
+    test qword [res_type], TYPE_L
+    jz .t_b
+    lea rdi, [sc_type_pfx]
+    lea rsi, [tv_symlink]
+    call show_type_opt
+.t_b:
+    test qword [res_type], TYPE_B
+    jz .emit_xnames
+    lea rdi, [sc_type_pfx]
+    lea rsi, [tv_broken]
+    call show_type_opt
+
+.emit_xnames:
+    ; 10. Basename exclusions (sorted order)
+    mov r12, [excl_n]
+    test r12, r12
+    jz .emit_xtypes
+    cmp r12, 1
+    jbe .xnames_sorted
+    xor r13, r13
+.sort_outer:
+    mov r14, r13
+    inc r14
+.sort_inner:
+    cmp r14, r12
+    jae .sort_outer_next
+    mov rdi, [excl_names + r13*8]
+    mov rsi, [excl_names + r14*8]
+    call strcmp
+    jle .sort_no_swap
+    mov rax, [excl_names + r13*8]
+    mov rbx, [excl_names + r14*8]
+    mov [excl_names + r13*8], rbx
+    mov [excl_names + r14*8], rax
+.sort_no_swap:
+    inc r14
+    jmp .sort_inner
+.sort_outer_next:
+    inc r13
+    cmp r13, r12
+    jb .sort_outer
+.xnames_sorted:
+    xor r13, r13
+.xnames_loop:
+    cmp r13, r12
+    jae .emit_xtypes
+    mov rsi, [excl_names + r13*8]
+    mov rdi, rsi
+    xor ebx, ebx
+.xname_scan_ws:
+    mov al, [rdi]
+    test al, al
+    jz .xname_scan_ws_done
+    cmp al, ' '
+    je .xname_has_ws
+    cmp al, 9
+    je .xname_has_ws
+    inc rdi
+    jmp .xname_scan_ws
+.xname_has_ws:
+    mov ebx, 1
+.xname_scan_ws_done:
+    test ebx, ebx
+    jz .xname_no_ws
+    push rsi
+    lea rsi, [sc_xname_pfx]
+    call show_cstr
+    mov al, '"'
+    call show_byte
+    pop rsi
+    call show_cstr
+    mov al, '"'
+    call show_byte
+    mov al, 10
+    call show_byte
+    jmp .xname_next
+.xname_no_ws:
+    push rsi
+    lea rsi, [sc_xname_pfx]
+    call show_cstr
+    pop rsi
+    call show_cstr
+    mov al, 10
+    call show_byte
+.xname_next:
+    inc r13
+    jmp .xnames_loop
+
+.emit_xtypes:
+    ; 11. Type exclusions
+    cmp byte [excl_seen], 0
+    jz .flush_and_exit
+    test qword [res_excl], TYPE_F
+    jz .xt_d
+    lea rdi, [sc_xtype_pfx]
+    lea rsi, [tv_file]
+    call show_type_opt
+.xt_d:
+    test qword [res_excl], TYPE_D
+    jz .xt_l
+    lea rdi, [sc_xtype_pfx]
+    lea rsi, [tv_dir_long]
+    call show_type_opt
+.xt_l:
+    test qword [res_excl], TYPE_L
+    jz .xt_b
+    lea rdi, [sc_xtype_pfx]
+    lea rsi, [tv_symlink]
+    call show_type_opt
+.xt_b:
+    test qword [res_excl], TYPE_B
+    jz .flush_and_exit
+    lea rdi, [sc_xtype_pfx]
+    lea rsi, [tv_broken]
+    call show_type_opt
+
+.flush_and_exit:
+    call out_flush
+    xor edi, edi
+    mov eax, SYS_exit_group
+    syscall
+show_config.end_func:
 
 ; startswith: rdi = string, rsi = prefix -> ZF=1 if string begins with prefix
     global startswith:function (startswith.end_func - startswith)
