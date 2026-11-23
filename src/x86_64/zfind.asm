@@ -6,6 +6,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
 ;         [--exclude-name NAME] [--exclude-type TYPE] [--limit N|none]
 ;         [--type TYPE] [--color auto|always|never]
+;         [--absolute | --relative]
 ;         [--config PATH | --no-config] [--path DIR] [--]
 ; PATH is an optional starting directory and must come before PATTERN. Without
 ; --path, a lone positional token containing '/' or the exact tokens . and ..
@@ -20,7 +21,14 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; --limit 0 exit, and its descriptor is consumed by the root worker; open and
 ; read failures are errors. Its display spelling is kept (redundant trailing
 ; '/' removed, '/' kept) and the root itself is never printed. --type,
-; --no-hidden and --exclude-name apply to descendants only.
+; --no-hidden and --exclude-name apply to descendants only. --absolute
+; prefixes that display spelling with getcwd(2), the physical path as pwd -P
+; reports it, keeping the spelling verbatim after the prefix: "." adds
+; nothing, a leading "./" is dropped, ".." and a symlinked PATH are not
+; resolved. An absolute PATH already prints absolute paths, so --absolute
+; changes nothing there. --relative, the default, keeps the spelling alone;
+; the two flags conflict within one source and the command line overrides the
+; config file.
 ; PATTERN is a literal substring (case-insensitive unless it contains A-Z,
 ; "smart case"); regex and glob syntax are not implemented.
 ; Every entry is searched, including hidden names and dot-directories like
@@ -142,6 +150,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define SYS_ioctl             16
 %define SYS_clone             56
 %define SYS_exit              60
+%define SYS_getcwd            79
 %define SYS_readlink          89
 %define SYS_getrlimit         97
 %define SYS_futex             202
@@ -467,6 +476,8 @@ section .rodata
     e_hid_e:
     e_ig        db "zfind: cannot combine --gitignore and --no-gitignore", 10
     e_ig_e:
+    e_abs       db "zfind: cannot combine --absolute and --relative", 10
+    e_abs_e:
     e_sep_missing db "zfind: missing value for --separator", 10
     e_sep_missing_e:
     e_sep_empty db "zfind: empty separator", 10
@@ -528,6 +539,8 @@ section .rodata
     nog_long    db "--no-gitignore", 0
     hidden_long db "--hidden", 0
     no_long     db "--no-hidden", 0
+    abs_long    db "--absolute", 0
+    rel_long    db "--relative", 0
     path_long   db "--path", 0
     path_eq     db "--path=", 0      ; 7 bytes of prefix
     cfg_long    db "--config", 0
@@ -566,6 +579,7 @@ section .rodata
                db "             [--exclude-name NAME]... [--exclude-type TYPE]", 10
                db "             [--limit N|none] [--type TYPE]", 10
                db "             [--color auto|always|never]", 10
+               db "             [--absolute | --relative]", 10
                db "             [--config PATH | --no-config]", 10, 10
                db "Search a directory tree for entries whose name contains", 10
                db "PATTERN, a literal substring (no regex or glob). By default, matching", 10
@@ -590,7 +604,9 @@ section .rodata
                db "missing or non-directory one is searched as a pattern. --path DIR", 10
                db "selects the starting directory explicitly and accepts a literal PATTERN", 10
                db "of any spelling. Output paths keep the spelling given for PATH;", 10
-               db "redundant trailing slashes are removed. The starting directory itself", 10
+               db "redundant trailing slashes are removed. --absolute prefixes that", 10
+               db "display root with getcwd(2), keeping the spelling after it; an", 10
+               db "absolute PATH already prints absolute paths. The starting directory itself", 10
                db "is never printed, and --type, --no-hidden and --exclude-name apply to", 10
                db "descendants only. An explicitly selected symlink is followed; output", 10
                db "keeps its spelling.", 10, 10
@@ -620,6 +636,11 @@ section .rodata
                db "  --no-gitignore      do not apply .gitignore rules (the default)", 10
                db "  --hidden            search hidden entries (the default)", 10
                db "  --no-hidden         skip entries whose name starts with .", 10
+               db "  --absolute          prefix results with the current directory, as", 10
+               db "                      getcwd(2) reports it; the PATH spelling follows", 10
+               db "                      unchanged; an absolute PATH prints absolute paths", 10
+               db "  --relative          keep paths relative to PATH (the default);", 10
+               db "                      combining the two flags is an error", 10
                db "  --exclude-name NAME repeatable; skip entries whose basename is exactly NAME", 10
                db "                      case-sensitive; no glob or '/'", 10
                db "                      also --exclude-name=NAME; matching dirs are pruned", 10
@@ -694,8 +715,12 @@ section .bss
     real_buf:    resb PATH_MAX + 2    ; resolved starting path (root worker only)
     repo_buf:    resb PATH_MAX + 2    ; repository root / ancestor paths
     probe_buf:   resb PATH_MAX + 16   ; marker and /proc/self/fd scratch
+    abs_buf:     resb PATH_MAX + 2    ; --absolute display root: cwd + spelling
+                                      ;   (its own buffer: root_grp points into it
+                                      ;   for the whole run)
     res_ig:     resq 1                ; 0 = default, 1 = --gitignore, 2 = --no-gitignore
     hid_mode:   resb 1                ; 0 = default, 1 = --hidden, 2 = --no-hidden
+    abs_mode:   resb 1                ; 0 = default, 1 = --absolute, 2 = --relative
     case_mode:  resb 1                ; --case: 0 = smart (default), 1 = sensitive, 2 = insensitive
     color_mode: resb 1                ; 0 = not set, 1 = auto, 2 = always, 3 = never
     cfg_color:  resb 1                ; the config file's color mode, parked while
@@ -712,6 +737,7 @@ section .bss
     cfg_mode:   resb 1                ; 0 = default location, 1 = --config, 2 = --no-config
     cfg_hid:    resb 1                ; the config file's modes, parked while the
                                       ;   command line is parsed (0 = not set)
+    cfg_abs:    resb 1                ; the config file's --absolute/--relative mode
     alignb 8
     cfg_ig:     resq 1
     cfg_type:   resq 1                ; the config file's --type bits (first qword of res_type)
@@ -802,6 +828,9 @@ _start:
     mov al, [hid_mode]
     mov [cfg_hid], al
     mov byte [hid_mode], 0
+    mov al, [abs_mode]
+    mov [cfg_abs], al
+    mov byte [abs_mode], 0
     mov rax, [res_ig]
     mov [cfg_ig], rax
     mov qword [res_ig], 0
@@ -818,9 +847,14 @@ _start:
     mov r13, rax                     ; PATTERN or 0
 .merge_hid:
     cmp byte [hid_mode], 0
-    jne .merge_ig
+    jne .merge_abs
     mov al, [cfg_hid]
     mov [hid_mode], al
+.merge_abs:
+    cmp byte [abs_mode], 0
+    jne .merge_ig
+    mov al, [cfg_abs]
+    mov [abs_mode], al
 .merge_ig:
     cmp qword [res_ig], 0
     jne .merge_type
@@ -849,6 +883,7 @@ _start:
     mov [color_mode], al
 .have_args:
     call select_root                 ; validate/open the starting directory
+    call abs_root_setup              ; --absolute: prefix the display root
     mov r13, [parsed_pat]
     call resolve_color               ; once, before any result
     test r13, r13
@@ -1257,6 +1292,14 @@ parse_args:
     call streq
     je .opt_nohid
     mov rdi, [rbp+r12*8]
+    lea rsi, [abs_long]
+    call streq
+    je .opt_abs
+    mov rdi, [rbp+r12*8]
+    lea rsi, [rel_long]
+    call streq
+    je .opt_rel
+    mov rdi, [rbp+r12*8]
     lea rsi, [cfg_long]
     call streq
     je .opt_cfg_next
@@ -1435,6 +1478,20 @@ parse_args:
     cmp byte [hid_mode], 1
     je bad_hid_comb
     mov byte [hid_mode], 2
+    inc r12
+    jmp .args_loop
+
+.opt_abs:
+    cmp byte [abs_mode], 2
+    je bad_abs_comb
+    mov byte [abs_mode], 1
+    inc r12
+    jmp .args_loop
+
+.opt_rel:
+    cmp byte [abs_mode], 1
+    je bad_abs_comb
+    mov byte [abs_mode], 2
     inc r12
     jmp .args_loop
 
@@ -1717,6 +1774,104 @@ select_root:
     pop rbx
     ret
 select_root.end_func:
+
+; abs_root_setup: --absolute repoints the display root at getcwd(2) plus the
+; selected spelling, so printed paths are absolute while the walk still uses
+; the spelling. The prefix is never resolved: ".." and a symlinked PATH keep
+; their spelling, and the cwd is the physical one, as pwd -P reports it. An
+; absolute spelling already prints absolute paths, so it is left alone.
+    global abs_root_setup:function (abs_root_setup.end_func - abs_root_setup)
+abs_root_setup:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    cmp byte [abs_mode], 1
+    jne .ret
+    mov r12, [sel_path_ptr]
+    mov r13, [sel_path_len]
+    test r13, r13
+    jz .cwd
+    cmp byte [r12], '/'
+    je .ret
+.cwd:
+    lea rdi, [abs_buf]
+    mov esi, PATH_MAX
+    mov eax, SYS_getcwd
+    syscall
+    test rax, rax
+    js .cwd_fail
+    dec rax                          ; the raw syscall counts the trailing NUL
+    jz .cwd_empty
+    mov rbx, rax                     ; prefix length: "/" alone stays one byte
+    cmp r13, 2
+    jb .dot
+    cmp byte [r12], '.'
+    jne .join
+    cmp byte [r12+1], '/'
+    jne .join
+    add r12, 2                       ; "./x" names x
+    sub r13, 2
+    jmp .join
+.dot:
+    cmp r13, 1
+    jne .join
+    cmp byte [r12], '.'
+    jne .join
+    xor r13d, r13d                   ; "." is the root itself
+.join:                               ; rbp = combined length
+    lea rbp, [rbx+r13]
+    xor edx, edx                     ; separator length
+    test r13, r13
+    jz .copy
+    cmp byte [abs_buf+rbx-1], '/'
+    je .copy
+    mov edx, 1
+    inc rbp
+.copy:
+    lea rdi, [abs_buf+rbx]
+    mov rcx, PATH_MAX + 1
+    sub rcx, rbx
+    sub rcx, rdx
+    mov r8, r13
+    cmp r8, rcx
+    jbe .room
+    mov r8, rcx                      ; too long: the diagnostic names what fits
+.room:
+    test edx, edx
+    jz .spelling
+    mov byte [rdi], '/'
+    inc rdi
+.spelling:
+    mov rcx, r8
+    mov rsi, r12
+    rep movsb
+    mov byte [rdi], 0
+    cmp rbp, PATH_MAX
+    jae .too_long
+    lea rax, [abs_buf]
+    mov [sel_path_ptr], rax
+    mov [sel_path_len], rbp
+    jmp .ret
+.too_long:
+    lea rdi, [abs_buf]
+    mov esi, 2                       ; "is too long"
+    call die_start_path
+.cwd_empty:                          ; impossible: getcwd writes at least '/' and NUL
+    mov eax, -5                      ; EIO
+.cwd_fail:
+    lea rdi, [dot]
+    mov esi, 4                       ; "cannot read"
+    mov edx, eax
+    neg edx                          ; getcwd returns a negative errno
+    call die_start_path
+.ret:
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+abs_root_setup.end_func:
 
 ; find_config: pre-scan argv for --config PATH / --config=PATH / --no-config
 ; and record the choice in cfg_mode / cfg_path. Like the main loop it stops at
@@ -5157,6 +5312,11 @@ bad_hid_comb:
 bad_ig_comb:
     lea rsi, [e_ig]
     mov rdx, e_ig_e - e_ig
+    jmp die
+
+bad_abs_comb:
+    lea rsi, [e_abs]
+    mov rdx, e_abs_e - e_abs
     jmp die
 
 bad_cfg_missing:
