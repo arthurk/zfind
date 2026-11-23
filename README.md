@@ -81,6 +81,7 @@ The positional arguments are interpreted as follows:
 | `zfind ./src` | Search from `./src`; the starting directory is not printed. |
 | `zfind ./src test` | Search from `./src` for names containing `test`. |
 | `zfind --path src` | Explicitly search from the bare directory `src`. |
+| `zfind --absolute ./src` | Search from `./src` and print absolute paths. |
 | `zfind -- ./src` | Search for the literal pattern `./src`, without path detection. |
 
 When there is one positional argument, a token containing `/`, or exactly `.` or `..`, is tested as a starting directory. If it opens as a directory, it becomes `PATH`. If it fails with `ENOENT` or `ENOTDIR`, it is treated as `PATTERN`; other errors are reported. Use `--` to force a path-like token to be a pattern.
@@ -181,6 +182,7 @@ All options must appear before the positional arguments, except `--help`, which 
 | `--hidden` / `--no-hidden` | — | Hidden entries included | Include hidden entries or prune them from traversal. The flags conflict if both are given in the same source. |
 | `--gitignore` / `--no-gitignore` | — | Off | Enable or disable `.gitignore` processing. The flags conflict if both are given in the same source. |
 | `--path` | `DIR` | Current directory | Set the starting directory. Accepts `--path DIR` or `--path=DIR`; may be used only once. The value must be non-empty and name an accessible directory. |
+| `--absolute` / `--relative` | — | Relative | Prefix output paths with the current directory, as `getcwd(2)` reports it, keeping the PATH spelling unchanged; `..` and symlinks are never resolved. An absolute PATH already prints absolute paths. `--relative` selects the default. The flags conflict if both are given in the same source. |
 | `--type` | `f`, `file`, `d`, `dir`, `directory`, `l`, `symlink`, `broken` | All entry types | Include regular files, real directories, symlinks, or broken symlinks. Repeatable; accepts `--type=VALUE`. See [Symlinks and type filters](#symlinks-and-type-filters). |
 | `--exclude-type` | `f`, `file`, `d`, `dir`, `directory`, `l`, `symlink`, `broken` | None | Exclude selected types from output. Repeatable and additive across the config file and command line. Accepts `--exclude-type=VALUE`. |
 | `--exclude-name` | `NAME` | None | Prune entries with this exact basename. Repeatable; up to 64 unique values across the config file and command line. |
@@ -313,6 +315,8 @@ Results are descendants of the selected starting directory; the starting directo
 
 Directory results end with `/`. Symlinks never end with `/`, even when they point to directories.
 
+`--absolute` prefixes the printed root with the current working directory as `getcwd(2)` reports it, which is the physical path (`pwd -P`). The selected root spelling follows unchanged after that prefix: with `.` only the prefix is printed, `./src` adds `/src`, `..` stays literal (`/home/u/proj/../main.c`), and a symlinked root keeps its name. An absolute PATH already prints absolute paths, so `--absolute` changes nothing there. `--relative` is the default and keeps output relative to the selected root; the two flags conflict within one source, and the command line overrides the configuration file.
+
 ### Separators
 
 Every result, including the last, is followed by the selected separator. If there are no results, `zfind` writes zero bytes.
@@ -413,7 +417,7 @@ Options are evaluated in this order: **built-in defaults → configuration file 
 
 | Option group | Merge behavior | Rule |
 | :--- | :--- | :--- |
-| Hidden and Gitignore modes | CLI overrides config | Conflicting flags in the same source are errors. A CLI mode replaces the configured mode. |
+| Hidden, Gitignore and path-spelling modes | CLI overrides config | Conflicting flags in the same source are errors. A CLI mode replaces the configured mode. |
 | Scalar options: `--case`, `--separator`, `--limit`, `--color` | Last value wins | A command-line value replaces the configured value. Use `--case=smart` or `--limit=none` to undo a configured setting. `--limit=0` still means no results. |
 | `--type` | CLI set replaces config set | If the CLI specifies any `--type`, all configured `--type` values are ignored for that run. Repeated values within one source accumulate. |
 | `--exclude-name` and `--exclude-type` | Cumulative set union | Config and CLI values are combined; duplicates are removed. The combined set can contain at most 64 unique `--exclude-name` values. A canonical type category present in both the merged `--type` and `--exclude-type` sets is an error. |
