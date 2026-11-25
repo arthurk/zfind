@@ -5,7 +5,7 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ;         [--help] [--separator STR] [--case smart|sensitive|insensitive]
 ;         [--gitignore | --no-gitignore] [--hidden | --no-hidden]
 ;         [--exclude-name NAME] [--exclude-type TYPE] [--limit N|none]
-;         [--type TYPE] [--color auto|always|never]
+;         [--type TYPE] [--color auto|always|never] [--quote auto|always|never]
 ;         [--absolute | --relative]
 ;         [--config PATH | --no-config] [--path DIR] [--]
 ; PATH is an optional starting directory and must come before PATTERN. Without
@@ -92,6 +92,20 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; TERM set and not "dumb"; the mode is resolved once before the walk. The
 ; config file may say auto or never, never always: a silent global default
 ; must not put escapes into every pipe.
+; --quote auto|always|never shell-quotes each result so that a pasted path is
+; one argument: auto (the default) quotes when stdout is a terminal, always
+; quotes unconditionally, never prints literally. The last --quote wins.
+; Only the TCGETS test on stdout decides auto; NO_COLOR, TERM=dumb and an
+; unset TERM are about color and change nothing here, so a pipe sees the
+; bytes it saw before. A path is wrapped only when it holds a byte outside
+; the bare set A-Z a-z 0-9 . _ + / , : @ % - and every byte >= 0x80, or when
+; its first byte is '-': quoting does not stop option parsing, the spelling
+; is not rewritten to ./, and -- is the answer. With none of " $ ` ! \ in the
+; path it is wrapped in " and nothing inside is escaped; otherwise it is
+; wrapped in ' and each ' is written as '\''. The wrapper and a directory's
+; trailing '/' are inside the quotes; the separator never is. With --color
+; the quotes sit outside the styled runs and a ' inside a highlighted match
+; expands inside its span. --limit frames measure the quoted length.
 ; shortcut: no regex/glob, and none of the ignore sources beyond .gitignore
 ;   in the walked tree and, for a selected path, its ancestors up to the
 ;   nearest repository (no global gitignore, no .ignore, no [] or \ in
@@ -203,11 +217,12 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define STACK_SZ    (1 << 20)        ; one worker stack
 %define MAX_THREADS 16
 %ifndef BLK_SZ
-%define BLK_SZ      49152            ; one output block, header included; a
-                                     ;   colored result can be ~45 KiB
+%define BLK_SZ      65536            ; one output block, header included; a
+                                     ;   quoted and colored result can be
+                                     ;   ~56 KiB
 %endif
 %ifndef BLK_LIMIT
-%define BLK_LIMIT   4608             ; blocks in flight before producers wait
+%define BLK_LIMIT   3456             ; blocks in flight before producers wait
                                      ;   (~216 MiB, the old memory budget)
 %endif
 %define BLK_HDR     32
@@ -215,13 +230,16 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 %define SORT_RUN    16               ; insertion-sort runs this long, merge above
 %define BLK_DATA    (BLK_SZ - BLK_HDR)
 ; Worst case: every path byte is its own match run (ESC[1;7m + byte +
-; ESC[0m = 11 bytes), plus a trailing '/' and the separator. The u16 frame
-; header used by --limit is the +2. A frame never spans blocks.
-%if 11 * (PATH_MAX + 1) + SEP_MAX + 2 > BLK_DATA
-    %error "a colored result frame must fit in one block"
+; ESC[0m = 11 bytes) and, when the byte is an apostrophe in the single-quote
+; branch, four bytes instead of one inside that run: 14. The 2 is the pair of
+; quote bytes that wrap the path, the trailing '/' is covered by the per-byte
+; factor, and the u16 frame header used by --limit is the last +2. A frame
+; never spans blocks.
+%if 14 * (PATH_MAX + 1) + 2 + SEP_MAX + 2 > BLK_DATA
+    %error "a quoted result frame must fit in one block"
 %endif
-%if 11 * (PATH_MAX + 1) + SEP_MAX + 2 > 0xffff
-    %error "a colored result frame must fit the u16 --limit header"
+%if 14 * (PATH_MAX + 1) + 2 + SEP_MAX + 2 > 0xffff
+    %error "a quoted result frame must fit the u16 --limit header"
 %endif
 %define BLK_NEXT    0                ; next block of the record / free-list link
 %define BLK_USED    8                ; bytes of data written so far
@@ -518,6 +536,10 @@ section .rodata
     e_color_e:
     e_color_cfg db "zfind: --color always is not allowed in the config file (use auto or never)", 10
     e_color_cfg_e:
+    e_quote     db "zfind: expected auto, always or never after --quote", 10
+    e_quote_e:
+    e_quote_cfg db "zfind: --quote always is not allowed in the config file (use auto or never)", 10
+    e_quote_cfg_e:
     e_pfx       db "zfind: "          ; 7 bytes: every message starts with it
     h_long      db "--help", 0
     case_long   db "--case", 0
@@ -548,6 +570,8 @@ section .rodata
     nocfg_long  db "--no-config", 0
     color_long  db "--color", 0
     color_eq    db "--color=", 0     ; 8 bytes of prefix
+    quote_long  db "--quote", 0
+    quote_eq    db "--quote=", 0     ; 8 bytes of prefix
     val_auto    db "auto", 0
     val_always  db "always", 0
     val_never   db "never", 0
@@ -566,6 +590,7 @@ section .rodata
     seq_match   db 27, '[', '1', ';', '7', 'm' ; 6 bytes
     seq_reset   db 27, '[', '0', 'm'        ; 4 bytes
     slash       db '/'
+    q_apos_tail db 92, 39, 39           ; \'' : the rest of '\'' after its '
     dd_long     db "--", 0
     env_xdg     db "XDG_CONFIG_HOME=", 0   ; 16 bytes of prefix
     env_home    db "HOME=", 0              ; 5 bytes of prefix
@@ -578,7 +603,7 @@ section .rodata
                db "             [--gitignore | --no-gitignore] [--hidden | --no-hidden]", 10
                db "             [--exclude-name NAME]... [--exclude-type TYPE]", 10
                db "             [--limit N|none] [--type TYPE]", 10
-               db "             [--color auto|always|never]", 10
+               db "             [--color auto|always|never] [--quote auto|always|never]", 10
                db "             [--absolute | --relative]", 10
                db "             [--config PATH | --no-config]", 10, 10
                db "Search a directory tree for entries whose name contains", 10
@@ -590,11 +615,11 @@ section .rodata
                db "Without a pattern every", 10
                db "entry is listed unless --type restricts the result types.", 10, 10
                db "Options must appear before PATH and PATTERN. --limit, --type, --case,", 10
-               db "--separator, --exclude-name, --exclude-type, --color, --config and", 10
-               db "--path consume the next token greedily as their value. -- ends options;", 10
-               db "any following argument is treated as PATTERN. --help prints this help", 10
-               db "and exits 0 anywhere before --, including after PATTERN or where an", 10
-               db "option value is expected.", 10, 10
+               db "--separator, --exclude-name, --exclude-type, --color, --quote,", 10
+               db "--config and --path consume the next token greedily as their value.", 10
+               db "-- ends options; any following argument is treated as PATTERN. --help", 10
+               db "prints this help and exits 0 anywhere before --, including after", 10
+               db "PATTERN or where an option value is expected.", 10, 10
                db "PATH must come before PATTERN. When both are given, the first token is", 10
                db "always the starting directory and the second is the pattern; more than", 10
                db "two positional arguments are an error. The directory must exist, or", 10
@@ -658,6 +683,13 @@ section .rodata
                db "                      also --color=WHEN; auto colors a terminal unless", 10
                db "                      NO_COLOR or TERM=dumb; an unset TERM is plain", 10
                db "                      the config file allows auto and never", 10
+               db "  --quote WHEN        shell-quote results: auto, always or never", 10
+               db "                      (default: auto); also --quote=WHEN; auto quotes", 10
+               db "                      only a terminal, and only that test decides:", 10
+               db "                      NO_COLOR and TERM do not; quotes wrap the whole", 10
+               db "                      path, the separator stays bare, and a ' becomes", 10
+               db "                      '\'' in the ' branch; the config file allows", 10
+               db "                      auto and never", 10
                db "  --path DIR          search from DIR instead of the current directory", 10
                db "                      (also --path=DIR); DIR must exist and be a", 10
                db "                      directory; command-line only", 10
@@ -685,6 +717,27 @@ section .rodata
 %rep 17
         dd (1 << i) - 1
 %assign i i+1
+%endrep
+
+; q_class: one byte per input byte, for the --quote bare-set test. Bit 0 set
+; means the byte needs no quoting; bit 1 means it also cannot appear inside
+; double quotes. Bytes >= 0x80 are bare: no shell metacharacter lives there.
+%define QC_BARE     1
+%define QC_SINGLE   2
+    align 16
+    q_class:
+%assign qci 0
+%rep 256
+    %if qci >= 0x80 || (qci >= '0' && qci <= '9') || (qci >= 'A' && qci <= 'Z') || (qci >= 'a' && qci <= 'z')
+        db QC_BARE
+    %elif qci = '.' || qci = '_' || qci = '+' || qci = '/' || qci = ',' || qci = ':' || qci = '@' || qci = '%' || qci = '-'
+        db QC_BARE
+    %elif qci = '"' || qci = '$' || qci = '`' || qci = '!' || qci = '\'
+        db QC_SINGLE
+    %else
+        db 0
+    %endif
+%assign qci qci+1
 %endrep
 
 section .bss
@@ -726,6 +779,10 @@ section .bss
     cfg_color:  resb 1                ; the config file's color mode, parked while
                                       ;   the command line is parsed (0 = not set)
     color_on:   resb 1                ; resolved once at startup: 1 = emit ANSI
+    quote_mode: resb 1                ; --quote: 0 = not set, 1 = auto, 2 = always, 3 = never
+    cfg_quote:  resb 1                ; the config file's quote mode, parked like
+                                      ;   cfg_color while the command line is parsed
+    quote_on:   resb 1                ; resolved once at startup: 1 = quote results
     res_type:   resb 32                ; --type bitset: bit index is the canonical
                                        ;   category's d_type value, plus TYPE_B;
                                        ;   so TYPE_D/F/L/B are the masks
@@ -769,7 +826,7 @@ section .bss
     blk_out:    resq 1                ; blocks handed out and not yet written
     emit_cur:   resq 1                ; record the writer is on (never throttled)
     out_len:    resq 1
-    statbuf0:   resb 144              ; _start's .git check and the color tty probe, before any thread
+    statbuf0:   resb 144              ; pre-thread: .git check, color/quote tty probes
     cfg_pathbuf: resb PATH_MAX        ; default config location
     cfg_buf:    resb CFG_MAX + 2      ; whole config file; excl_names points into it
     err_buf:    resb PATH_MAX + 512   ; "zfind: PATH:LINE: message"
@@ -841,6 +898,9 @@ _start:
     mov al, [color_mode]
     mov [cfg_color], al
     mov byte [color_mode], 0
+    mov al, [quote_mode]
+    mov [cfg_quote], al
+    mov byte [quote_mode], 0
     mov rdi, rbp
     mov rsi, rbx
     call parse_args
@@ -878,14 +938,20 @@ _start:
     mov [type_filter], al
 .merge_color:
     cmp byte [color_mode], 0
-    jne .have_args
+    jne .merge_quote
     mov al, [cfg_color]
     mov [color_mode], al
+.merge_quote:
+    cmp byte [quote_mode], 0
+    jne .have_args
+    mov al, [cfg_quote]
+    mov [quote_mode], al
 .have_args:
     call select_root                 ; validate/open the starting directory
     call abs_root_setup              ; --absolute: prefix the display root
     mov r13, [parsed_pat]
     call resolve_color               ; once, before any result
+    call resolve_quote               ; once, before any result
     test r13, r13
     jz .no_pat
     mov [pat_ptr], r13
@@ -1247,6 +1313,14 @@ parse_args:
     call startswith
     je .opt_color_eq
     mov rdi, [rbp+r12*8]
+    lea rsi, [quote_long]
+    call streq
+    je .opt_quote_next
+    mov rdi, [rbp+r12*8]
+    lea rsi, [quote_eq]
+    call startswith
+    je .opt_quote_eq
+    mov rdi, [rbp+r12*8]
     lea rsi, [l_eq]
     call startswith
     je .opt_limit_eq
@@ -1450,6 +1524,42 @@ parse_args:
     mov al, 3
 .color_set:
     mov [color_mode], al
+    inc r12
+    jmp .args_loop
+
+.opt_quote_next:
+    inc r12
+    cmp r12, rbx
+    jae bad_quote
+    mov rdi, [rbp+r12*8]
+    jmp .opt_quote_value
+.opt_quote_eq:
+    mov rdi, [rbp+r12*8]
+    add rdi, 8                         ; len("--quote=")
+.opt_quote_value:                      ; rdi = the value: auto, always or never
+    lea rsi, [val_auto]
+    call streq
+    je .quote_auto
+    lea rsi, [val_always]
+    call streq
+    je .quote_always
+    lea rsi, [val_never]
+    call streq
+    je .quote_never
+    jmp bad_quote
+.quote_auto:
+    mov al, 1
+    jmp .quote_set
+.quote_always:
+    ; A config file must not quote every pipe.
+    cmp qword [err_path], 0
+    jne bad_quote_cfg
+    mov al, 2
+    jmp .quote_set
+.quote_never:
+    mov al, 3
+.quote_set:
+    mov [quote_mode], al
     inc r12
     jmp .args_loop
 
@@ -1934,6 +2044,10 @@ find_config:
     call streq
     je .skip
     mov rdi, [rbp+r12*8]
+    lea rsi, [quote_long]
+    call streq
+    je .skip
+    mov rdi, [rbp+r12*8]
     lea rsi, [path_long]
     call streq
     je .skip
@@ -2149,11 +2263,12 @@ load_config.end_func:
 ; ignored; the value may be wrapped in matching quotes, which are removed).
 ; It is run through parse_args as a one-entry argv, or a two-entry one when the
 ; option takes a value (--limit, --type, --case, --separator, --exclude-name,
-; --exclude-type, --color): text after a flag is an error, so a line can never
-; carry a second option. The line is edited in place and the buffer lives for
-; the whole run: excl_names points into it. --help, --config, --no-config,
-; --path and "--" are command-line only, and a positional PATH or PATTERN is
-; rejected: a config line never selects a starting directory or pattern.
+; --exclude-type, --color, --quote): text after a flag is an error, so a
+; line can never carry a second option. The line is edited in place and the
+; buffer lives for the whole run: excl_names points into it. --help, --config,
+; --no-config, --path and "--" are command-line only, and a positional PATH or
+; PATTERN is rejected: a config line never selects a starting directory or
+; pattern.
     global cfg_line:function (cfg_line.end_func - cfg_line)
 cfg_line:
 .lead:                               ; skip leading blanks and \r
@@ -2254,6 +2369,9 @@ cfg_line:
     call streq
     je .split
     lea rsi, [color_long]
+    call streq
+    je .split
+    lea rsi, [quote_long]
     call streq
     je .split
     ; A flag with text after it. Parse the name alone first, so that an unknown
@@ -2631,6 +2749,32 @@ resolve_color:
     pop rbx
     ret
 resolve_color.end_func:
+
+; resolve_quote: turn quote_mode (0/1 auto, 2 always, 3 never) into quote_on.
+; Only the isatty test decides: NO_COLOR and TERM are about color, not quoting,
+; because quoting is not decoration. Runs once, before the walk.
+    global resolve_quote:function (resolve_quote.end_func - resolve_quote)
+resolve_quote:
+    movzx eax, byte [quote_mode]
+    cmp eax, 2
+    je .on                           ; always
+    cmp eax, 3
+    je .off                          ; never
+    ; auto (or unset: the built-in default)
+    mov eax, SYS_ioctl
+    mov edi, 1                       ; stdout
+    mov esi, 0x5401                  ; TCGETS
+    lea rdx, [statbuf0]
+    syscall
+    test rax, rax
+    js .off                          ; not a terminal
+.on:
+    mov byte [quote_on], 1
+    ret
+.off:
+    mov byte [quote_on], 0
+    ret
+resolve_quote.end_func:
 
 ; cpu_count -> rax = walking thread count, 2..MAX_THREADS (the main thread
 ; writes and is not counted). -DFORCE_THREADS=n pins it for stress tests.
@@ -4385,6 +4529,114 @@ sort_table:
 sort_table.end_func:
 
 ; -----------------------------------------------------------------------------
+; Shell quoting
+;
+; --quote wraps a printed path so that a pasted line is one shell argument.
+; Only a path with a byte outside the bare set is wrapped; the separator never
+; is. Bare: A-Z a-z 0-9 . _ + / , : @ % - and every byte >= 0x80, provided the
+; first byte is not '-'. A path with none of " $ ` ! \ is double-quoted
+; verbatim; otherwise it is single-quoted with every ' written as '\''. Both
+; emitters share q_class_path and q_escape, so they cannot disagree.
+; -----------------------------------------------------------------------------
+
+; q_class_path: rsi = path, rcx = length -> eax = 0 when every byte is bare,
+; 1 when the path needs double quotes, 2 when it needs single quotes; rdx = the
+; number of ' bytes (the +3 each in mode 2; 0 in the other modes).
+    global q_class_path:function (q_class_path.end_func - q_class_path)
+q_class_path:
+    xor r8d, r8d                     ; bit 0: needs quotes, bit 1: single
+    xor r9d, r9d                     ; apostrophes
+    test rcx, rcx
+    jz .out
+    lea r11, [q_class]
+    xor edx, edx                     ; index
+    cmp byte [rsi], '-'
+    jne .scan
+    or r8d, 1                        ; a leading '-' is quoted, not rewritten
+.scan:
+    movzx r10d, byte [rsi+rdx]
+    cmp r10b, 39
+    jne .class
+    inc r9
+.class:
+    movzx eax, byte [r11+r10]
+    test eax, QC_BARE
+    jnz .next
+    or r8d, 1
+    test eax, QC_SINGLE
+    jz .next
+    or r8d, 2
+.next:
+    inc rdx
+    cmp rdx, rcx
+    jb .scan
+.out:
+    xor eax, eax
+    test r8d, 1
+    jz .ret
+    mov eax, 1
+    test r8d, 2
+    jz .ret
+    mov eax, 2
+.ret:
+    mov rdx, r9
+    ret
+q_class_path.end_func:
+
+; q_escape: rsi = source, rcx = length, rdi = destination (0 = measure only).
+; Copies the bytes for the single-quote branch: every ' is written as '\''.
+; -> rax = bytes emitted, rdi = the advanced destination.
+    global q_escape:function (q_escape.end_func - q_escape)
+q_escape:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    mov rbx, rdi                     ; destination, 0 while measuring
+    mov r12, rsi                     ; source
+    mov r13, rcx                     ; bytes left
+    xor ebp, ebp                     ; bytes emitted
+.run:
+    test r13, r13
+    jz .done
+    mov rdi, r12
+    mov rcx, r13
+    mov al, 39
+    repne scasb                      ; find the next ' (the run ends on it)
+    mov r8, rdi
+    sub r8, r12
+    add rbp, r8
+    test rbx, rbx
+    jz .advanced
+    mov rdi, rbx
+    mov rsi, r12
+    mov rcx, r8
+    rep movsb
+    mov rbx, rdi
+.advanced:
+    add r12, r8
+    sub r13, r8
+    cmp byte [r12-1], 39             ; no ' at all: the whole rest was copied
+    jne .run
+    add rbp, 3                       ; the copied ' needs the rest of '\''
+    test rbx, rbx
+    jz .run
+    lea rsi, [q_apos_tail]
+    mov ecx, 3
+    rep movsb
+    mov rbx, rdi
+    jmp .run
+.done:
+    mov rax, rbp
+    mov rdi, rbx
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+q_escape.end_func:
+
+; -----------------------------------------------------------------------------
 ; Color rendering
 ;
 ; The search filter is untouched: spans are found only here, at render time,
@@ -4400,6 +4652,8 @@ sort_table.end_func:
 %define RS_BASE   32                ; basename start in path_buf
 %define RS_MSTART 40                ; current match start
 %define RS_MEND   48                ; current match end (exclusive)
+%define RS_ESC    56                ; byte: 1 = ' expands to '\'' while copying
+%define RS_WRAP   57                ; byte: the quote char, 0 = path unquoted
 %define RS_SZ     64
 
 ; match_next: rdi = name, rsi = name length, rdx = start offset ->
@@ -4581,6 +4835,8 @@ match_next.end_func:
 ; changes, the previous styled run is closed with ESC[0m and the new one opens
 ; with its own sequence. With state->dest = 0 it only accumulates the length.
 ; Neighboring regions with the same style merge because no sequence is emitted.
+; With state->esc set, the source bytes are copied through q_escape, so a
+; quoted run expands inside its own span.
     global style_emit:function (style_emit.end_func - style_emit)
 style_emit:
     push rbx
@@ -4626,6 +4882,8 @@ style_emit:
 .copy:
     test r13, r13
     jz .done
+    cmp byte [rbx+RS_ESC], 0
+    jne .copy_escaped
     add [rbx+RS_TOTAL], r13
     mov rdi, [rbx+RS_DEST]
     test rdi, rdi
@@ -4633,6 +4891,14 @@ style_emit:
     mov rsi, r12
     mov rcx, r13
     rep movsb
+    mov [rbx+RS_DEST], rdi
+    jmp .done
+.copy_escaped:                       ; the single-quote branch: escape the run
+    mov rdi, [rbx+RS_DEST]
+    mov rsi, r12
+    mov rcx, r13
+    call q_escape                    ; -> rax = bytes, rdi = new destination
+    add [rbx+RS_TOTAL], rax
     mov [rbx+RS_DEST], rdi
 .done:
     pop r13
@@ -4666,7 +4932,9 @@ style_close.end_func:
 ; -> rax = payload length. Splits path_buf into the directory prefix and the
 ; basename, emits cyan prefix, highlights basename match spans, makes the whole
 ; directory name (trailing '/') cyan, and ends with the separator. Writes the
-; original path bytes; no second copy of the path is built.
+; original path bytes; no second copy of the path is built. With quote_on the
+; whole path, trailing '/' included, is wrapped in " or ' outside the styled
+; runs, and in the ' branch each ' inside a run expands to '\''.
     global render_entry:function (render_entry.end_func - render_entry)
 render_entry:
     push rbx
@@ -4679,9 +4947,33 @@ render_entry:
     mov [r15+RS_DEST], rdx
     mov qword [r15+RS_TOTAL], 0
     mov dword [r15+RS_CUR], -1
+    mov byte [r15+RS_ESC], 0
+    mov byte [r15+RS_WRAP], 0
     mov rbx, rdi                     ; path length
     mov r12, rsi                     ; is dir
 
+    ; quoting wraps the whole path, so decide the branch and open it first
+    cmp byte [quote_on], 0
+    je .scan_base
+    lea rsi, [r14+path_buf]
+    mov rcx, rbx
+    call q_class_path
+    test eax, eax
+    jz .scan_base
+    mov byte [r15+RS_WRAP], '"'
+    cmp eax, 2
+    jne .wrap_open
+    mov byte [r15+RS_WRAP], 39
+.wrap_open:
+    mov rdi, r15
+    lea rsi, [r15+RS_WRAP]
+    mov ecx, 1
+    xor eax, eax
+    call style_emit                  ; the opening quote is never escaped
+    cmp byte [r15+RS_WRAP], 39
+    jne .scan_base
+    mov byte [r15+RS_ESC], 1
+.scan_base:
     ; basename starts after the last '/'
     xor eax, eax
     xor ecx, ecx
@@ -4774,11 +5066,23 @@ render_entry:
 .after_name:
     ; directory results carry the trailing '/' in the cyan run
     test r12, r12
-    jz .separator
+    jz .wrap_close
     lea rsi, [slash]
     mov rdi, r15
     mov ecx, 1
     mov eax, 1
+    call style_emit
+
+.wrap_close:
+    ; the closing quote is outside the styled runs; the separator is never
+    ; quoted, so the escape stops before it
+    cmp byte [r15+RS_WRAP], 0
+    je .separator
+    mov byte [r15+RS_ESC], 0         ; the closing quote is never escaped
+    mov rdi, r15
+    lea rsi, [r15+RS_WRAP]
+    mov ecx, 1
+    xor eax, eax
     call style_emit
 
 .separator:
@@ -4809,7 +5113,8 @@ render_entry.end_func:
 ; "path[/]SEP". Frames are internal to the block; BLK_USED counts framed bytes,
 ; a frame never spans blocks, and it is published only after the whole frame.
 ; With color_on, the payload is rendered by render_entry instead: the plain
-; length is measured first so the block-room decision stays exact.
+; length is measured first so the block-room decision stays exact. With
+; quote_on, the payload is the quoted path, so its length is the quoted one.
     global print_entry:function (print_entry.end_func - print_entry)
 print_entry:
     push rbx
@@ -4820,8 +5125,25 @@ print_entry:
     mov r13, rsi                     ; is_dir
     cmp byte [color_on], 0
     jne .color_len
-    lea r12, [rdi+rsi]               ; payload length: path + '/' + separator
+    cmp byte [quote_on], 0
+    jne .quoted_len
+.plain_len:
+    lea r12, [rbx+r13]               ; payload length: path + '/' + separator
     add r12, [sep_len]
+    jmp .len_ready
+.quoted_len:
+    lea rsi, [r14+path_buf]
+    mov rcx, rbx
+    call q_class_path                ; eax = branch, rdx = apostrophes
+    test eax, eax
+    jz .plain_len                    ; only bare bytes: nothing to wrap
+    lea r12, [rbx+r13]               ; path + '/' + two quote bytes
+    add r12, [sep_len]
+    add r12, 2
+    cmp eax, 2
+    jne .len_ready
+    lea rax, [rdx+rdx*2]             ; each ' is '\'': three extra bytes
+    add r12, rax
     jmp .len_ready
 .color_len:
     mov rdi, rbx
@@ -4872,6 +5194,40 @@ print_entry:
 .payload:
     cmp byte [color_on], 0
     jne .colored
+    cmp byte [quote_on], 0
+    je .plain_copy
+    lea rsi, [r14+path_buf]
+    mov rcx, rbx
+    call q_class_path                ; the same branch the length used
+    test eax, eax
+    jz .plain_copy                   ; only bare bytes: nothing to wrap
+    mov dl, '"'
+    cmp eax, 2
+    jne .q_open
+    mov dl, 39
+.q_open:
+    mov [rdi], dl
+    inc rdi
+    push rdx                         ; the wrapper, kept across the escape
+    lea rsi, [r14+path_buf]
+    mov rcx, rbx
+    cmp eax, 2
+    jne .q_body
+    call q_escape                    ; every ' becomes '\''
+    jmp .q_slash
+.q_body:
+    rep movsb
+.q_slash:
+    pop rdx
+    test r13, r13
+    jz .q_close
+    mov byte [rdi], '/'
+    inc rdi
+.q_close:
+    mov [rdi], dl
+    inc rdi
+    jmp .sep
+.plain_copy:
     lea rsi, [r14+path_buf]
     mov rcx, rbx
     rep movsb
@@ -5292,6 +5648,16 @@ bad_color:
 bad_color_cfg:
     lea rsi, [e_color_cfg]
     mov rdx, e_color_cfg_e - e_color_cfg
+    jmp die
+
+bad_quote:
+    lea rsi, [e_quote]
+    mov rdx, e_quote_e - e_quote
+    jmp die
+
+bad_quote_cfg:
+    lea rsi, [e_quote_cfg]
+    mov rdx, e_quote_cfg_e - e_quote_cfg
     jmp die
 
 bad_flag:

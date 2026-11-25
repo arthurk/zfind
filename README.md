@@ -10,6 +10,7 @@
 - **Literal matching:** Treat the pattern as a byte substring. Globs and regular expressions have no special meaning.
 - **Flexible filtering:** Select entry types, prune exact basenames, skip hidden entries, or apply `.gitignore` rules in Git and Jujutsu repositories.
 - **Script-friendly output:** Use NUL or a custom separator, limit the number of results, and control ANSI colors.
+- **Paste-ready quoting:** Piped output stays byte-identical, while `--quote auto` wraps a path in shell quotes on a terminal so a pasted result is one argument, spaces and apostrophes included.
 - **Persistent defaults:** Load options from an XDG-style configuration file, with command-line overrides.
 
 ## Quick start
@@ -189,6 +190,7 @@ All options must appear before the positional arguments, except `--help`, which 
 | `--separator` | `STR` | `\n` | Terminate each result with the decoded separator, from 1 to 64 bytes. Supports `\n`, `\t`, `\r`, `\0`, and `\\`. |
 | `--limit` | `N` or `none` | `none` | Print at most `N` results. `0` prints no results; `none` means unlimited. `N` may be any whole number up to `18446744073709551615`. |
 | `--color` | `auto`, `always`, `never` | `auto` | Control ANSI styling. `auto` uses terminal and environment checks; `always` forces color; `never` disables it. Accepts `--color=WHEN`. |
+| `--quote` | `auto`, `always`, `never` | `auto` | Shell-quote results so a pasted path is one argument. `auto` quotes only when stdout is a terminal, `always` quotes unconditionally, `never` prints paths as they are. Accepts `--quote=WHEN`. |
 | `--config` | `PATH` | Automatic lookup | Load the configuration file at `PATH`. Relative paths are resolved from the current working directory. The file must exist. |
 | `--no-config` | — | Off | Ignore all configuration files for this run. |
 | `--` | — | — | End option parsing and disable automatic path detection. The remaining argument is treated as the literal pattern. |
@@ -360,6 +362,28 @@ The mode is resolved once at startup. Command-line settings override the configu
 
 The configuration file accepts `--color auto` and `--color never`, but not `--color always`. This prevents a global setting from unexpectedly adding escape sequences to scripts and pipelines. Setting `always` in the configuration file is an error.
 
+### Quoting
+
+`--quote WHEN` shell-quotes each result, so a path with a space, an apostrophe or a parenthesis can be pasted into `cp`, `rm` or `mv` as one argument. Quoting never changes what a pipe sees: with the default `auto`, a pipe receives exactly the bytes it received before this option existed.
+
+A path is wrapped only when it contains a byte outside the bare set:
+
+- `A-Z`, `a-z`, `0-9`, `.`, `_`, `+`, `/`, `,`, `:`, `@`, `%`, `-`
+- every byte `>= 0x80`, so `Café/` prints unquoted
+
+A path whose first byte is `-` is quoted too, but its spelling is left alone: quoting does not stop option parsing, so pass `--` in that case.
+
+| Path contains | Wrapped in | Inside the quotes |
+| :--- | :--- | :--- |
+| none of `"`, `$`, `` ` ``, `!`, `\` | `"` | the original bytes, nothing escaped |
+| any of `"`, `$`, `` ` ``, `!`, `\` | `'` | the original bytes, except that each `'` is written as `'\''` |
+
+The wrapper goes around the whole printed path, including a directory's trailing `/`, and only when the path needs it: `notes.txt` and `reports/2026-01-15/` stay bare, while `"quarterly report (Q1)/"` is quoted. The separator is never quoted. Bytes such as a newline or a tab are quoted and left literal inside the quotes; `$'...'` quoting is not implemented.
+
+`auto` (the default) quotes only when stdout is a terminal. Only that test decides: quoting is not decoration, so `NO_COLOR`, `TERM=dumb` and an unset `TERM` change nothing. `always` quotes even when output is piped, and `never` prints paths as they are. The mode is resolved once at startup, the last `--quote` wins, and the command line overrides the configuration file.
+
+Quoting combines with `--color`: the quotes sit outside the styled spans, and a `'` inside a highlighted match expands inside that span, so the highlighted run displays `'\''` — four extra glyphs that still paste correctly. `--limit` measures the quoted length, and its output stays a byte-for-byte prefix of an unlimited run. `--absolute` quotes the absolute path, and `--separator='\0'` with `--quote=always` is allowed: the path is quoted, then NUL, which is pointless for `xargs` but harmless.
+
 ## Configuration
 
 `zfind` can read default options from one configuration file. Built-in defaults are applied first, then the configuration file, then command-line options.
@@ -410,6 +434,7 @@ Rules:
 - Shell variables, tilde expansion, globs, and command substitutions are not expanded. Backslashes are passed to the option handler, so `--separator='\t'` is decoded by the separator option.
 - Short options, positional paths or patterns, `--`, `--path`, `--help`, `--config`, and `--no-config` are not allowed in the configuration file.
 - `--color always` is not allowed in the configuration file. Use `auto` or `never` instead.
+- `--quote always` is not allowed in the configuration file, for the same reason: use `auto` or `never` instead.
 
 ### Precedence and merging
 
@@ -418,7 +443,7 @@ Options are evaluated in this order: **built-in defaults → configuration file 
 | Option group | Merge behavior | Rule |
 | :--- | :--- | :--- |
 | Hidden, Gitignore and path-spelling modes | CLI overrides config | Conflicting flags in the same source are errors. A CLI mode replaces the configured mode. |
-| Scalar options: `--case`, `--separator`, `--limit`, `--color` | Last value wins | A command-line value replaces the configured value. Use `--case=smart` or `--limit=none` to undo a configured setting. `--limit=0` still means no results. |
+| Scalar options: `--case`, `--separator`, `--limit`, `--color`, `--quote` | Last value wins | A command-line value replaces the configured value. Use `--case=smart` or `--limit=none` to undo a configured setting. `--limit=0` still means no results. |
 | `--type` | CLI set replaces config set | If the CLI specifies any `--type`, all configured `--type` values are ignored for that run. Repeated values within one source accumulate. |
 | `--exclude-name` and `--exclude-type` | Cumulative set union | Config and CLI values are combined; duplicates are removed. The combined set can contain at most 64 unique `--exclude-name` values. A canonical type category present in both the merged `--type` and `--exclude-type` sets is an error. |
 
