@@ -16,7 +16,8 @@ from helpers import ZfindRunner, entries, run_in
 CURRENT_HELP_OPTIONS = [
     b"--separator", b"--case", b"--gitignore", b"--no-gitignore", b"--hidden",
     b"--no-hidden", b"--exclude-name", b"--limit", b"--type", b"--color",
-    b"--quote", b"--config", b"--no-config", b"--path", b"--help",
+    b"--quote", b"--config", b"--no-config", b"--path", b"--show-config",
+    b"--help",
 ]
 
 
