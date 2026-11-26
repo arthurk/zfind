@@ -2831,6 +2831,9 @@ show_type_opt:
 show_type_opt.end_func:
 
 ; show_config: format resolved configuration and exit 0
+; shortcut: a value holding both ' and " cannot be written in the config file's
+;   quote syntax at all, so it is emitted single-quoted and does not re-read;
+;   upgrade if the config format ever gains escapes for the enclosing quote
     global show_config:function (show_config.end_func - show_config)
 show_config:
     push rbx
@@ -2937,10 +2940,15 @@ show_config:
     je .sep_needs_quote
     cmp al, 32
     je .sep_needs_quote
+    cmp al, 34
+    je .sep_has_dq
     cmp al, "'"
     je .sep_has_sq
     inc r13
     jmp .sep_check
+.sep_has_dq:
+    mov r15d, 1                      ; a " in the value rules out a " wrapper
+    jmp .sep_needs_quote
 .sep_has_sq:
     mov r14d, 1
 .sep_needs_quote:
@@ -2950,10 +2958,14 @@ show_config:
 .sep_check_done:
     test ebx, ebx
     jz .sep_no_quote
-    mov r15b, "'"
     test r14d, r14d
-    jz .sep_quote_char_ready
+    jz .sep_wrap_sq
+    test r15d, r15d                  ; holds both quotes: no wrapper can hold it
+    jnz .sep_wrap_sq
     mov r15b, '"'
+    jmp .sep_quote_char_ready
+.sep_wrap_sq:
+    mov r15b, "'"
 .sep_quote_char_ready:
     mov al, r15b
     call show_byte
@@ -3121,6 +3133,14 @@ show_config:
     mov rsi, [excl_names + r13*8]
     mov rdi, rsi
     xor ebx, ebx
+    xor r15d, r15d
+    mov al, [rdi]
+    cmp al, '"'
+    je .xname_lead_quote
+    cmp al, "'"
+    jne .xname_scan_ws
+.xname_lead_quote:
+    mov ebx, 1                       ; a value must not open with a bare quote
 .xname_scan_ws:
     mov al, [rdi]
     test al, al
@@ -3129,21 +3149,34 @@ show_config:
     je .xname_has_ws
     cmp al, 9
     je .xname_has_ws
+    cmp al, '"'
+    je .xname_has_dq
+    inc rdi
+    jmp .xname_scan_ws
+.xname_has_dq:
+    mov r15d, 1                      ; a " in the value rules out a " wrapper
     inc rdi
     jmp .xname_scan_ws
 .xname_has_ws:
     mov ebx, 1
+    inc rdi
+    jmp .xname_scan_ws
 .xname_scan_ws_done:
     test ebx, ebx
     jz .xname_no_ws
+    mov r14b, '"'
+    test r15d, r15d                  ; holds both quotes: no wrapper can hold it
+    jz .xname_wrap_ready
+    mov r14b, "'"
+.xname_wrap_ready:
     push rsi
     lea rsi, [sc_xname_pfx]
     call show_cstr
-    mov al, '"'
+    mov al, r14b
     call show_byte
     pop rsi
     call show_cstr
-    mov al, '"'
+    mov al, r14b
     call show_byte
     mov al, 10
     call show_byte
