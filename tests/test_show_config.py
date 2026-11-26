@@ -585,6 +585,32 @@ class TestShowConfigEdgeCases:
         assert res.status == 0
         assert b'--exclude-name="build output"' in res.out
 
+    @pytest.mark.parametrize(
+        "value",
+        ['"', '"lead', 'a"b', "a b \"c", "trail \"", "'"],
+    )
+    def test_quote_chars_round_trip(
+        self, binary: Path, tmp_path: Path, value: str
+    ):
+        """A value holding a quote character must survive a re-read (gate 12)."""
+        home = tmp_path / "home"
+        home.mkdir()
+        env = {"HOME": str(home)}
+
+        for kind in ("--separator", "--exclude-name"):
+            res1 = run_zfind(
+                binary, "--show-config", f"{kind}={value}", cwd=tmp_path, env=env
+            )
+            assert res1.status == 0, f"{kind}={value!r}: {res1}"
+
+            dump = tmp_path / "dump.conf"
+            dump.write_bytes(res1.out)
+            res2 = run_zfind(
+                binary, "--config", str(dump), "--show-config", cwd=tmp_path, env=env
+            )
+            assert res2.status == 0, f"{kind}={value!r}: {res2}"
+            assert res1.out.split(b"\n", 1)[1] == res2.out.split(b"\n", 1)[1]
+
     def test_show_config_after_double_dash_is_literal_pattern(
         self, binary: Path, tmp_path: Path
     ):
