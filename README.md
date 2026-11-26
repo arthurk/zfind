@@ -193,6 +193,7 @@ All options must appear before the positional arguments, except `--help`, which 
 | `--quote` | `auto`, `always`, `never` | `auto` | Shell-quote results so a pasted path is one argument. `auto` quotes only when stdout is a terminal, `always` quotes unconditionally, `never` prints paths as they are. Accepts `--quote=WHEN`. |
 | `--config` | `PATH` | Automatic lookup | Load the configuration file at `PATH`. Relative paths are resolved from the current working directory. The file must exist. |
 | `--no-config` | — | Off | Ignore all configuration files for this run. |
+| `--show-config` | — | — | Print effective resolved configuration and exit immediately. Command-line only. |
 | `--` | — | — | End option parsing and disable automatic path detection. The remaining argument is treated as the literal pattern. |
 
 ## Search and traversal behavior
@@ -432,7 +433,7 @@ Rules:
 - Lines whose first non-whitespace character is `#` are comments. Inline comments are not supported; `#` elsewhere is part of the value.
 - Values may be enclosed in single or double quotes. Quotes preserve leading and trailing whitespace and are removed when parsing; the enclosing quote character cannot appear inside the value.
 - Shell variables, tilde expansion, globs, and command substitutions are not expanded. Backslashes are passed to the option handler, so `--separator='\t'` is decoded by the separator option.
-- Short options, positional paths or patterns, `--`, `--path`, `--help`, `--config`, and `--no-config` are not allowed in the configuration file.
+- Short options, positional paths or patterns, `--`, `--path`, `--help`, `--config`, `--no-config`, and `--show-config` are not allowed in the configuration file.
 - `--color always` is not allowed in the configuration file. Use `auto` or `never` instead.
 - `--quote always` is not allowed in the configuration file, for the same reason: use `auto` or `never` instead.
 
@@ -450,6 +451,10 @@ Options are evaluated in this order: **built-in defaults → configuration file 
 `--exclude-type` values accumulate across the configuration file and command line. For example, a configured `--exclude-type l` and a command-line `--exclude-type directory` exclude every symlink and every real directory. Values are normalized to their canonical category before merging, so a configured `--type f` and a command-line `--exclude-type file` conflict even though the spellings differ.
 
 Use `--no-config` when a command must ignore all configured defaults, including exclusions.
+
+### Inspecting configuration
+
+Use `zfind --show-config` to print the effective resolved configuration, including the configuration source header, active scalar settings, mode flags, type filters, and exclusions. Output is valid configuration file syntax and can be redirected directly into a configuration file. `--show-config` does not traverse the filesystem.
 
 ## Release workflow
 
