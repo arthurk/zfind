@@ -193,7 +193,7 @@ All options must appear before the positional arguments, except `--help`, which 
 | `--quote` | `auto`, `always`, `never` | `auto` | Shell-quote results so a pasted path is one argument. `auto` quotes only when stdout is a terminal, `always` quotes unconditionally, `never` prints paths as they are. Accepts `--quote=WHEN`. |
 | `--config` | `PATH` | Automatic lookup | Load the configuration file at `PATH`. Relative paths are resolved from the current working directory. The file must exist. |
 | `--no-config` | — | Off | Ignore all configuration files for this run. |
-| `--show-config` | — | — | Print effective resolved configuration and exit immediately. Command-line only. |
+| `--show-config` | — | — | Print the resolved configuration and exit immediately: built-in defaults are commented out, settings you supplied are not. Command-line only. |
 | `--` | — | — | End option parsing and disable automatic path detection. The remaining argument is treated as the literal pattern. |
 
 ## Search and traversal behavior
@@ -454,7 +454,50 @@ Use `--no-config` when a command must ignore all configured defaults, including 
 
 ### Inspecting configuration
 
-Use `zfind --show-config` to print the effective resolved configuration, including the configuration source header, active scalar settings, mode flags, type filters, and exclusions. Output is valid configuration file syntax and can be redirected directly into a configuration file. `--show-config` does not traverse the filesystem.
+Use `zfind --show-config` to print the effective resolved configuration: the configuration source header, then every option, with built-in defaults commented out and settings you supplied uncommented. Output is valid configuration file syntax and can be redirected directly into a configuration file. `--show-config` does not traverse the filesystem.
+
+With no configuration file and no options, every option line is a comment:
+
+```text
+# Configuration source: none (built-in defaults)
+# Commented-out lines are built-in defaults; uncommented lines are set by you
+
+# --case=smart
+# --color=auto
+# --limit=none
+# --quote=auto
+# --separator='\n'
+# --hidden
+# --no-gitignore
+# --relative
+```
+
+Settings from the configuration file or the command line move to an uncommented block below the defaults, in the same fixed order. Each option appears exactly once, even when you wrote a value equal to the built-in default:
+
+```text
+# Configuration source: /home/arthur/.config/zfind/config
+# Commented-out lines are built-in defaults; uncommented lines are set by you
+
+# --case=smart
+# --color=auto
+# --limit=none
+# --quote=auto
+# --separator='\n'
+# --hidden
+# --no-gitignore
+# --relative
+
+--exclude-name=.direnv
+--exclude-name=.git
+--exclude-name=.pytest_cache
+--exclude-name=__pycache__
+```
+
+`--color always` and `--quote always` are command-line only, so a dump taken with either keeps that line commented, with a note:
+
+```text
+# --color=always (command line only, not allowed in a config file)
+```
 
 ## Release workflow
 
