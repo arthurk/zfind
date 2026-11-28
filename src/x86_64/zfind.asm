@@ -80,12 +80,16 @@ default rel                     ; x86-64: address labels RIP-relative, not via i
 ; (parse_args), so each line is checked exactly like its flag. --help,
 ; --show-config, --config, --no-config, --path and "--" are command-line only,
 ; and a positional PATH or PATTERN is rejected in the file. --show-config
-; prints the effective resolved configuration and loaded configuration file
-; path to stdout, then exits 0 without traversing the filesystem. The layers are
-; the built-in defaults, then the file, then the command line: a mode
-; (hidden, gitignore) set on the command line replaces the file's, a scalar
-; (--separator, --limit, --case) is overwritten, a command-line --type replaces
-; the file's whole set, and --exclude-name and --exclude-type accumulate.
+; prints the resolved configuration to stdout, then exits 0 without traversing
+; the filesystem: the source header, then every option, with built-in defaults
+; commented out and settings you supplied uncommented, so the output is valid
+; config syntax and can be redirected into a config file. A value the file
+; rejects (--color always, --quote always) prints as a comment with a note.
+; The layers are the built-in defaults, then the file, then the command line:
+; a mode (hidden, gitignore) set on the command line replaces the file's, a
+; scalar (--separator, --limit, --case) is overwritten, a command-line --type
+; replaces the file's whole set, and --exclude-name and --exclude-type
+; accumulate.
 ; Opposing hidden or gitignore modes within one source are an error. A missing
 ; default file is normal; anything else wrong with the file stops zfind before
 ; the walk, and the error names the file and line.
@@ -575,14 +579,19 @@ section .rodata
     sc_hdr_pfx   db "# Configuration source: ", 0
     sc_hdr_none  db "none (built-in defaults)", 10, 0
     sc_hdr_nocfg db "none (--no-config)", 10, 0
+    sc_hdr_legend db "# Commented-out lines are built-in defaults; uncommented lines are set by you", 10, 10, 0
+    sc_def_pfx   db "# ", 0
     sc_case_smart db "--case=smart", 10, 0
     sc_case_sens db "--case=sensitive", 10, 0
     sc_case_insens db "--case=insensitive", 10, 0
     sc_col_auto  db "--color=auto", 10, 0
-    sc_col_always db "--color=always", 10, 0
+    sc_col_always_note db "# --color=always (command line only, not allowed in a config file)", 10, 0
     sc_col_never db "--color=never", 10, 0
     sc_lim_pfx   db "--limit=", 0
     sc_lim_none  db "--limit=none", 10, 0
+    sc_quote_auto db "--quote=auto", 10, 0
+    sc_quote_always_note db "# --quote=always (command line only, not allowed in a config file)", 10, 0
+    sc_quote_never db "--quote=never", 10, 0
     sc_sep_pfx   db "--separator=", 0
     sc_hid       db "--hidden", 10, 0
     sc_nohid     db "--no-hidden", 10, 0
@@ -722,7 +731,7 @@ section .rodata
                db "  --config PATH       read settings from PATH instead of the default file", 10
                db "                      (also --config=PATH); the file must exist", 10
                db "  --no-config         read no config file", 10
-               db "  --show-config       show effective resolved configuration and exit", 10
+               db "  --show-config       show resolved configuration, defaults commented out", 10
                db "  --                  end options; following arguments are PATTERN", 10
     help_msg_e:
     align 8
@@ -802,6 +811,9 @@ section .bss
     hid_mode:   resb 1                ; 0 = default, 1 = --hidden, 2 = --no-hidden
     abs_mode:   resb 1                ; 0 = default, 1 = --absolute, 2 = --relative
     case_mode:  resb 1                ; --case: 0 = smart (default), 1 = sensitive, 2 = insensitive
+    case_seen:  resb 1                ; --case was written by the file or the command line
+    limit_seen: resb 1                ; --limit was written, even as an explicit "none"
+    sep_seen:   resb 1                ; --separator was written
     color_mode: resb 1                ; 0 = not set, 1 = auto, 2 = always, 3 = never
     cfg_color:  resb 1                ; the config file's color mode, parked while
                                       ;   the command line is parsed (0 = not set)
@@ -823,6 +835,7 @@ section .bss
                                       ;   command line is parsed (0 = not set)
     cfg_abs:    resb 1                ; the config file's --absolute/--relative mode
     flag_show_config: resb 1          ; 1 = --show-config was given
+    sc_pass:    resb 1                ; show_config: 0 = commented defaults, 1 = user settings
     cfg_loaded: resb 1                ; 1 = a config file was successfully loaded
     alignb 8
     cfg_ig:     resq 1
@@ -897,6 +910,9 @@ _start:
     mov qword [root_fd], -1
     mov qword [sep_len], 1
     mov byte [sep_buf], 10
+    mov byte [case_seen], 0
+    mov byte [limit_seen], 0
+    mov byte [sep_seen], 0
 
     ; Settings come from layers, lowest first: the defaults above, the config
     ; file, then the command line. One parser (parse_args) reads both the file
@@ -1490,6 +1506,7 @@ parse_args:
 .case_smart:
     mov byte [case_mode], 0            ; the default, spelled out
 .case_set:
+    mov byte [case_seen], 1
     inc r12
     jmp .args_loop
 
@@ -1666,6 +1683,7 @@ parse_args:
     mov qword [lim_left], -1           ; no limit; also overwrites a configured one
     mov qword [limit_given], 0
 .limit_set:
+    mov byte [limit_seen], 1
     inc r12
     jmp .args_loop
 
@@ -2689,6 +2707,7 @@ parse_sep:
     test rcx, rcx
     jz bad_sep_empty
     mov [sep_len], rcx
+    mov byte [sep_seen], 1
     ret
 parse_sep.end_func:
 
@@ -2843,7 +2862,7 @@ show_config:
     push r15
     sub rsp, 8
 
-    ; 1. Configuration source header
+    ; 1. Configuration source header, then the legend and its blank line
     cmp byte [cfg_mode], 2
     je .hdr_nocfg
     cmp byte [cfg_loaded], 1
@@ -2852,13 +2871,13 @@ show_config:
     call show_cstr
     lea rsi, [sc_hdr_none]
     call show_cstr
-    jmp .show_case
+    jmp .hdr_legend
 .hdr_nocfg:
     lea rsi, [sc_hdr_pfx]
     call show_cstr
     lea rsi, [sc_hdr_nocfg]
     call show_cstr
-    jmp .show_case
+    jmp .hdr_legend
 .hdr_file:
     lea rsi, [sc_hdr_pfx]
     call show_cstr
@@ -2866,9 +2885,45 @@ show_config:
     call show_cstr
     mov al, 10
     call show_byte
+.hdr_legend:
+    lea rsi, [sc_hdr_legend]
+    call show_cstr
+
+    ; 2. Every option the user left at its built-in default, commented out
+    mov byte [sc_pass], 0
+    call sc_emit_options
+
+    ; 3. Every option the user set, uncommented, after one blank line
+    call sc_has_user_lines
+    test eax, eax
+    jz .flush_and_exit
+    mov al, 10
+    call show_byte
+    mov byte [sc_pass], 1
+    call sc_emit_options
+
+.flush_and_exit:
+    call out_flush
+    xor edi, edi
+    mov eax, SYS_exit_group
+    syscall
+show_config.end_func:
+
+; sc_emit_options: one pass over the option list, in the fixed order the dump
+;   documents. sc_pass = 0 emits each option the user left at its default,
+;   behind "# "; sc_pass = 1 emits each option the user set. --type,
+;   --exclude-name and --exclude-type have no default, so pass 1 is their only
+;   pass. Every option therefore appears exactly once, and the output stays
+;   valid config syntax: a commented line is inert.
+    global sc_emit_options:function (sc_emit_options.end_func - sc_emit_options)
+sc_emit_options:
 
 .show_case:
-    ; 2. Scalar: --case
+    ; Scalar: --case
+    lea rdi, [case_seen]
+    call sc_want
+    je .show_color
+    call sc_pfx
     cmp byte [case_mode], 1
     je .case_1
     cmp byte [case_mode], 2
@@ -2885,29 +2940,39 @@ show_config:
     call show_cstr
 
 .show_color:
-    ; 3. Scalar: --color
+    ; Scalar: --color
+    lea rdi, [color_mode]
+    call sc_want
+    je .show_limit
     cmp byte [color_mode], 2
     je .col_2
     cmp byte [color_mode], 3
     je .col_3
+    call sc_pfx
     lea rsi, [sc_col_auto]
     call show_cstr
     jmp .show_limit
 .col_2:
-    lea rsi, [sc_col_always]
+    ; the config file rejects "always": a comment plus a note stays inert
+    lea rsi, [sc_col_always_note]
     call show_cstr
     jmp .show_limit
 .col_3:
+    call sc_pfx
     lea rsi, [sc_col_never]
     call show_cstr
 
 .show_limit:
-    ; 4. Scalar: --limit
+    ; Scalar: --limit
+    lea rdi, [limit_seen]
+    call sc_want
+    je .show_quote
+    call sc_pfx
     cmp qword [limit_given], 0
     jne .lim_num
     lea rsi, [sc_lim_none]
     call show_cstr
-    jmp .show_sep
+    jmp .show_quote
 .lim_num:
     lea rsi, [sc_lim_pfx]
     call show_cstr
@@ -2916,8 +2981,35 @@ show_config:
     mov al, 10
     call show_byte
 
+.show_quote:
+    ; Scalar: --quote
+    lea rdi, [quote_mode]
+    call sc_want
+    je .show_sep
+    cmp byte [quote_mode], 2
+    je .q_always
+    cmp byte [quote_mode], 3
+    je .q_never
+    call sc_pfx
+    lea rsi, [sc_quote_auto]
+    call show_cstr
+    jmp .show_sep
+.q_always:
+    ; the config file rejects "always": a comment plus a note stays inert
+    lea rsi, [sc_quote_always_note]
+    call show_cstr
+    jmp .show_sep
+.q_never:
+    call sc_pfx
+    lea rsi, [sc_quote_never]
+    call show_cstr
+
 .show_sep:
-    ; 5. Scalar: --separator
+    ; Scalar: --separator
+    lea rdi, [sep_seen]
+    call sc_want
+    je .show_modes
+    call sc_pfx
     lea rsi, [sc_sep_pfx]
     call show_cstr
     mov r12, [sep_len]
@@ -3036,7 +3128,11 @@ show_config:
     call show_byte
 
 .show_modes:
-    ; 6. Mode: --hidden / --no-hidden
+    ; Mode: --hidden / --no-hidden
+    lea rdi, [hid_mode]
+    call sc_want
+    je .show_git
+    call sc_pfx
     cmp byte [hid_mode], 2
     je .hid_no
     lea rsi, [sc_hid]
@@ -3047,7 +3143,11 @@ show_config:
     call show_cstr
 
 .show_git:
-    ; 7. Mode: --gitignore / --no-gitignore
+    ; Mode: --gitignore / --no-gitignore
+    lea rdi, [res_ig]
+    call sc_want
+    je .show_abs
+    call sc_pfx
     cmp qword [res_ig], 1
     je .git_yes
     lea rsi, [sc_nogit]
@@ -3058,7 +3158,11 @@ show_config:
     call show_cstr
 
 .show_abs:
-    ; 8. Mode: --relative / --absolute
+    ; Mode: --relative / --absolute
+    lea rdi, [abs_mode]
+    call sc_want
+    je .emit_types
+    call sc_pfx
     cmp byte [abs_mode], 1
     je .abs_yes
     lea rsi, [sc_rel]
@@ -3069,7 +3173,9 @@ show_config:
     call show_cstr
 
 .emit_types:
-    ; 9. Result type filters
+    ; Result type filters: no default, so the user pass only
+    cmp byte [sc_pass], 0
+    je .emit_xnames
     cmp byte [type_seen], 0
     jz .emit_xnames
     test qword [res_type], TYPE_F
@@ -3097,7 +3203,9 @@ show_config:
     call show_type_opt
 
 .emit_xnames:
-    ; 10. Basename exclusions (sorted order)
+    ; Basename exclusions (sorted order): no default, so the user pass only
+    cmp byte [sc_pass], 0
+    je .emit_xtypes
     mov r12, [excl_n]
     test r12, r12
     jz .emit_xtypes
@@ -3194,9 +3302,11 @@ show_config:
     jmp .xnames_loop
 
 .emit_xtypes:
-    ; 11. Type exclusions
+    ; Type exclusions: no default, so the user pass only
+    cmp byte [sc_pass], 0
+    je .done
     cmp byte [excl_seen], 0
-    jz .flush_and_exit
+    jz .done
     test qword [res_excl], TYPE_F
     jz .xt_d
     lea rdi, [sc_xtype_pfx]
@@ -3216,17 +3326,74 @@ show_config:
     call show_type_opt
 .xt_b:
     test qword [res_excl], TYPE_B
-    jz .flush_and_exit
+    jz .done
     lea rdi, [sc_xtype_pfx]
     lea rsi, [tv_broken]
     call show_type_opt
 
-.flush_and_exit:
-    call out_flush
-    xor edi, edi
-    mov eax, SYS_exit_group
-    syscall
-show_config.end_func:
+.done:
+    ret
+sc_emit_options.end_func:
+
+; sc_want: rdi = address of an option's "set by the user" byte -> ZF=1 when the
+;   current pass emits that option: pass 0 wants it unset, pass 1 wants it set
+    global sc_want:function (sc_want.end_func - sc_want)
+sc_want:
+    mov al, [rdi]
+    test al, al
+    setnz al
+    cmp byte [sc_pass], 0
+    je .defaults
+    test al, al
+    ret
+.defaults:
+    xor al, 1
+    test al, al
+    ret
+sc_want.end_func:
+
+; sc_pfx: emit the "# " that comments out a built-in default line
+    global sc_pfx:function (sc_pfx.end_func - sc_pfx)
+sc_pfx:
+    cmp byte [sc_pass], 0
+    jne .done
+    lea rsi, [sc_def_pfx]
+    call show_cstr
+.done:
+    ret
+sc_pfx.end_func:
+
+; sc_has_user_lines -> eax = 1 when at least one option is set by the user
+    global sc_has_user_lines:function (sc_has_user_lines.end_func - sc_has_user_lines)
+sc_has_user_lines:
+    cmp byte [case_seen], 0
+    jne .yes
+    cmp byte [color_mode], 0
+    jne .yes
+    cmp byte [limit_seen], 0
+    jne .yes
+    cmp byte [quote_mode], 0
+    jne .yes
+    cmp byte [sep_seen], 0
+    jne .yes
+    cmp byte [hid_mode], 0
+    jne .yes
+    cmp qword [res_ig], 0
+    jne .yes
+    cmp byte [abs_mode], 0
+    jne .yes
+    cmp byte [type_seen], 0
+    jne .yes
+    cmp qword [excl_n], 0
+    jne .yes
+    cmp byte [excl_seen], 0
+    jne .yes
+    xor eax, eax
+    ret
+.yes:
+    mov eax, 1
+    ret
+sc_has_user_lines.end_func:
 
 ; startswith: rdi = string, rsi = prefix -> ZF=1 if string begins with prefix
     global startswith:function (startswith.end_func - startswith)
