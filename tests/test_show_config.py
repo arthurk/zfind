@@ -39,16 +39,10 @@ class TestShowConfigDefaults:
         res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
         assert res.status == 0, f"Expected 0 exit: {res}"
         assert res.err == b""
-        lines = res.out.splitlines()
-        assert len(lines) == 8, f"Unexpected line count in {lines}"
-        assert lines[0] == b"# Configuration source: none (built-in defaults)"
-        assert lines[1] == b"--case=smart"
-        assert lines[2] == b"--color=auto"
-        assert lines[3] == b"--limit=none"
-        assert lines[4] in (b"--separator='\\n'", b"--separator=\\n")
-        assert lines[5] == b"--hidden"
-        assert lines[6] == b"--no-gitignore"
-        assert lines[7] == b"--relative"
+        assert res.out.startswith(b"# Configuration source: none (built-in defaults)\n")
+        defaults, user = _split_dump(res.out)
+        _assert_default_block(defaults)
+        assert user == []
         assert res.out.endswith(b"\n")
 
 
@@ -67,17 +61,11 @@ class TestShowConfigWithFile:
         res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
         assert res.status == 0, f"Expected 0 exit: {res}"
         assert res.err == b""
-        lines = res.out.splitlines()
-        assert lines[0] == f"# Configuration source: {cfg_file}".encode()
-        assert lines[1] == b"--case=smart"
-        assert lines[2] == b"--color=auto"
-        assert lines[3] == b"--limit=500"
-        assert lines[4] in (b"--separator='\\n'", b"--separator=\\n")
-        assert lines[5] == b"--hidden"
-        assert lines[6] == b"--no-gitignore"
-        assert lines[7] == b"--relative"
-        assert lines[8] == b"--exclude-name=node_modules"
-        assert len(lines) == 9
+        assert res.out.startswith(f"# Configuration source: {cfg_file}\n".encode())
+        defaults, user = _split_dump(res.out)
+        assert b"# --limit=none" not in defaults
+        assert len(defaults) == 7, defaults
+        assert user == [b"--limit=500", b"--exclude-name=node_modules"]
 
     def test_show_config_with_xdg_config_file(
         self, binary: Path, tmp_path: Path
@@ -98,10 +86,11 @@ class TestShowConfigWithFile:
         )
         assert res.status == 0, f"Expected 0 exit: {res}"
         assert res.err == b""
-        lines = res.out.splitlines()
-        assert lines[0] == f"# Configuration source: {cfg_file}".encode()
-        assert lines[1] == b"--case=sensitive"
-        assert b"--no-hidden" in lines
+        assert res.out.startswith(f"# Configuration source: {cfg_file}\n".encode())
+        defaults, user = _split_dump(res.out)
+        assert b"# --case=smart" not in defaults
+        assert b"# --hidden" not in defaults
+        assert user == [b"--case=sensitive", b"--no-hidden"]
 
     def test_show_config_with_explicit_config_arg(
         self, binary: Path, tmp_path: Path
@@ -119,9 +108,10 @@ class TestShowConfigWithFile:
         )
         assert res.status == 0, f"Expected 0 exit: {res}"
         assert res.err == b""
-        lines = res.out.splitlines()
-        assert lines[0] == f"# Configuration source: {cfg_file}".encode()
-        assert lines[3] == b"--limit=10"
+        assert res.out.startswith(f"# Configuration source: {cfg_file}\n".encode())
+        defaults, user = _split_dump(res.out)
+        assert b"# --limit=none" not in defaults
+        assert user == [b"--limit=10"]
 
 
 class TestShowConfigNoConfigOverride:
@@ -145,16 +135,10 @@ class TestShowConfigNoConfigOverride:
         )
         assert res.status == 0, f"Expected 0 exit: {res}"
         assert res.err == b""
-        lines = res.out.splitlines()
-        assert lines[0] == b"# Configuration source: none (--no-config)"
-        assert lines[1] == b"--case=smart"
-        assert lines[2] == b"--color=auto"
-        assert lines[3] == b"--limit=none"
-        assert lines[4] in (b"--separator='\\n'", b"--separator=\\n")
-        assert lines[5] == b"--hidden"
-        assert lines[6] == b"--no-gitignore"
-        assert lines[7] == b"--relative"
-        assert len(lines) == 8
+        assert res.out.startswith(b"# Configuration source: none (--no-config)\n")
+        defaults, user = _split_dump(res.out)
+        _assert_default_block(defaults)
+        assert user == []
 
 
 class TestShowConfigTypePrecedence:
@@ -623,3 +607,387 @@ class TestShowConfigEdgeCases:
         # Should be a search result, not a config dump
         assert b"# Configuration source:" not in res.out
         assert b"--show-config" in res.out
+
+
+# --- Issues #56/#57/#58: defaults-vs-user split, --quote, config-valid dump ---
+
+HEADER_NOTE = (
+    b"# Commented-out lines are built-in defaults; uncommented lines are set by you"
+)
+SOURCE_PREFIX = b"# Configuration source: "
+SEPARATOR_DEFAULTS = (b"# --separator='\\n'", b"# --separator=\\n")
+SEPARATOR_USER = (b"--separator='\\n'", b"--separator=\\n")
+
+# The mode flags share one "option" between their two spellings.
+_OPTION_ALIASES = {
+    b"--no-hidden": b"--hidden",
+    b"--no-gitignore": b"--gitignore",
+    b"--absolute": b"--relative",
+}
+
+
+def _assert_default_block(lines: list[bytes]) -> None:
+    """The 8 active default lines, in the binding fixed order."""
+    assert len(lines) == 8, f"expected 8 default lines, got {lines}"
+    assert lines[0] == b"# --case=smart"
+    assert lines[1] == b"# --color=auto"
+    assert lines[2] == b"# --limit=none"
+    assert lines[3] == b"# --quote=auto"
+    assert lines[4] in SEPARATOR_DEFAULTS, lines[4]
+    assert lines[5] == b"# --hidden"
+    assert lines[6] == b"# --no-gitignore"
+    assert lines[7] == b"# --relative"
+
+
+def _split_dump(out: bytes) -> tuple[list[bytes], list[bytes]]:
+    """Split a --show-config dump into (defaults_block, user_set_block)."""
+    lines = out.splitlines()
+    assert lines[0].startswith(SOURCE_PREFIX), lines[:1]
+    assert lines[1] == HEADER_NOTE, lines[:2]
+    assert lines[2] == b"", lines[:3]
+    body = lines[3:]
+    if b"" in body:
+        boundary = body.index(b"")
+        defaults, user = body[:boundary], body[boundary + 1 :]
+    else:
+        defaults, user = body, []
+    assert b"" not in user, f"unexpected blank line in user block: {user}"
+    return defaults, user
+
+
+def _option_key(line: bytes) -> bytes:
+    """Option name of a dump line, with the leading comment and value removed."""
+    text = line[2:] if line.startswith(b"# ") else line
+    key = text.split(b"=", 1)[0].split(b" ", 1)[0]
+    return _OPTION_ALIASES.get(key, key)
+
+
+def _option_counts(out: bytes) -> dict[bytes, int]:
+    counts: dict[bytes, int] = {}
+    for line in out.splitlines():
+        if not line or line.startswith(SOURCE_PREFIX) or line == HEADER_NOTE:
+            continue
+        key = _option_key(line)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+class TestShowConfigQuote:
+    """Issue #56: the resolved --quote mode is part of the dump."""
+
+    def test_config_quote_never_in_user_block(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        cfg_dir = home / ".config" / "zfind"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config").write_text("--quote=never\n")
+
+        res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
+        assert res.status == 0, res
+        assert res.err == b""
+        defaults, user = _split_dump(res.out)
+        assert b"--quote=never" in user
+        assert b"# --quote=auto" not in res.out
+
+    def test_cli_quote_always_note_line(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        home.mkdir()
+        res = run_zfind(
+            binary,
+            "--show-config",
+            "--quote=always",
+            cwd=tmp_path,
+            env={"HOME": str(home)},
+        )
+        assert res.status == 0, res
+        assert res.err == b""
+        assert (
+            b"# --quote=always (command line only, not allowed in a config file)"
+            in res.out
+        )
+
+    def test_quote_in_scalar_group_order(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        home.mkdir()
+        res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
+        assert res.status == 0, res
+        lines = res.out.splitlines()
+        _assert_default_block(lines[3:])
+        sep_index = next(i for i, line in enumerate(lines) if line in SEPARATOR_DEFAULTS)
+        assert lines.index(b"# --limit=none") < lines.index(b"# --quote=auto") < sep_index
+
+
+class TestShowConfigDefaultsAndUserBlocks:
+    """Issue #57: built-in defaults are commented, user settings are not."""
+
+    def test_no_config_no_flags_eleven_lines(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        home.mkdir()
+        res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
+        assert res.status == 0, res
+        assert res.err == b""
+        lines = res.out.splitlines()
+        assert len(lines) == 11, lines
+        assert lines[0] == b"# Configuration source: none (built-in defaults)"
+        assert lines[1] == HEADER_NOTE
+        assert lines[2] == b""
+        _assert_default_block(lines[3:])
+        assert res.out.endswith(b"\n")
+
+    def test_no_config_no_flags_all_lines_commented(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        home.mkdir()
+        res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
+        assert res.status == 0, res
+        for line in res.out.splitlines():
+            assert line == b"" or line.startswith(b"#"), line
+
+    def test_exclude_names_only(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        cfg_dir = home / ".config" / "zfind"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config").write_text("--exclude-name=zeta\n--exclude-name=alpha\n")
+
+        res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
+        assert res.status == 0, res
+        defaults, user = _split_dump(res.out)
+        _assert_default_block(defaults)
+        assert user == [b"--exclude-name=alpha", b"--exclude-name=zeta"]
+
+    def test_scalar_override_moves_to_user_block(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        cfg_dir = home / ".config" / "zfind"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config").write_text("--case=sensitive\n")
+
+        res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
+        assert res.status == 0, res
+        defaults, user = _split_dump(res.out)
+        assert b"# --case=smart" not in defaults
+        assert user == [b"--case=sensitive"]
+        assert b"# --color=auto" in defaults
+        assert b"# --limit=none" in defaults
+
+    def test_mode_flag_override_moves_to_user_block(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        cfg_dir = home / ".config" / "zfind"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config").write_text("--gitignore\n")
+
+        res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
+        assert res.status == 0, res
+        defaults, user = _split_dump(res.out)
+        assert b"# --no-gitignore" not in defaults
+        assert b"--gitignore" in user
+        assert b"# --hidden" in defaults
+        assert b"# --relative" in defaults
+
+    def test_no_hidden_override(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        cfg_dir = home / ".config" / "zfind"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config").write_text("--no-hidden\n")
+
+        res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
+        assert res.status == 0, res
+        defaults, user = _split_dump(res.out)
+        assert b"# --hidden" not in defaults
+        assert user == [b"--no-hidden"]
+
+    def test_explicit_default_values_uncommented(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        cfg_dir = home / ".config" / "zfind"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config").write_text(
+            "--case=smart\n--limit=none\n--separator='\\n'\n"
+        )
+
+        res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
+        assert res.status == 0, res
+        defaults, user = _split_dump(res.out)
+        assert b"--case=smart" in user
+        assert b"--limit=none" in user
+        assert any(line in SEPARATOR_USER for line in user), user
+
+    def test_each_option_appears_once(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        cfg_dir = home / ".config" / "zfind"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config").write_text(
+            "--case=sensitive\n"
+            "--hidden\n"
+            "--type=f\n"
+            "--exclude-name=foo\n"
+            "--exclude-type=l\n"
+        )
+
+        res = run_zfind(binary, "--show-config", cwd=tmp_path, env={"HOME": str(home)})
+        assert res.status == 0, res
+        counts = _option_counts(res.out)
+        expected = {
+            b"--case",
+            b"--color",
+            b"--limit",
+            b"--quote",
+            b"--separator",
+            b"--hidden",
+            b"--gitignore",
+            b"--relative",
+            b"--type",
+            b"--exclude-name",
+            b"--exclude-type",
+        }
+        assert set(counts) == expected, counts
+        assert all(count == 1 for count in counts.values()), counts
+
+
+class TestShowConfigSplitRoundTrip:
+    """Issues #57/#58: a dump stays valid config syntax and re-reads identically."""
+
+    def _round_trip(self, binary: Path, tmp_path: Path, home: Path, *args: str) -> None:
+        env = {"HOME": str(home)}
+        res1 = run_zfind(binary, *args, "--show-config", cwd=tmp_path, env=env)
+        assert res1.status == 0, res1
+        assert HEADER_NOTE in res1.out
+
+        dump = tmp_path / "dump.conf"
+        dump.write_bytes(res1.out)
+
+        res2 = run_zfind(
+            binary, "--config", str(dump), "--show-config", cwd=tmp_path, env=env
+        )
+        assert res2.status == 0, res2
+        assert res2.err == b""
+        # Only the source header may differ; the body must be byte-identical.
+        assert res1.out.split(b"\n", 1)[1] == res2.out.split(b"\n", 1)[1]
+
+    def test_defaults_dump_round_trip(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        home.mkdir()
+        self._round_trip(binary, tmp_path, home)
+
+    def test_exclusions_and_types_dump_round_trip(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        cfg_dir = home / ".config" / "zfind"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config").write_text(
+            "--exclude-name=zeta\n"
+            "--exclude-name=alpha\n"
+            "--type=f\n"
+            "--exclude-type=l\n"
+        )
+        self._round_trip(binary, tmp_path, home)
+
+    def test_cli_values_dump_round_trip(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        home.mkdir()
+        self._round_trip(
+            binary,
+            tmp_path,
+            home,
+            "--case=sensitive",
+            "--limit=5",
+            "--separator=,",
+            "--hidden",
+            "--type=f",
+            "--exclude-type=l",
+            "--exclude-name=foo",
+        )
+
+
+class TestShowConfigCommandLineOnly:
+    """Issue #58: config-forbidden command-line values stay commented."""
+
+    def test_color_and_quote_always_note_lines(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        home.mkdir()
+        res = run_zfind(
+            binary,
+            "--color=always",
+            "--quote=always",
+            "--show-config",
+            cwd=tmp_path,
+            env={"HOME": str(home)},
+        )
+        assert res.status == 0, res
+        assert res.err == b""
+        assert (
+            b"# --color=always (command line only, not allowed in a config file)"
+            in res.out
+        )
+        assert (
+            b"# --quote=always (command line only, not allowed in a config file)"
+            in res.out
+        )
+
+    def test_color_and_quote_always_dump_loads(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        home.mkdir()
+        env = {"HOME": str(home)}
+        res1 = run_zfind(
+            binary,
+            "--color=always",
+            "--quote=always",
+            "--show-config",
+            cwd=tmp_path,
+            env=env,
+        )
+        assert res1.status == 0, res1
+
+        dump = tmp_path / "dump.conf"
+        dump.write_bytes(res1.out)
+
+        res2 = run_zfind(
+            binary, "--config", str(dump), "--show-config", cwd=tmp_path, env=env
+        )
+        assert res2.status == 0, res2
+        assert res2.err == b""
+
+    def test_config_quote_never_plus_cli_quote_always_single_line(
+        self, binary: Path, tmp_path: Path
+    ):
+        home = tmp_path / "home"
+        cfg_dir = home / ".config" / "zfind"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config").write_text("--quote=never\n")
+
+        res = run_zfind(
+            binary,
+            "--show-config",
+            "--quote=always",
+            cwd=tmp_path,
+            env={"HOME": str(home)},
+        )
+        assert res.status == 0, res
+        quote_lines = [line for line in res.out.splitlines() if b"--quote" in line]
+        assert quote_lines == [
+            b"# --quote=always (command line only, not allowed in a config file)"
+        ], quote_lines
+
+
+class TestShowConfigNeverDumpsMetaOptions:
+    """Issue #59: meta options and positionals are never dump lines."""
+
+    def test_meta_options_and_positionals_absent(self, binary: Path, tmp_path: Path):
+        home = tmp_path / "home"
+        home.mkdir()
+        cfg_file = tmp_path / "custom.conf"
+        cfg_file.write_text("--limit=10\n")
+
+        res = run_zfind(
+            binary,
+            "--config",
+            str(cfg_file),
+            "--path",
+            str(tmp_path),
+            "--limit=7",
+            "--show-config",
+            "positional_pattern",
+            cwd=tmp_path,
+            env={"HOME": str(home)},
+        )
+        assert res.status == 0, res
+        assert res.err == b""
+        keys = _option_counts(res.out)
+        for meta in (b"--path", b"--config", b"--no-config", b"--show-config"):
+            assert meta not in keys, keys
+        assert b"--limit=7" in res.out.splitlines()
